@@ -454,6 +454,34 @@ fn printable<T: std::fmt::Display>(value: Option<T>) -> String {
     value.map_or_else(|| "unavailable".to_owned(), |value| value.to_string())
 }
 
+fn scheduler_markdown(scheduler: Option<&schedule_events::Summary>) -> String {
+    let mut out = String::from("\n## Scheduler interventions\n\n");
+    if let Some(scheduler) = scheduler {
+        let _ = write!(
+            out,
+            "- Submitted: {}\n- Admitted: {}\n- Completed: {}\n- Failed: {}\n- Cancelled: {}\n- Rejected: {}\n- Queue wait p50/p95: {} / {} ms\n- Submission-to-finish p50/p95: {} / {} ms\n- Wait by reason (pressure/capacity/FIFO/running limit/admission): {} / {} / {} / {} / {} ms\n\nScheduler outcomes are observations, not evidence that Reef prevented pressure.\n",
+            scheduler.submitted,
+            scheduler.admitted,
+            scheduler.completed,
+            scheduler.failed,
+            scheduler.cancelled,
+            scheduler.rejected,
+            printable(scheduler.queue_wait_p50_ms),
+            printable(scheduler.queue_wait_p95_ms),
+            printable(scheduler.submission_to_finish_p50_ms),
+            printable(scheduler.submission_to_finish_p95_ms),
+            scheduler.wait.pressure,
+            scheduler.wait.capacity,
+            scheduler.wait.fifo,
+            scheduler.wait.running_limit,
+            scheduler.wait.admission,
+        );
+    } else {
+        out.push_str("Unavailable: no scheduler event history.\n");
+    }
+    out
+}
+
 fn markdown(report: &Report) -> String {
     let mut out = format!(
         "# Reef workload report\n\n- Range: {} to {} (end exclusive)\n- Empty: {}\n- Observations: {}\n- Observed working time: {} ms\n- Peak host memory: {} bytes\n- Swap growth: {} bytes\n- Peak command concurrency: {}\n\n",
@@ -530,30 +558,7 @@ fn markdown(report: &Report) -> String {
             );
         }
     }
-    out.push_str("\n## Scheduler interventions\n\n");
-    if let Some(scheduler) = &report.scheduler {
-        let _ = write!(
-            out,
-            "- Submitted: {}\n- Admitted: {}\n- Completed: {}\n- Failed: {}\n- Cancelled: {}\n- Rejected: {}\n- Queue wait p50/p95: {} / {} ms\n- Submission-to-finish p50/p95: {} / {} ms\n- Wait by reason (pressure/capacity/FIFO/running limit/admission): {} / {} / {} / {} / {} ms\n\nScheduler outcomes are observations, not evidence that Reef prevented pressure.\n",
-            scheduler.submitted,
-            scheduler.admitted,
-            scheduler.completed,
-            scheduler.failed,
-            scheduler.cancelled,
-            scheduler.rejected,
-            printable(scheduler.queue_wait_p50_ms),
-            printable(scheduler.queue_wait_p95_ms),
-            printable(scheduler.submission_to_finish_p50_ms),
-            printable(scheduler.submission_to_finish_p95_ms),
-            scheduler.wait.pressure,
-            scheduler.wait.capacity,
-            scheduler.wait.fifo,
-            scheduler.wait.running_limit,
-            scheduler.wait.admission,
-        );
-    } else {
-        out.push_str("Unavailable: no scheduler event history.\n");
-    }
+    out.push_str(&scheduler_markdown(report.scheduler.as_ref()));
     #[cfg(unix)]
     {
         out.push_str(&cache_impact::markdown(&report.cache));
@@ -597,7 +602,7 @@ pub fn run(options: &Options) -> io::Result<()> {
         }
         Some(all)
     };
-    let mut report = build_report(
+    let report = build_report(
         from,
         to,
         samples,
@@ -625,14 +630,16 @@ pub fn run(options: &Options) -> io::Result<()> {
         },
     );
     #[cfg(unix)]
-    {
+    let report = {
+        let mut report = report;
         report.cache = cache_impact::report(
             options.cache_dir.as_deref(),
             u128::try_from(from.timestamp_millis()).unwrap_or_default(),
             u128::try_from(to.timestamp_millis()).unwrap_or_default(),
         )?;
         report.empty = report.empty && report.cache.hits == 0 && report.cache.misses == 0;
-    }
+        report
+    };
     match options.format {
         Format::Markdown => print!("{}", markdown(&report)),
         Format::Json => println!("{}", serde_json::to_string_pretty(&report)?),

@@ -9,7 +9,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -69,10 +69,10 @@ pub(crate) fn cache_path(override_path: Option<&Path>) -> io::Result<PathBuf> {
 }
 
 fn private_dir(path: &Path) -> io::Result<()> {
-    if !path.exists() {
-        fs::create_dir_all(path)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)?;
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir()
         || metadata.file_type().is_symlink()
