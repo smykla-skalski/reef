@@ -279,6 +279,7 @@ fn missing_identity_uses_fresh_local_scheduler_admission() {
             "--",
             "/usr/bin/true",
         ])
+        .env("HOME", &fixture.0)
         .output()
         .unwrap();
     server.kill().unwrap();
@@ -292,6 +293,16 @@ fn missing_identity_uses_fresh_local_scheduler_admission() {
     );
     assert!(String::from_utf8_lossy(&result.stderr).contains("SSH identity file"));
     assert!(String::from_utf8_lossy(&result.stderr).contains("fresh local scheduler admission"));
+    let history = fixture.0.join(".local/state/reef/history");
+    let record = fs::read_dir(history)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(record).unwrap()).unwrap();
+    assert_eq!(saved["identity"], "job");
+    assert_eq!(saved["status"], "success");
 }
 
 #[test]
