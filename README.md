@@ -20,7 +20,7 @@ Start a background recorder with no project configuration:
 reef observe start
 ```
 
-It samples every 30 seconds, keeps seven days of observations, and limits storage to 100 MiB. Samples are JSON Lines files in `~/.local/state/reef/observe`. The directory is private to your user account on Unix. Each sample includes system CPU, memory, swap, root disk capacity, and numeric process usage with parent PIDs for tree analysis. Metrics that are unavailable are `null`. Samples include `working_ms`, capped at the configured interval so time spent asleep does not accumulate as working time. Reef stores no process names, command lines, environment variables, file contents, credentials, or tokens.
+It samples every 30 seconds, keeps seven days of observations, and limits storage to 100 MiB. Samples are JSON Lines files in `~/.local/state/reef/observe`. The directory is private to your user account on Unix. Each sample includes system CPU, memory, swap, root disk capacity, and numeric process usage with parent PIDs for tree analysis. Metrics that are unavailable are `null`; zero process I/O deltas are also `null` because a failed system query is indistinguishable from no I/O. Samples include `working_ms`, capped at the configured interval so time spent asleep does not accumulate as working time. Reef stores no process names, command lines, environment variables, file contents, credentials, or tokens.
 
 Change collection limits when starting the recorder:
 

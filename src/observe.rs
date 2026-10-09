@@ -123,8 +123,8 @@ fn sample(system: &mut System, disks: &mut Disks, working_ms: u64) -> io::Result
                     .is_finite()
                     .then_some(process.cpu_usage()),
                 memory_bytes: Some(process.memory()),
-                read_bytes: Some(usage.read_bytes),
-                written_bytes: Some(usage.written_bytes),
+                read_bytes: (usage.read_bytes > 0).then_some(usage.read_bytes),
+                written_bytes: (usage.written_bytes > 0).then_some(usage.written_bytes),
             }
         })
         .collect();
@@ -219,6 +219,27 @@ fn working_ms(elapsed: Duration, interval: Duration) -> u64 {
     u64::try_from(elapsed.min(interval).as_millis()).unwrap_or(u64::MAX)
 }
 
+fn active_recorder_pid(path: &Path) -> io::Result<Option<u32>> {
+    let contents = fs::read_to_string(path)?;
+    let mut fields = contents.split_whitespace();
+    let (Some(pid), Some(start_time), None) = (fields.next(), fields.next(), fields.next()) else {
+        return Ok(None);
+    };
+    let (Ok(pid), Ok(start_time)) = (pid.parse::<u32>(), start_time.parse::<u64>()) else {
+        return Ok(None);
+    };
+    let pid = sysinfo::Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    Ok(system
+        .process(pid)
+        .and_then(|process| (process.start_time() == start_time).then_some(pid.as_u32())))
+}
+
 pub fn run(options: &ObserveOptions) -> io::Result<()> {
     let dir = state_dir(options.state_dir.as_deref())?;
     private_dir(&dir)?;
@@ -237,7 +258,18 @@ pub fn run(options: &ObserveOptions) -> io::Result<()> {
     if stop_path.exists() {
         fs::remove_file(&stop_path)?;
     }
-    writeln!(lock, "{}", std::process::id())?;
+    let pid = sysinfo::Pid::from_u32(std::process::id());
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    let started = system
+        .process(pid)
+        .ok_or_else(|| io::Error::other("cannot identify recorder process"))?
+        .start_time();
+    writeln!(lock, "{} {started}", std::process::id())?;
     let result = record_loop(&dir, &stop_path, options);
     fs::remove_file(lock_path)?;
     result
@@ -251,7 +283,10 @@ fn record_loop(dir: &Path, stop_path: &Path, options: &ObserveOptions) -> io::Re
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
-        ProcessRefreshKind::nothing().with_cpu().without_tasks(),
+        ProcessRefreshKind::nothing()
+            .with_cpu()
+            .with_disk_usage()
+            .without_tasks(),
     );
     let mut previous = std::time::Instant::now();
     loop {
@@ -275,17 +310,7 @@ pub fn start(options: &ObserveOptions) -> io::Result<()> {
     private_dir(&dir)?;
     let lock_path = dir.join("recorder.pid");
     if lock_path.exists() {
-        let pid = fs::read_to_string(&lock_path)?.trim().parse::<u32>().ok();
-        let mut system = System::new();
-        let alive = pid.is_some_and(|pid| {
-            system.refresh_processes_specifics(
-                ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
-                true,
-                ProcessRefreshKind::nothing(),
-            );
-            system.process(sysinfo::Pid::from_u32(pid)).is_some()
-        });
-        if alive {
+        if active_recorder_pid(&lock_path)?.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "recorder already running",
@@ -295,7 +320,7 @@ pub fn start(options: &ObserveOptions) -> io::Result<()> {
     }
     let mut child = platform::spawn_detached(options, &dir)?;
     for _ in 0..20 {
-        if fs::read_to_string(&lock_path).is_ok_and(|pid| pid.trim() == child.id().to_string()) {
+        if active_recorder_pid(&lock_path).ok().flatten() == Some(child.id()) {
             println!(
                 "Recorder started (PID {}). Observations: {}",
                 child.id(),
@@ -315,10 +340,8 @@ pub fn start(options: &ObserveOptions) -> io::Result<()> {
 
 pub fn stop(dir: Option<&Path>) -> io::Result<()> {
     let dir = state_dir(dir)?;
-    let pid = fs::read_to_string(dir.join("recorder.pid"))?
-        .trim()
-        .parse::<u32>()
-        .map_err(io::Error::other)?;
+    let pid = active_recorder_pid(&dir.join("recorder.pid"))?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "recorder is not running"))?;
     let stop_path = dir.join(format!("stop-{pid}"));
     match private_file(&stop_path, true) {
         Ok(_) => {}
@@ -432,5 +455,17 @@ mod tests {
             working_ms(Duration::from_millis(750), Duration::from_secs(1)),
             750
         );
+    }
+
+    #[test]
+    fn unrelated_live_pid_does_not_claim_recorder_state() {
+        let dir = std::env::temp_dir().join(format!("reef-pid-test-{}", std::process::id()));
+        private_dir(&dir).unwrap();
+        let path = dir.join("recorder.pid");
+        fs::write(&path, format!("{} 0\n", std::process::id())).unwrap();
+
+        assert_eq!(active_recorder_pid(&path).unwrap(), None);
+
+        fs::remove_dir_all(dir).unwrap();
     }
 }
