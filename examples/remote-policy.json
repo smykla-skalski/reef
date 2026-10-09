@@ -1,0 +1,19 @@
+{
+  "enabled": false,
+  "target": "reef-worker@example.test",
+  "identity_file": "/path/to/private/reef-worker-key",
+  "known_hosts_file": "/path/to/private/reef-worker-known-hosts",
+  "worker_root": "/srv/reef-worker",
+  "worker_binary": "/usr/local/bin/reef",
+  "repository": "example-project",
+  "toolchain": "1.99.0",
+  "os": "linux",
+  "arch": "x86_64",
+  "allowed_commands": [
+    {
+      "identity": "project-build",
+      "argv": ["/home/reef/.cargo/bin/cargo", "build", "--locked"]
+    }
+  ],
+  "local_fallback": false
+}

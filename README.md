@@ -99,6 +99,8 @@ The default range is the last 24 hours. Its start is inclusive and its end is ex
 - Reuse compatible results and persistent build caches
 - Offload work when local capacity is insufficient
 
+An opt-in trusted SSH worker path is implemented behind a disabled-by-default policy. Its setup, recovery behavior, and unmeasured real-host release gate are documented in [experimental remote offload](docs/remote.md).
+
 ## Design principles
 
 - Keep admission and scheduling deterministic

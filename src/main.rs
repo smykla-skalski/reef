@@ -3,6 +3,8 @@ mod agents;
 mod observe;
 #[cfg(unix)]
 mod pressure;
+#[cfg(unix)]
+mod remote;
 mod report;
 #[cfg(unix)]
 mod run;
@@ -92,6 +94,13 @@ enum Command {
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
+    /// Submit an explicitly approved job to a trusted SSH worker.
+    #[cfg(unix)]
+    Remote(remote::Options),
+    /// Internal entry point for an SSH worker account.
+    #[cfg(unix)]
+    #[command(hide = true)]
+    RemoteWorker(remote::WorkerOptions),
     /// Record resource usage over time.
     Observe {
         #[command(subcommand)]
@@ -272,6 +281,10 @@ fn main() -> std::process::ExitCode {
         Command::Queue { state_dir } => result(schedule::queue(state_dir.as_deref())),
         #[cfg(unix)]
         Command::Cancel { id, state_dir } => result(schedule::cancel(id, state_dir.as_deref())),
+        #[cfg(unix)]
+        Command::Remote(options) => command_result(remote::submit(&options)),
+        #[cfg(unix)]
+        Command::RemoteWorker(options) => command_result(remote::worker(&options)),
         Command::Observe { command } => {
             let result = match command {
                 ObserveCommand::Start(options) => observe::start(&options),

@@ -302,15 +302,15 @@ fn cancellation_stops_descendants_that_ignore_the_forwarded_signal() {
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !pid_file.exists() {
+    let descendant = loop {
+        if let Ok(pid) = fs::read_to_string(&pid_file)
+            && let Ok(pid) = pid.trim().parse::<i32>()
+        {
+            break pid;
+        }
         assert!(Instant::now() < deadline, "descendant never started");
         std::thread::sleep(Duration::from_millis(10));
-    }
-    let descendant = fs::read_to_string(&pid_file)
-        .unwrap()
-        .trim()
-        .parse::<i32>()
-        .unwrap();
+    };
     kill(
         Pid::from_raw(i32::try_from(child.id()).unwrap()),
         Signal::SIGTERM,
