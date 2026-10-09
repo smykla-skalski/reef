@@ -30,7 +30,7 @@ enum RecordWriter {
 pub trait Admission {
     fn started(&mut self, pid: u32) -> io::Result<()>;
     fn status(&mut self) -> io::Result<AdmissionStatus>;
-    fn finished(&mut self) -> io::Result<()>;
+    fn finished(&mut self, outcome: &str) -> io::Result<()>;
 }
 
 pub enum AdmissionStatus {
@@ -130,14 +130,18 @@ pub fn run_with(
     let mut child = match process.spawn() {
         Ok(child) => child,
         Err(error) => {
-            return Ok(spawn_failed(
+            let exit = spawn_failed(
                 &error,
                 category,
                 identity,
                 started_at_unix_ms,
                 start,
                 &mut record_writer,
-            ));
+            );
+            if let Some(lease) = admission.as_mut() {
+                let _ = lease.finished("failed");
+            }
+            return Ok(exit);
         }
     };
     let foreground = prepare_child(&mut child, interactive, &mut admission)?;
@@ -188,7 +192,7 @@ pub fn run_with(
         ));
     }
     if let Some(lease) = admission.as_mut() {
-        lease.finished()?;
+        lease.finished(status)?;
     }
     if scheduler_cancelled {
         return Ok(130);

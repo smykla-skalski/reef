@@ -52,6 +52,7 @@ fn reports_empty_range_with_unavailable_command_measurements() {
     assert_eq!(report["empty"], true);
     assert_eq!(report["observation_count"], 0);
     assert_eq!(report["command_measurements_available"], false);
+    assert!(report["scheduler"].is_null());
     assert!(report["categories"].is_null());
     assert!(report["pressure"]["any_above_ms"].is_null());
 }

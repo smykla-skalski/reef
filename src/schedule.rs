@@ -1,5 +1,6 @@
 use crate::pressure::{self, Monitor, Policy};
 use crate::run::{self, Admission, AdmissionStatus};
+use crate::schedule_events::{self, Event, Wait};
 use fs2::FileExt;
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, killpg};
@@ -15,7 +16,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use sysinfo::System;
 
 const POLL: Duration = Duration::from_millis(50);
@@ -80,6 +81,12 @@ struct Job {
     memory_mib: u64,
     pid: Option<u32>,
     cancelled: bool,
+    submitted: Instant,
+}
+
+struct Events {
+    dir: PathBuf,
+    session: String,
 }
 
 struct State {
@@ -90,6 +97,7 @@ struct State {
     waiting: VecDeque<Job>,
     running: HashMap<u64, Job>,
     pressure: Option<Monitor>,
+    events: Option<Events>,
 }
 
 impl State {
@@ -102,6 +110,7 @@ impl State {
             waiting: VecDeque::new(),
             running: HashMap::new(),
             pressure,
+            events: None,
         }
     }
 
@@ -129,6 +138,7 @@ impl State {
             memory_mib,
             pid: None,
             cancelled: false,
+            submitted: Instant::now(),
         });
         Ok(id)
     }
@@ -243,6 +253,26 @@ impl State {
         };
         Some((position, reason.into()))
     }
+
+    fn event(&self, kind: &str, id: Option<u64>, wait: Option<Wait>, elapsed: Option<u128>) {
+        let Some(events) = &self.events else { return };
+        let result = schedule_events::now_ms().and_then(|at_unix_ms| {
+            schedule_events::save(
+                &events.dir,
+                &Event {
+                    session: events.session.clone(),
+                    id,
+                    kind: kind.to_owned(),
+                    at_unix_ms,
+                    wait,
+                    submission_to_finish_ms: elapsed,
+                },
+            )
+        });
+        if let Err(error) = result {
+            eprintln!("reef: scheduler event history unavailable: {error}");
+        }
+    }
 }
 
 fn state_path(state_dir: Option<&Path>) -> io::Result<PathBuf> {
@@ -354,12 +384,15 @@ pub fn serve(
     })?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
-    let state = Arc::new(Mutex::new(State::new(
-        cpu,
-        memory_mib,
-        max_running,
-        monitor,
-    )));
+    let mut initial = State::new(cpu, memory_mib, max_running, monitor);
+    match schedule_events::session().and_then(|session| {
+        schedule_events::init(&dir)?;
+        Ok(session)
+    }) {
+        Ok(session) => initial.events = Some(Events { dir, session }),
+        Err(error) => eprintln!("reef: scheduler event history unavailable: {error}"),
+    }
+    let state = Arc::new(Mutex::new(initial));
     let stopping = Arc::new(AtomicBool::new(false));
     if !pressure_options.no_pressure {
         let state = Arc::clone(&state);
@@ -471,10 +504,14 @@ fn handle(mut stream: UnixStream, shared: &Arc<Mutex<State>>) -> io::Result<()> 
                 let mut state = shared.lock().unwrap();
                 match state.add(cpu, memory_mib, identity) {
                     Ok(id) => {
+                        state.event("submitted", Some(id), None, None);
                         let (position, reason) = state.wait_status(id).expect("new request queued");
                         (id, position, reason)
                     }
-                    Err(message) => return send(&mut stream, &Reply::Error { message }),
+                    Err(message) => {
+                        state.event("rejected", None, None, None);
+                        return send(&mut stream, &Reply::Error { message });
+                    }
                 }
             };
             if let Err(error) = send(
@@ -485,10 +522,29 @@ fn handle(mut stream: UnixStream, shared: &Arc<Mutex<State>>) -> io::Result<()> 
                     reason,
                 },
             ) {
+                shared
+                    .lock()
+                    .unwrap()
+                    .event("cancelled", Some(id), None, Some(0));
                 shared.lock().unwrap().remove(id);
                 return Err(error);
             }
             let result = hold_job(&mut stream, shared, id);
+            if result.is_err() {
+                let state = shared.lock().unwrap();
+                let submitted = state
+                    .waiting
+                    .iter()
+                    .chain(state.running.values())
+                    .find(|job| job.id == id)
+                    .map(|job| job.submitted);
+                state.event(
+                    "failed",
+                    Some(id),
+                    None,
+                    submitted.map(|at| at.elapsed().as_millis()),
+                );
+            }
             if result.is_err()
                 && let Some(pid) = shared
                     .lock()
@@ -508,7 +564,23 @@ fn handle(mut stream: UnixStream, shared: &Arc<Mutex<State>>) -> io::Result<()> 
 fn hold_job(stream: &mut UnixStream, shared: &Arc<Mutex<State>>, id: u64) -> io::Result<()> {
     stream.set_read_timeout(Some(POLL))?;
     let mut last_wait = shared.lock().unwrap().wait_status(id);
+    let submitted = shared
+        .lock()
+        .unwrap()
+        .waiting
+        .iter()
+        .find(|job| job.id == id)
+        .expect("queued job")
+        .submitted;
+    let mut last_tick = submitted;
+    let mut waited = WaitNanos::default();
     loop {
+        let now = Instant::now();
+        waited.add(
+            last_wait.as_ref().map(|(_, reason)| reason.as_str()),
+            now.duration_since(last_tick).as_nanos(),
+        );
+        last_tick = now;
         let decision = {
             let mut state = shared.lock().unwrap();
             if state
@@ -524,9 +596,27 @@ fn hold_job(stream: &mut UnixStream, shared: &Arc<Mutex<State>>, id: u64) -> io:
             }
         };
         if matches!(decision, QueueDecision::Cancelled) {
+            record_queue_event(
+                shared,
+                id,
+                "cancelled",
+                &mut waited,
+                last_wait.as_ref(),
+                last_tick,
+                submitted,
+            );
             return send(stream, &Reply::Cancelled { id });
         }
         if matches!(decision, QueueDecision::Granted) {
+            record_queue_event(
+                shared,
+                id,
+                "admitted",
+                &mut waited,
+                last_wait.as_ref(),
+                last_tick,
+                submitted,
+            );
             send(stream, &Reply::Granted { id })?;
             break;
         }
@@ -546,7 +636,18 @@ fn hold_job(stream: &mut UnixStream, shared: &Arc<Mutex<State>>, id: u64) -> io:
         }
         let mut byte = [0];
         match stream.read(&mut byte) {
-            Ok(0) => return Ok(()),
+            Ok(0) => {
+                record_queue_event(
+                    shared,
+                    id,
+                    "cancelled",
+                    &mut waited,
+                    last_wait.as_ref(),
+                    last_tick,
+                    submitted,
+                );
+                return Ok(());
+            }
             Ok(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -560,7 +661,89 @@ fn hold_job(stream: &mut UnixStream, shared: &Arc<Mutex<State>>, id: u64) -> io:
         }
     }
 
-    hold_running(stream, shared, id)
+    finish_running(stream, shared, id, submitted)
+}
+
+fn finish_running(
+    stream: &mut UnixStream,
+    shared: &Arc<Mutex<State>>,
+    id: u64,
+    submitted: Instant,
+) -> io::Result<()> {
+    let result = hold_running(stream, shared, id);
+    let kind = result.as_ref().copied().unwrap_or("failed");
+    shared
+        .lock()
+        .unwrap()
+        .event(kind, Some(id), None, Some(submitted.elapsed().as_millis()));
+    result.map(|_| ())
+}
+
+fn record_queue_event(
+    shared: &Arc<Mutex<State>>,
+    id: u64,
+    kind: &str,
+    waited: &mut WaitNanos,
+    last_wait: Option<&(usize, String)>,
+    last_tick: Instant,
+    submitted: Instant,
+) {
+    waited.add(
+        last_wait.map(|(_, reason)| reason.as_str()),
+        last_tick.elapsed().as_nanos(),
+    );
+    let elapsed = (kind != "admitted").then(|| submitted.elapsed().as_millis());
+    shared
+        .lock()
+        .unwrap()
+        .event(kind, Some(id), Some(waited.as_wait()), elapsed);
+}
+
+#[derive(Default)]
+struct WaitNanos {
+    pressure: u128,
+    capacity: u128,
+    fifo: u128,
+    running_limit: u128,
+    admission: u128,
+}
+
+impl WaitNanos {
+    fn add(&mut self, reason: Option<&str>, elapsed: u128) {
+        match reason {
+            Some("waiting for earlier requests") => self.fifo += elapsed,
+            Some("running limit reached") => self.running_limit += elapsed,
+            Some("CPU budget in use" | "memory budget in use") => self.capacity += elapsed,
+            Some(
+                "awaiting admission"
+                | "waiting for a live pressure sample"
+                | "pressure sample is stale"
+                | "CPU pressure is unavailable"
+                | "memory pressure is unavailable",
+            )
+            | None => self.admission += elapsed,
+            Some(_) => self.pressure += elapsed,
+        }
+    }
+
+    fn as_wait(&self) -> Wait {
+        let parts = [
+            self.pressure,
+            self.capacity,
+            self.fifo,
+            self.running_limit,
+            self.admission,
+        ];
+        let ms = parts.map(|part| part / 1_000_000);
+        let remainder_ms = parts.iter().sum::<u128>() / 1_000_000 - ms.iter().sum::<u128>();
+        Wait {
+            pressure: ms[0],
+            capacity: ms[1],
+            fifo: ms[2],
+            running_limit: ms[3],
+            admission: ms[4] + remainder_ms,
+        }
+    }
 }
 
 enum QueueDecision {
@@ -569,7 +752,11 @@ enum QueueDecision {
     Cancelled,
 }
 
-fn hold_running(stream: &mut UnixStream, shared: &Arc<Mutex<State>>, id: u64) -> io::Result<()> {
+fn hold_running(
+    stream: &mut UnixStream,
+    shared: &Arc<Mutex<State>>,
+    id: u64,
+) -> io::Result<&'static str> {
     let mut buffer = Vec::new();
     let mut stop_sent = false;
     loop {
@@ -597,12 +784,20 @@ fn hold_running(stream: &mut UnixStream, shared: &Arc<Mutex<State>>, id: u64) ->
                 {
                     stop_group(pid)?;
                 }
-                return Ok(());
+                return Ok(if stop_sent { "cancelled" } else { "failed" });
             }
             Ok(_) if byte[0] == b'\n' => {
                 let line = std::str::from_utf8(&buffer).map_err(io::Error::other)?;
-                if line == "done" {
-                    return Ok(());
+                if let Some(status) = line.strip_prefix("done ") {
+                    return match status {
+                        "success" => Ok("completed"),
+                        "failed" => Ok("failed"),
+                        "cancelled" => Ok("cancelled"),
+                        _ => Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid lease outcome",
+                        )),
+                    };
                 }
                 if let Some(pid) = line
                     .strip_prefix("started ")
@@ -785,9 +980,10 @@ impl Admission for Lease {
         }
     }
 
-    fn finished(&mut self) -> io::Result<()> {
+    fn finished(&mut self, outcome: &str) -> io::Result<()> {
         self.stream.set_nonblocking(false)?;
-        self.stream.write_all(b"done\n")
+        self.stream
+            .write_all(format!("done {outcome}\n").as_bytes())
     }
 }
 

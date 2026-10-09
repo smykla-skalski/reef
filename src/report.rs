@@ -1,4 +1,5 @@
 use crate::history;
+use crate::schedule_events;
 use chrono::{DateTime, Duration, Utc};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,9 @@ pub struct Options {
     /// Private JSON Lines file written by reef run; may be repeated.
     #[arg(long = "records")]
     records: Vec<PathBuf>,
+    /// Scheduler state directory containing private intervention events.
+    #[arg(long)]
+    schedule_state_dir: Option<PathBuf>,
     /// Report format.
     #[arg(long, value_enum, default_value_t = Format::Markdown)]
     format: Format,
@@ -88,6 +92,7 @@ struct Report {
     peak_command_concurrency: Option<usize>,
     pressure: PressureReport,
     timeline: Vec<PressureEvent>,
+    scheduler: Option<schedule_events::Summary>,
 }
 
 #[derive(Serialize)]
@@ -343,6 +348,7 @@ fn build_report(
     samples: Vec<Observation>,
     records: Option<Vec<Measurement>>,
     thresholds: (u8, u8, u8),
+    scheduler: Option<schedule_events::Summary>,
 ) -> Report {
     let from_ms = u128::try_from(from.timestamp_millis()).unwrap_or_default();
     let to_ms = u128::try_from(to.timestamp_millis()).unwrap_or_default();
@@ -415,7 +421,11 @@ fn build_report(
     Report {
         from: from.to_rfc3339(),
         to: to.to_rfc3339(),
-        empty: samples.is_empty() && command_count.unwrap_or_default() == 0,
+        empty: samples.is_empty()
+            && command_count.unwrap_or_default() == 0
+            && scheduler
+                .as_ref()
+                .is_none_or(|summary| summary.submitted == 0 && summary.rejected == 0),
         observation_count: samples.len(),
         observed_working_ms,
         command_measurements_available: records.is_some(),
@@ -426,6 +436,7 @@ fn build_report(
         peak_command_concurrency,
         pressure,
         timeline,
+        scheduler,
     }
 }
 
@@ -509,6 +520,30 @@ fn markdown(report: &Report) -> String {
             );
         }
     }
+    out.push_str("\n## Scheduler interventions\n\n");
+    if let Some(scheduler) = &report.scheduler {
+        let _ = write!(
+            out,
+            "- Submitted: {}\n- Admitted: {}\n- Completed: {}\n- Failed: {}\n- Cancelled: {}\n- Rejected: {}\n- Queue wait p50/p95: {} / {} ms\n- Submission-to-finish p50/p95: {} / {} ms\n- Wait by reason (pressure/capacity/FIFO/running limit/admission): {} / {} / {} / {} / {} ms\n\nScheduler outcomes are observations, not evidence that Reef prevented pressure.\n",
+            scheduler.submitted,
+            scheduler.admitted,
+            scheduler.completed,
+            scheduler.failed,
+            scheduler.cancelled,
+            scheduler.rejected,
+            printable(scheduler.queue_wait_p50_ms),
+            printable(scheduler.queue_wait_p95_ms),
+            printable(scheduler.submission_to_finish_p50_ms),
+            printable(scheduler.submission_to_finish_p95_ms),
+            scheduler.wait.pressure,
+            scheduler.wait.capacity,
+            scheduler.wait.fifo,
+            scheduler.wait.running_limit,
+            scheduler.wait.admission,
+        );
+    } else {
+        out.push_str("Unavailable: no scheduler event history.\n");
+    }
     out
 }
 
@@ -558,6 +593,22 @@ pub fn run(options: &Options) -> io::Result<()> {
             options.memory_threshold,
             options.swap_threshold,
         ),
+        {
+            let dir = options.schedule_state_dir.clone().or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(".local/state/reef/schedule"))
+            });
+            match dir {
+                Some(dir) => schedule_events::read(&dir)?.map(|events| {
+                    schedule_events::summary(
+                        &events,
+                        u64::try_from(from.timestamp_millis()).unwrap_or_default(),
+                        u64::try_from(to.timestamp_millis()).unwrap_or_default(),
+                    )
+                }),
+                None => None,
+            }
+        },
     );
     match options.format {
         Format::Markdown => print!("{}", markdown(&report)),
@@ -613,6 +664,7 @@ mod tests {
                 command("test", 400, 500, 10),
             ]),
             (90, 90, 1),
+            None,
         );
         assert_eq!(report.command_count, Some(2));
         assert_eq!(report.peak_command_concurrency, Some(2));
@@ -633,7 +685,7 @@ mod tests {
 
     #[test]
     fn empty_and_unavailable_are_distinct_from_zero() {
-        let report = build_report(date(100), date(200), vec![], None, (90, 90, 1));
+        let report = build_report(date(100), date(200), vec![], None, (90, 90, 1), None);
         assert!(report.empty);
         assert!(!report.command_measurements_available);
         assert!(report.categories.is_none());
@@ -646,6 +698,7 @@ mod tests {
             vec![sample(150, Some(0.0), None)],
             Some(vec![]),
             (90, 90, 1),
+            None,
         );
         assert!(!measured.empty);
         assert_eq!(measured.command_count, Some(0));
@@ -667,6 +720,7 @@ mod tests {
             vec![sample(250, Some(95.0), Some(10))],
             Some(vec![command("build", 0, 100, 1)]),
             (90, 90, 1),
+            None,
         );
         assert_eq!(report.timeline.len(), 1);
         assert_eq!(
@@ -685,6 +739,7 @@ mod tests {
             vec![sample(250, Some(95.0), None)],
             Some(vec![command("build", 0, 100, 1)]),
             (90, 90, 1),
+            None,
         );
         assert_eq!(report.command_count, Some(0));
         assert_eq!(report.observation_count, 1);
@@ -708,6 +763,7 @@ mod tests {
             }],
             None,
             (90, 90, 1),
+            None,
         );
         assert_eq!(report.pressure.cpu_above_ms, Some(0));
         assert!(report.pressure.any_above_ms.is_none());
@@ -730,6 +786,7 @@ mod tests {
             .collect(),
             None,
             (90, 90, 1),
+            None,
         );
         assert_eq!(report.observed_working_ms, 1_500);
         assert_eq!(report.pressure.cpu_above_ms, Some(1_500));
@@ -748,6 +805,7 @@ mod tests {
             vec![sample(200, Some(95.0), Some(10)), missing],
             None,
             (90, 90, 1),
+            None,
         );
         assert_eq!(report.pressure.cpu_above_ms, Some(100));
         assert!(report.pressure.memory_above_ms.is_none());
@@ -762,6 +820,7 @@ mod tests {
             vec![],
             Some(vec![command("secret-command-arguments", 100, 200, 1)]),
             (90, 90, 1),
+            None,
         );
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("secret-command-arguments"));
