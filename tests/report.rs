@@ -57,6 +57,31 @@ fn reports_empty_range_with_unavailable_command_measurements() {
     assert!(report["pressure"]["any_above_ms"].is_null());
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_reports_missing_scheduler_history_as_unavailable() {
+    let fixture = Fixture::new();
+    let output = reef()
+        .args([
+            "report",
+            "--from",
+            "2026-01-01T00:00:00Z",
+            "--to",
+            "2026-01-02T00:00:00Z",
+            "--state-dir",
+        ])
+        .arg(&fixture.0)
+        .arg("--schedule-state-dir")
+        .arg(fixture.0.join("never-started"))
+        .args(["--format", "json"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["scheduler"].is_null());
+}
+
 #[test]
 fn explicit_records_work_without_a_home_directory() {
     let fixture = Fixture::new();
