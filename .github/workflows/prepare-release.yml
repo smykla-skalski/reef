@@ -1,0 +1,101 @@
+name: Prepare release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version component to increment
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: reef-prepare-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Plan and check version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUMP: ${{ inputs.bump }}
+        run: |
+          current=$(python scripts/release_version.py current)
+          next=$(python scripts/release_version.py next "$BUMP")
+          gh release view "v$current" --json isDraft --jq '.isDraft' | grep -qx false
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$next" >/dev/null 2> tag-error.txt; then
+            echo "Tag v$next already exists" >&2
+            exit 1
+          fi
+          if ! grep -q '(HTTP 404)' tag-error.txt; then
+            cat tag-error.txt >&2
+            exit 1
+          fi
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Check bumped source
+        env:
+          NEXT_VERSION: ${{ steps.version.outputs.next }}
+        run: |
+          python -m unittest discover -s scripts -p 'test_*.py'
+          python scripts/release_version.py apply "$NEXT_VERSION"
+          cargo fmt --all --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked
+          cargo build --release --locked
+          test "$(target/release/reef --version)" = "reef $NEXT_VERSION"
+
+      - name: Open version-bump PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT_VERSION: ${{ steps.version.outputs.next }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          branch="release/v$NEXT_VERSION"
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" --method POST \
+            -f ref="refs/heads/$branch" -f sha="$EXPECTED_SHA" >/dev/null
+          jq -n \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg branch "refs/heads/$branch" \
+            --arg sha "$EXPECTED_SHA" \
+            --arg version "$NEXT_VERSION" \
+            --arg cargo "$(base64 -w0 Cargo.toml)" \
+            --arg lock "$(base64 -w0 Cargo.lock)" \
+            --arg marker "$(base64 -w0 .release-version)" \
+            '{query:"mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",variables:{input:{branch:{repositoryNameWithOwner:$repo,refName:$branch},expectedHeadOid:$sha,message:{headline:("chore(release): bump Reef to " + $version),body:"Signed-off-by: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"},fileChanges:{additions:[{path:"Cargo.toml",contents:$cargo},{path:"Cargo.lock",contents:$lock},{path:".release-version",contents:$marker}]}}}}' \
+            | gh api graphql --input - --jq '.data.createCommitOnBranch.commit.oid' > commit-sha.txt
+          commit_sha=$(<commit-sha.txt)
+          [[ "$commit_sha" =~ ^[0-9a-f]{40}$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/commits/$commit_sha" --jq '.commit.verification.verified' | grep -qx true
+          body=$(printf '## Motivation\n\n> Changelog: skip\n\nPublish Reef v%s from the merged source with a reviewed version bump.\n\n## Implementation information\n\n- Update the package, lockfile, and release marker to v%s\n- Publish the tag and four native archives only after this PR merges\n' "$NEXT_VERSION" "$NEXT_VERSION")
+          gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" \
+            --title "chore(release): bump Reef to $NEXT_VERSION" --body "$body"
+          gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$branch"
+          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$branch"
