@@ -17,6 +17,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::new_with_options(&["--no-pressure"])
+    }
+
+    fn new_with_options(options: &[&str]) -> Self {
         let path = std::env::temp_dir().join(format!(
             "reef-schedule-test-{}-{}",
             std::process::id(),
@@ -24,9 +28,10 @@ impl Fixture {
         ));
         fs::create_dir(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-        let server = reef()
-            .args(["serve", "--cpu", "1", "--memory-mib", "1024", "--state-dir"])
-            .arg(&path)
+        let mut server_command = reef();
+        server_command.args(["serve", "--cpu", "1", "--memory-mib", "1024"]);
+        server_command.args(options).arg("--state-dir").arg(&path);
+        let server = server_command
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -105,6 +110,70 @@ fn unavailable_scheduler_does_not_start_command() {
     assert!(!output.status.success());
     assert!(!marker.exists());
     assert!(String::from_utf8_lossy(&output.stderr).contains("scheduler unavailable"));
+}
+
+#[test]
+fn live_memory_reserve_holds_and_cancels_a_queued_command() {
+    let mut system = sysinfo::System::new();
+    system.refresh_memory();
+    let reserve = (system.total_memory() / 1_048_576).saturating_sub(1);
+    let reserve_arg = reserve.to_string();
+    let fixture = Fixture::new_with_options(&["--memory-reserve-mib", &reserve_arg]);
+    let marker = fixture.path.join("unexpected-start");
+    let client = reef()
+        .arg("schedule")
+        .arg("--state-dir")
+        .arg(&fixture.path)
+        .args([
+            "--memory-mib",
+            "1",
+            "--",
+            "sh",
+            "-c",
+            "touch \"$REEF_MARKER\"",
+        ])
+        .env("REEF_MARKER", &marker)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    Fixture::wait_until(|| has_job(&fixture.jobs(), "queued"));
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(!marker.exists());
+    let id = fixture.jobs()[0]["id"].as_u64().unwrap();
+    let output = reef()
+        .arg("cancel")
+        .arg(id.to_string())
+        .arg("--state-dir")
+        .arg(&fixture.path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(client.wait_with_output().unwrap().status.code(), Some(130));
+}
+
+#[test]
+fn invalid_pressure_policy_fails_before_creating_server_state() {
+    let path = std::env::temp_dir().join(format!(
+        "reef-invalid-pressure-{}-{}",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let output = reef()
+        .args([
+            "serve",
+            "--cpu-recover-percent",
+            "95",
+            "--cpu-high-percent",
+            "90",
+            "--state-dir",
+        ])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid pressure thresholds"));
+    assert!(!path.exists());
 }
 
 #[test]
@@ -229,7 +298,15 @@ fn restarts_after_abrupt_server_exit() {
     fixture.server.kill().unwrap();
     fixture.server.wait().unwrap();
     fixture.server = reef()
-        .args(["serve", "--cpu", "1", "--memory-mib", "1024", "--state-dir"])
+        .args([
+            "serve",
+            "--cpu",
+            "1",
+            "--memory-mib",
+            "1024",
+            "--no-pressure",
+            "--state-dir",
+        ])
         .arg(&fixture.path)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

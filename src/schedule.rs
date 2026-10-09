@@ -1,3 +1,4 @@
+use crate::pressure::{self, Monitor, Policy};
 use crate::run::{self, Admission, AdmissionStatus};
 use fs2::FileExt;
 use nix::errno::Errno;
@@ -71,10 +72,11 @@ struct State {
     max_running: u32,
     waiting: VecDeque<Job>,
     running: HashMap<u64, Job>,
+    pressure: Option<Monitor>,
 }
 
 impl State {
-    fn new(cpu: u32, memory_mib: u64, max_running: u32) -> Self {
+    fn new(cpu: u32, memory_mib: u64, max_running: u32, pressure: Option<Monitor>) -> Self {
         Self {
             next_id: 1,
             cpu,
@@ -82,12 +84,21 @@ impl State {
             max_running,
             waiting: VecDeque::new(),
             running: HashMap::new(),
+            pressure,
         }
     }
 
     fn add(&mut self, cpu: u32, memory_mib: u64, identity: String) -> Result<u64, String> {
         if cpu == 0 || memory_mib == 0 || cpu > self.cpu || memory_mib > self.memory_mib {
             return Err("request exceeds the scheduler budget or has a zero estimate".into());
+        }
+        if identity.is_empty()
+            || identity.len() > 64
+            || !identity.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+            })
+        {
+            return Err("invalid workload identity".into());
         }
         let id = self.next_id;
         self.next_id = self
@@ -112,6 +123,13 @@ impl State {
         let used_cpu: u32 = self.running.values().map(|job| job.cpu).sum();
         let used_memory: u64 = self.running.values().map(|job| job.memory_mib).sum();
         let first = self.waiting.front().expect("checked front");
+        if self.pressure.as_ref().is_some_and(|pressure| {
+            pressure
+                .wait_reason(first.cpu, first.memory_mib, std::time::Instant::now())
+                .is_some()
+        }) {
+            return false;
+        }
         if self.running.len() >= self.max_running as usize
             || first.cpu > self.cpu - used_cpu
             || first.memory_mib > self.memory_mib - used_memory
@@ -212,6 +230,7 @@ pub fn serve(
     memory_mib: Option<u64>,
     max_running: Option<u32>,
     state_dir: Option<&Path>,
+    pressure_options: pressure::Options,
 ) -> io::Result<()> {
     let mut system = System::new_all();
     system.refresh_memory();
@@ -228,6 +247,7 @@ pub fn serve(
             .max(1)
     });
     let max_running = max_running.unwrap_or(cpu);
+    let monitor = make_monitor(pressure_options, &system)?;
     let dir = state_path(state_dir)?;
     private_dir(&dir)?;
     let socket = dir.join("reef.sock");
@@ -281,18 +301,48 @@ pub fn serve(
     })?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
-    let state = Arc::new(Mutex::new(State::new(cpu, memory_mib, max_running)));
+    let state = Arc::new(Mutex::new(State::new(
+        cpu,
+        memory_mib,
+        max_running,
+        monitor,
+    )));
     let stopping = Arc::new(AtomicBool::new(false));
+    if !pressure_options.no_pressure {
+        let state = Arc::clone(&state);
+        let stopping = Arc::clone(&stopping);
+        std::thread::spawn(move || monitor_pressure(&state, &stopping));
+    }
     for signal in [SIGINT, SIGTERM, SIGHUP, SIGQUIT] {
         signal_hook::flag::register(signal, Arc::clone(&stopping))?;
     }
     eprintln!(
         "reef: scheduler ready (cpu={cpu}, memory_mib={memory_mib}, max_running={max_running})"
     );
+    accept_clients(&listener, &state, &stopping)?;
+    drop(listener);
+    fs::remove_file(socket)
+}
+
+fn make_monitor(options: pressure::Options, system: &System) -> io::Result<Option<Monitor>> {
+    let policy = Policy::new(
+        options,
+        u32::try_from(system.cpus().len()).unwrap_or(u32::MAX),
+        system.total_memory(),
+    )
+    .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    Ok((!options.no_pressure).then(|| Monitor::new(policy)))
+}
+
+fn accept_clients(
+    listener: &UnixListener,
+    state: &Arc<Mutex<State>>,
+    stopping: &AtomicBool,
+) -> io::Result<()> {
     while !stopping.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
-                let state = Arc::clone(&state);
+                let state = Arc::clone(state);
                 std::thread::spawn(move || {
                     if let Err(error) = handle(stream, &state) {
                         eprintln!("reef: scheduler client: {error}");
@@ -303,8 +353,39 @@ pub fn serve(
             Err(error) => return Err(error),
         }
     }
-    drop(listener);
-    fs::remove_file(socket)
+    Ok(())
+}
+
+fn monitor_pressure(state: &Arc<Mutex<State>>, stopping: &AtomicBool) {
+    let mut system = System::new_all();
+    system.refresh_cpu_usage();
+    while !stopping.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_secs(1));
+        let sample = pressure::sample(&mut system);
+        let critical_jobs = {
+            let mut state = state.lock().unwrap();
+            if state
+                .pressure
+                .as_mut()
+                .is_some_and(|monitor| monitor.update(sample))
+            {
+                let mut jobs: Vec<_> = state
+                    .running
+                    .values()
+                    .map(|job| format!("{} ({})", job.identity, job.id))
+                    .collect();
+                jobs.sort();
+                Some(jobs.join(", "))
+            } else {
+                None
+            }
+        };
+        if let Some(jobs) = critical_jobs {
+            eprintln!(
+                "reef: critical workstation pressure; tracked running workloads: [{jobs}]; inspect `reef queue` and reduce load"
+            );
+        }
+    }
 }
 
 fn handle(mut stream: UnixStream, shared: &Arc<Mutex<State>>) -> io::Result<()> {
@@ -719,7 +800,7 @@ mod tests {
 
     #[test]
     fn fifo_admission_holds_small_job_behind_large_one() {
-        let mut state = State::new(4, 8, 3);
+        let mut state = State::new(4, 8, 3, None);
         let first = state.add(3, 4, "first".into()).unwrap();
         let second = state.add(2, 4, "second".into()).unwrap();
         let third = state.add(1, 1, "third".into()).unwrap();
@@ -733,7 +814,7 @@ mod tests {
 
     #[test]
     fn rejects_requests_that_cannot_fit() {
-        let mut state = State::new(2, 4096, 2);
+        let mut state = State::new(2, 4096, 2, None);
         assert!(state.add(3, 1, "oversized".into()).is_err());
         assert!(state.add(1, 4097, "oversized".into()).is_err());
         assert!(state.add(0, 1, "zero".into()).is_err());
@@ -741,7 +822,7 @@ mod tests {
 
     #[test]
     fn cancellation_and_release_free_capacity() {
-        let mut state = State::new(1, 1024, 1);
+        let mut state = State::new(1, 1024, 1, None);
         let first = state.add(1, 1024, "first".into()).unwrap();
         let second = state.add(1, 1024, "second".into()).unwrap();
         assert!(state.admit(first));
