@@ -2,6 +2,7 @@
 mod agents;
 #[cfg(unix)]
 mod cache;
+#[cfg(unix)]
 mod contain;
 mod history;
 mod observe;
