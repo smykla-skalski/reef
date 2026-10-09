@@ -145,13 +145,6 @@ pub fn run_with(
     let (result, forwarded, scheduler_lost, scheduler_cancelled) =
         wait_child(&mut child, &mut sampler, &mut signals, &mut admission)?;
     let exit_signal = platform::exit_signal(result.status);
-    if (admission.is_some() && !scheduler_cancelled)
-        || forwarded.is_some()
-        || (exit_signal.is_some() && !scheduler_cancelled)
-    {
-        cleanup_group(child.id())?;
-    }
-    drop(foreground);
     let cpu_ms = (result.rusage.utime + result.rusage.stime).as_millis();
     let signal = exit_signal;
     let exit_code = result.status.code();
@@ -181,6 +174,13 @@ pub fn run_with(
         tree_usage_complete: false,
     };
     report(&measurement, &mut record_writer);
+    if (admission.is_some() && !scheduler_cancelled)
+        || forwarded.is_some()
+        || (exit_signal.is_some() && !scheduler_cancelled)
+    {
+        cleanup_group(child.id())?;
+    }
+    drop(foreground);
     if scheduler_lost {
         return Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
