@@ -158,7 +158,14 @@ impl Monitor {
         notify
     }
 
-    pub fn wait_reason(&self, cpu: u32, memory_mib: u64, now: Instant) -> Option<&'static str> {
+    pub fn wait_reason(
+        &self,
+        cpu: u32,
+        memory_mib: u64,
+        running_cpu: u32,
+        running_memory_mib: u64,
+        now: Instant,
+    ) -> Option<&'static str> {
         let Some(sample) = self.sample else {
             return Some("waiting for a live pressure sample");
         };
@@ -175,11 +182,17 @@ impl Monitor {
             return Some("machine pressure is above the recovery threshold");
         }
         let idle_cores = (1.0 - f64::from(cpu_percent) / 100.0) * f64::from(self.policy.cpu_cores);
-        if idle_cores < f64::from(cpu.saturating_add(self.policy.cpu_reserve)) {
+        if idle_cores
+            < f64::from(
+                cpu.saturating_add(running_cpu)
+                    .saturating_add(self.policy.cpu_reserve),
+            )
+        {
             return Some("interactive CPU reserve would be consumed");
         }
         if u128::from(memory_used)
             + u128::from(memory_mib) * u128::from(MIB)
+            + u128::from(running_memory_mib) * u128::from(MIB)
             + u128::from(self.policy.memory_reserve)
             > u128::from(self.policy.memory_total)
         {
@@ -231,7 +244,7 @@ mod tests {
         let mut monitor = Monitor::new(Policy::new(options(), 8, 16 * 1024 * MIB).unwrap());
         let start = Instant::now();
         monitor.update(sample(start, Some(90.0), Some(8_000)));
-        assert!(monitor.wait_reason(1, 1024, start).is_some());
+        assert!(monitor.wait_reason(1, 1024, 0, 0, start).is_some());
         monitor.update(sample(
             start + Duration::from_secs(1),
             Some(50.0),
@@ -244,7 +257,7 @@ mod tests {
         ));
         assert!(
             monitor
-                .wait_reason(1, 1024, start + Duration::from_secs(5))
+                .wait_reason(1, 1024, 0, 0, start + Duration::from_secs(5))
                 .is_some()
         );
         monitor.update(sample(
@@ -254,7 +267,7 @@ mod tests {
         ));
         assert!(
             monitor
-                .wait_reason(1, 1024, start + Duration::from_secs(6))
+                .wait_reason(1, 1024, 0, 0, start + Duration::from_secs(6))
                 .is_none()
         );
     }
@@ -264,7 +277,7 @@ mod tests {
         let mut monitor = Monitor::new(Policy::new(options(), 8, 16 * 1024 * MIB).unwrap());
         let start = Instant::now();
         monitor.update(sample(start, None, Some(1_000)));
-        assert!(monitor.wait_reason(1, 1024, start).is_some());
+        assert!(monitor.wait_reason(1, 1024, 0, 0, start).is_some());
         monitor.update(sample(
             start + Duration::from_secs(6),
             Some(10.0),
@@ -272,13 +285,13 @@ mod tests {
         ));
         assert!(
             monitor
-                .wait_reason(1, 1024, start + Duration::from_secs(10))
+                .wait_reason(1, 1024, 0, 0, start + Duration::from_secs(10))
                 .is_some()
         );
     }
 
     #[test]
-    fn reserve_checks_next_job_without_double_counting_running_jobs() {
+    fn reserve_checks_next_job_against_live_capacity() {
         let mut monitor = Monitor::new(Policy::new(options(), 8, 16 * 1024 * MIB).unwrap());
         let start = Instant::now();
         monitor.update(sample(start, Some(10.0), Some(12_000)));
@@ -289,19 +302,34 @@ mod tests {
         ));
         assert!(
             monitor
-                .wait_reason(1, 1024, start + Duration::from_secs(5))
+                .wait_reason(1, 1024, 0, 0, start + Duration::from_secs(5))
                 .is_none()
         );
         assert!(
             monitor
-                .wait_reason(1, 4096, start + Duration::from_secs(5))
+                .wait_reason(1, 4096, 0, 0, start + Duration::from_secs(5))
                 .is_some()
         );
         assert!(
             monitor
-                .wait_reason(7, 1024, start + Duration::from_secs(5))
+                .wait_reason(7, 1024, 0, 0, start + Duration::from_secs(5))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn concurrent_grants_cannot_spend_the_same_live_headroom() {
+        let mut monitor = Monitor::new(Policy::new(options(), 8, 16 * 1024 * MIB).unwrap());
+        let start = Instant::now();
+        monitor.update(sample(start, Some(10.0), Some(4_000)));
+        monitor.update(sample(
+            start + Duration::from_secs(5),
+            Some(10.0),
+            Some(4_000),
+        ));
+        let now = start + Duration::from_secs(5);
+        assert!(monitor.wait_reason(4, 1024, 0, 0, now).is_none());
+        assert!(monitor.wait_reason(4, 1024, 4, 1024, now).is_some());
     }
 
     #[test]

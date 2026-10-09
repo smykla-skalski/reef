@@ -125,7 +125,13 @@ impl State {
         let first = self.waiting.front().expect("checked front");
         if self.pressure.as_ref().is_some_and(|pressure| {
             pressure
-                .wait_reason(first.cpu, first.memory_mib, std::time::Instant::now())
+                .wait_reason(
+                    first.cpu,
+                    first.memory_mib,
+                    used_cpu,
+                    used_memory,
+                    std::time::Instant::now(),
+                )
                 .is_some()
         }) {
             return false;
