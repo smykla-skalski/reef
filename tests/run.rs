@@ -101,7 +101,7 @@ fn preserves_streams_exit_status_and_private_record() {
 }
 
 #[test]
-fn rejects_public_record_before_starting_command() {
+fn skips_public_record_but_runs_command() {
     let fixture = Fixture::new();
     let record = fixture.record();
     fs::write(&record, "").unwrap();
@@ -111,15 +111,33 @@ fn rejects_public_record_before_starting_command() {
         .args(["run", "--record"])
         .arg(&record)
         .args(["--", "sh", "-c"])
-        .arg(format!("touch {}", marker.display()))
+        .arg(format!("touch {}; exit 7", marker.display()))
         .output()
         .unwrap();
-    assert!(!output.status.success());
-    assert!(!marker.exists());
+    assert_eq!(output.status.code(), Some(7));
+    assert!(marker.exists());
+    assert_eq!(fs::read(&record).unwrap(), b"");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot open measurement record"));
 }
 
 #[test]
-fn rejects_pipe_record_without_waiting_for_a_reader() {
+fn runs_command_when_record_directory_is_missing() {
+    let fixture = Fixture::new();
+    let record = fixture.0.join("missing").join("measurements.jsonl");
+    let output = reef()
+        .args(["run", "--record"])
+        .arg(&record)
+        .args(["--", "sh", "-c", "printf 'started\\n'; exit 7"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(output.stdout, b"started\n");
+    assert!(!record.exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot open measurement record"));
+}
+
+#[test]
+fn skips_pipe_record_without_waiting_for_a_reader() {
     let fixture = Fixture::new();
     let record = fixture.record();
     assert!(
@@ -132,7 +150,7 @@ fn rejects_pipe_record_without_waiting_for_a_reader() {
     let mut child = reef()
         .args(["run", "--record"])
         .arg(&record)
-        .args(["--", "sh", "-c", ":"])
+        .args(["--", "sh", "-c", "exit 7"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -149,7 +167,7 @@ fn rejects_pipe_record_without_waiting_for_a_reader() {
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    assert!(!status.success());
+    assert_eq!(status.code(), Some(7));
 }
 
 #[test]
@@ -225,6 +243,40 @@ fn forwards_interrupt_and_saves_cancelled_measurement() {
     .unwrap();
     let status = child.wait().unwrap();
     assert!(!status.success());
+    let result: Value = serde_json::from_str(fs::read_to_string(record).unwrap().trim()).unwrap();
+    assert_eq!(result["status"], "cancelled");
+    assert_eq!(result["signal"], 15);
+}
+
+#[test]
+fn forwards_later_interrupt_after_the_first_is_ignored() {
+    let fixture = Fixture::new();
+    let record = fixture.record();
+    let ready = fixture.0.join("ready");
+    let mut child = reef()
+        .args(["run", "--record"])
+        .arg(&record)
+        .args([
+            "--",
+            "sh",
+            "-c",
+            "trap '' INT; trap 'exit 42' TERM; touch \"$REEF_READY\"; while :; do sleep 1; done",
+        ])
+        .env("REEF_READY", &ready)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(Instant::now() < deadline, "command never started");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let pid = Pid::from_raw(i32::try_from(child.id()).unwrap());
+    kill(pid, Signal::SIGINT).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    kill(pid, Signal::SIGTERM).unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(42));
     let result: Value = serde_json::from_str(fs::read_to_string(record).unwrap().trim()).unwrap();
     assert_eq!(result["status"], "cancelled");
     assert_eq!(result["signal"], 15);

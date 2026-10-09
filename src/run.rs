@@ -84,7 +84,7 @@ pub fn run(
     identity: &str,
     record: Option<&Path>,
 ) -> io::Result<u8> {
-    let mut record_file = record.map(open_record).transpose()?;
+    let mut record_file = open_optional_record(record);
 
     let mut signals = platform::signals()?;
     let started_at_unix_ms = unix_ms();
@@ -135,11 +135,11 @@ pub fn run(
     let result = loop {
         sampler.sample(root);
         for signal in signals.pending() {
+            platform::forward(child.id(), signal)?;
             if forwarded.is_none() {
-                platform::forward(child.id(), signal)?;
-                forwarded = Some(signal);
                 interrupted_at = Some(Instant::now());
             }
+            forwarded = Some(signal);
         }
         if let Some(result) = child.try_wait4()? {
             break result;
@@ -242,6 +242,16 @@ fn report(measurement: &Measurement<'_>, record_file: Option<&mut File>) {
     if let Err(error) = emit(measurement, record_file) {
         eprintln!("reef: cannot save measurement: {error}");
     }
+}
+
+fn open_optional_record(record: Option<&Path>) -> Option<File> {
+    record.and_then(|path| match open_record(path) {
+        Ok(file) => Some(file),
+        Err(error) => {
+            eprintln!("reef: cannot open measurement record: {error}");
+            None
+        }
+    })
 }
 
 fn open_record(path: &Path) -> io::Result<File> {
