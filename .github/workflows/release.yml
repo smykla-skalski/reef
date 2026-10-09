@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - Cargo.toml
+      - Cargo.lock
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            asset: reef-macos-arm64
+            binary: reef
+          - os: macos-15-intel
+            asset: reef-macos-x86_64
+            binary: reef
+          - os: ubuntu-24.04
+            asset: reef-linux-x86_64
+            binary: reef
+          - os: windows-2022
+            asset: reef-windows-x86_64
+            binary: reef.exe
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Verify tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          REEF_TAG: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          test "$REEF_TAG" = "v$version"
+
+      - name: Build and test
+        shell: bash
+        run: |
+          cargo test --locked
+          cargo build --release --locked
+          target/release/${{ matrix.binary }} --version
+
+      - name: Package binary
+        shell: bash
+        env:
+          ASSET: ${{ matrix.asset }}
+          BINARY: ${{ matrix.binary }}
+        run: |
+          mkdir dist
+          tar -czf "dist/${ASSET}.tar.gz" -C target/release "$BINARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums and publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REEF_TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          sha256sum reef-*.tar.gz > SHA256SUMS
+          gh release create "$REEF_TAG" reef-*.tar.gz SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Reef $REEF_TAG" \
+            --generate-notes \
+            --verify-tag

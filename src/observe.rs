@@ -1,4 +1,5 @@
 use crate::ObserveOptions;
+use fs2::FileExt;
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -244,16 +245,15 @@ pub fn run(options: &ObserveOptions) -> io::Result<()> {
     let dir = state_dir(options.state_dir.as_deref())?;
     private_dir(&dir)?;
     let lock_path = dir.join("recorder.pid");
-    let mut lock = private_file(&lock_path, true).map_err(|error| {
-        if error.kind() == io::ErrorKind::AlreadyExists {
-            io::Error::new(
-                error.kind(),
-                "recorder already running or stale recorder.pid",
-            )
+    let mut lock = private_file(&lock_path, false)?;
+    lock.try_lock_exclusive().map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            io::Error::new(io::ErrorKind::AlreadyExists, "recorder already running")
         } else {
             error
         }
     })?;
+    lock.set_len(0)?;
     let stop_path = dir.join(format!("stop-{}", std::process::id()));
     if stop_path.exists() {
         fs::remove_file(&stop_path)?;
@@ -271,7 +271,7 @@ pub fn run(options: &ObserveOptions) -> io::Result<()> {
         .start_time();
     writeln!(lock, "{} {started}", std::process::id())?;
     let result = record_loop(&dir, &stop_path, options);
-    fs::remove_file(lock_path)?;
+    lock.set_len(0)?;
     result
 }
 
@@ -309,14 +309,11 @@ pub fn start(options: &ObserveOptions) -> io::Result<()> {
     let dir = state_dir(options.state_dir.as_deref())?;
     private_dir(&dir)?;
     let lock_path = dir.join("recorder.pid");
-    if lock_path.exists() {
-        if active_recorder_pid(&lock_path)?.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "recorder already running",
-            ));
-        }
-        fs::remove_file(&lock_path)?;
+    if lock_path.exists() && active_recorder_pid(&lock_path)?.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "recorder already running",
+        ));
     }
     let mut child = platform::spawn_detached(options, &dir)?;
     for _ in 0..20 {
