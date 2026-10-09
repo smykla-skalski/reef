@@ -5,6 +5,7 @@ use crate::history;
 use fs2::FileExt;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
@@ -393,15 +394,9 @@ fn command_process(
 ) -> io::Result<Command> {
     let command = if let Some(scope) = containment {
         let process = scope.command(command)?;
-        let mut args = vec!["systemd-run".to_owned()];
-        args.extend(
-            process
-                .get_args()
-                .map(|arg| arg.to_string_lossy().into_owned()),
-        );
-        args
+        scoped_command_args(&process)
     } else {
-        command.to_vec()
+        command.iter().map(OsString::from).collect()
     };
     let mut process = if interactive || scheduled {
         let mut wrapper = Command::new("/bin/sh");
@@ -425,6 +420,12 @@ fn command_process(
     }
     platform::isolate(&mut process);
     Ok(process)
+}
+
+fn scoped_command_args(process: &Command) -> Vec<OsString> {
+    std::iter::once(process.get_program().to_os_string())
+        .chain(process.get_args().map(std::ffi::OsStr::to_os_string))
+        .collect()
 }
 
 fn cleanup_group(pid: u32) -> io::Result<()> {
@@ -486,4 +487,21 @@ fn open_record(path: &Path) -> io::Result<File> {
         ));
     }
     Ok(file)
+}
+
+#[cfg(test)]
+mod scoped_command_tests {
+    use super::scoped_command_args;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::process::Command;
+
+    #[test]
+    fn keeps_non_utf8_scope_arguments() {
+        let path = OsString::from_vec(vec![b'/', b't', b'm', b'p', b'/', 0xff]);
+        let mut process = Command::new("systemd-run");
+        process.arg(&path);
+        let args = scoped_command_args(&process);
+        assert_eq!(args[1].as_bytes(), path.as_bytes());
+    }
 }

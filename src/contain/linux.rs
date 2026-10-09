@@ -49,6 +49,7 @@ impl Containment {
             ));
         }
         let _ = limits.properties()?;
+        probe_controllers(limits)?;
         let registry = registry_dir()?;
         reap_stale(&registry)?;
         let timestamp = SystemTime::now()
@@ -119,32 +120,7 @@ impl Containment {
     }
 
     pub fn command(&self, command: &[String]) -> io::Result<Command> {
-        let mut process = Command::new("systemd-run");
-        process.args([
-            "--user",
-            "--scope",
-            "--collect",
-            "--quiet",
-            "--description=Reef workload",
-            "--unit",
-            &self.unit,
-        ]);
-        for property in self.limits.properties()? {
-            process.arg("--property").arg(property);
-        }
-        let executable = std::env::current_exe()?;
-        let expected_json = serde_json::to_string(&self.limits)?;
-        process
-            .arg("--")
-            .arg(escape_expansion(&executable.to_string_lossy()))
-            .arg("contain-exec")
-            .arg("--snapshot")
-            .arg(escape_expansion(&self.snapshot_path.to_string_lossy()))
-            .arg("--expected-json")
-            .arg(escape_expansion(&expected_json))
-            .arg("--")
-            .args(command.iter().map(|arg| escape_expansion(arg)));
-        Ok(process)
+        scope_command(&self.limits, &self.unit, &self.snapshot_path, command)
     }
 
     pub fn sample(&mut self) {
@@ -247,6 +223,93 @@ impl Containment {
     pub fn boundaries(&self) -> Vec<Boundary> {
         self.boundaries.clone()
     }
+}
+
+fn scope_command(
+    limits: &Limits,
+    unit: &str,
+    snapshot_path: &Path,
+    command: &[String],
+) -> io::Result<Command> {
+    let mut process = Command::new("systemd-run");
+    process.args([
+        "--user",
+        "--scope",
+        "--collect",
+        "--quiet",
+        "--expand-environment=no",
+        "--description=Reef workload",
+        "--unit",
+        unit,
+    ]);
+    for property in limits.properties()? {
+        process.arg("--property").arg(property);
+    }
+    let executable = std::env::current_exe()?;
+    let expected_json = serde_json::to_string(limits)?;
+    process
+        .arg("--")
+        .arg(executable)
+        .arg("contain-exec")
+        .arg("--snapshot")
+        .arg(snapshot_path)
+        .arg("--expected-json")
+        .arg(expected_json)
+        .arg("--")
+        .args(command);
+    Ok(process)
+}
+
+fn probe_controllers(limits: &Limits) -> io::Result<()> {
+    let output = Command::new("systemctl")
+        .args(["--user", "show", "--property=ControlGroup", "--value"])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cannot inspect systemd user manager cgroup controllers",
+        ));
+    }
+    let group = String::from_utf8(output.stdout).map_err(io::Error::other)?;
+    let relative = group
+        .trim()
+        .strip_prefix('/')
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| io::Error::other("invalid systemd user manager cgroup"))?;
+    if Path::new(relative)
+        .components()
+        .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(io::Error::other("invalid systemd user manager cgroup"));
+    }
+    let controllers = fs::read_to_string(
+        Path::new("/sys/fs/cgroup")
+            .join(relative)
+            .join("cgroup.controllers"),
+    )?;
+    if let Some(controller) = missing_controller(limits, &controllers) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "{controller} controller is not delegated to the systemd user manager; command was not started"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn missing_controller(limits: &Limits, available: &str) -> Option<&'static str> {
+    [
+        (limits.cpu_percent.is_some(), "cpu"),
+        (limits.memory_cap_mib.is_some(), "memory"),
+        (limits.tasks.is_some(), "pids"),
+        (limits.io_read.is_some() || limits.io_write.is_some(), "io"),
+    ]
+    .into_iter()
+    .find_map(|(requested, controller)| {
+        (requested && !available.split_whitespace().any(|item| item == controller))
+            .then_some(controller)
+    })
 }
 
 impl Drop for Containment {
@@ -369,10 +432,6 @@ fn counter(contents: &str, key: &str) -> Option<u64> {
     })
 }
 
-fn escape_expansion(value: &str) -> String {
-    value.replace('$', "$$")
-}
-
 pub fn exec_payload(command: &[String], snapshot: &Path, expected_json: &str) -> io::Result<u8> {
     let limits: Limits = serde_json::from_str(expected_json)?;
     verify_applied_limits(&limits)?;
@@ -463,15 +522,30 @@ fn verify_number(path: &Path, requested: u64, resource: &str) -> io::Result<()> 
 }
 
 fn verify_io(group: &Path, limit: &super::IoLimit, field: &str, resource: &str) -> io::Result<()> {
-    let metadata = fs::metadata(&limit.path)?;
-    let device = if metadata.file_type().is_block_device() {
-        metadata.rdev()
+    let device_key = io_device_key(Path::new(&limit.path))?;
+    let unit = group
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| name.starts_with("reef-") && name.strip_suffix(".scope").is_some())
+        .ok_or_else(|| limit_not_applied(resource))?;
+    let property = if field == "rbps" {
+        "IOReadBandwidthMax"
     } else {
-        metadata.dev()
+        "IOWriteBandwidthMax"
     };
-    let major = ((device >> 8) & 0xfff) | ((device >> 32) & 0xffff_f000);
-    let minor = (device & 0xff) | ((device >> 12) & 0xffff_ff00);
-    let device_key = format!("{major}:{minor}");
+    let output = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            unit,
+            &format!("--property={property}"),
+            "--value",
+        ])
+        .output()?;
+    let expected = format!("{} {}\n", limit.path, limit.bytes_per_second);
+    if !output.status.success() || output.stdout != expected.as_bytes() {
+        return Err(limit_not_applied(resource));
+    }
     let contents = fs::read_to_string(group.join("io.max"))?;
     let applied = contents.lines().any(|line| {
         let mut fields = line.split_whitespace();
@@ -488,6 +562,60 @@ fn verify_io(group: &Path, limit: &super::IoLimit, field: &str, resource: &str) 
     } else {
         Err(limit_not_applied(resource))
     }
+}
+
+fn io_device_key(path: &Path) -> io::Result<String> {
+    let metadata = fs::metadata(path)?;
+    let device = if metadata.file_type().is_block_device() {
+        metadata.rdev()
+    } else {
+        let output = Command::new("findmnt")
+            .args(["--noheadings", "--output", "SOURCE", "--target"])
+            .arg(path)
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other("cannot resolve I/O backing device"));
+        }
+        let source = String::from_utf8(output.stdout).map_err(io::Error::other)?;
+        let block = source_block_device(source.trim())
+            .ok_or_else(|| io::Error::other("I/O path is not backed by a simple block device"))?;
+        let metadata = fs::metadata(block)?;
+        if !metadata.file_type().is_block_device() {
+            return Err(io::Error::other("I/O path is not backed by a block device"));
+        }
+        metadata.rdev()
+    };
+    let major = ((device >> 8) & 0xfff) | ((device >> 32) & 0xffff_f000);
+    let minor = (device & 0xff) | ((device >> 12) & 0xffff_ff00);
+    let sysfs = fs::canonicalize(format!("/sys/dev/block/{major}:{minor}"))?;
+    whole_disk_key(&sysfs)
+}
+
+fn source_block_device(source: &str) -> Option<&str> {
+    let block = source.split_once('[').map_or(source, |(block, _)| block);
+    block.starts_with("/dev/").then_some(block)
+}
+
+fn whole_disk_key(sysfs: &Path) -> io::Result<String> {
+    let disk = if sysfs.join("partition").is_file() {
+        sysfs
+            .parent()
+            .ok_or_else(|| io::Error::other("invalid partition device"))?
+    } else {
+        sysfs
+    };
+    let key = fs::read_to_string(disk.join("dev"))?;
+    let key = key.trim();
+    let (major, minor) = key
+        .split_once(':')
+        .ok_or_else(|| io::Error::other("invalid block device number"))?;
+    let major = major
+        .parse::<u32>()
+        .map_err(|_| io::Error::other("invalid block device number"))?;
+    let minor = minor
+        .parse::<u32>()
+        .map_err(|_| io::Error::other("invalid block device number"))?;
+    Ok(format!("{major}:{minor}"))
 }
 
 fn limit_not_applied(resource: &str) -> io::Error {
@@ -536,7 +664,10 @@ fn own_cgroup() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{counter, escape_expansion, scope_absent, verify_number};
+    use super::{
+        counter, missing_controller, scope_absent, scope_command, source_block_device,
+        verify_number, whole_disk_key,
+    };
     use crate::contain::Limits;
     use std::fs;
     use std::os::unix::process::ExitStatusExt;
@@ -573,8 +704,51 @@ mod tests {
     }
 
     #[test]
-    fn protects_literal_dollars_in_command_arguments() {
-        assert_eq!(escape_expansion("${HOME} $$PATH"), "$${HOME} $$$$PATH");
+    fn passes_dollars_verbatim_with_expansion_disabled() {
+        let command = ["sh".to_owned(), "-c".to_owned(), "echo $HOME $$".to_owned()];
+        let scope = scope_command(
+            &Limits::default(),
+            "reef-test.scope",
+            std::path::Path::new("/tmp/reef-test-snapshot"),
+            &command,
+        )
+        .unwrap();
+        let args: Vec<_> = scope.get_args().collect();
+        assert!(args.contains(&std::ffi::OsStr::new("--expand-environment=no")));
+        assert_eq!(args.last(), Some(&std::ffi::OsStr::new("echo $HOME $$")));
+    }
+
+    #[test]
+    fn names_missing_delegated_controller() {
+        let limits = Limits {
+            io_write: Some(super::super::IoLimit {
+                path: "/tmp".into(),
+                bytes_per_second: 1024,
+            }),
+            ..Limits::default()
+        };
+        assert_eq!(missing_controller(&limits, "cpu memory pids"), Some("io"));
+        assert_eq!(missing_controller(&limits, "cpu io memory pids"), None);
+    }
+
+    #[test]
+    fn resolves_subvolume_source_to_parent_disk() {
+        assert_eq!(
+            source_block_device("/dev/vdb1[/scon/containers/test/rootfs]"),
+            Some("/dev/vdb1")
+        );
+        assert_eq!(source_block_device("tmpfs"), None);
+        let root = std::env::temp_dir().join(format!(
+            "reef-io-device-{}-{}",
+            std::process::id(),
+            super::NEXT_UNIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let partition = root.join("vdb/vdb1");
+        fs::create_dir_all(&partition).unwrap();
+        fs::write(root.join("vdb/dev"), "254:16\n").unwrap();
+        fs::write(partition.join("partition"), "1\n").unwrap();
+        assert_eq!(whole_disk_key(&partition).unwrap(), "254:16");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
