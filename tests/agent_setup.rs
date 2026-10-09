@@ -211,6 +211,26 @@ fn updates_only_a_reef_managed_plugin() {
     );
 }
 
+#[test]
+fn adopts_the_exact_plugin_shipped_before_setup_existed() {
+    let config = TestConfig::new();
+    fs::create_dir_all(config.0.join("plugins")).unwrap();
+    let current = include_str!("../integrations/opencode/reef-observe.js");
+    let old = current
+        .strip_prefix("// Managed by Reef. Install with: reef agents setup opencode\n")
+        .unwrap();
+    fs::write(config.plugin(), old).unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(config.plugin()).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(config.plugin(), permissions).unwrap();
+    }
+    assert!(!config.reef(true).status.success());
+    assert!(config.reef(false).status.success());
+    assert_eq!(fs::read_to_string(config.plugin()).unwrap(), current);
+}
+
 #[cfg(unix)]
 #[test]
 fn refuses_to_replace_symlinked_plugin() {

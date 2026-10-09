@@ -7,7 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 const OPENCODE_PLUGIN: &str = include_str!("../integrations/opencode/reef-observe.js");
-const MANAGED_HEADER: &str = "// Managed by Reef.";
+const MANAGED_HEADER: &str = "// Managed by Reef. Install with: reef agents setup opencode\n";
+const MANAGED_PREFIX: &str = "// Managed by Reef.";
 
 pub fn run(
     agent: Option<&str>,
@@ -242,7 +243,10 @@ fn opencode(
                     plugin.display()
                 )));
             }
-            if !current.starts_with(MANAGED_HEADER) {
+            let previous_plugin = OPENCODE_PLUGIN
+                .strip_prefix(MANAGED_HEADER)
+                .ok_or_else(|| io::Error::other("invalid bundled OpenCode plugin header"))?;
+            if !current.starts_with(MANAGED_PREFIX) && current != previous_plugin {
                 return Err(io::Error::other(format!(
                     "refusing to replace unmanaged OpenCode plugin: {}",
                     plugin.display()
