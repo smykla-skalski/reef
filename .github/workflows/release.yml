@@ -6,8 +6,12 @@ on:
       - .github/workflows/release.yml
       - Cargo.toml
       - Cargo.lock
+      - .release-version
   push:
+    branches: [main]
+    paths: [.release-version]
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -49,9 +53,19 @@ jobs:
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
           test "$REEF_TAG" = "v$version"
 
+      - name: Verify merged release marker
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          test "$(<.release-version)" = "$version"
+
       - name: Build and test
         shell: bash
         run: |
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            python3 -m unittest discover -s scripts -p 'test_*.py'
+          fi
           cargo test --locked
           cargo build --release --locked
           target/release/${{ matrix.binary }} --version
@@ -73,7 +87,7 @@ jobs:
 
   publish:
     name: Publish GitHub release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs: build
     runs-on: ubuntu-24.04
     permissions:
@@ -90,12 +104,37 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          REEF_TAG: ${{ github.ref_name }}
         run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            reef_tag="$GITHUB_REF_NAME"
+          else
+            reef_tag="v$(<.release-version)"
+            if tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$reef_tag" \
+              --jq 'select(.object.type == "commit") | .object.sha' 2> tag-error.txt); then
+              test "$tag_sha" = "$GITHUB_SHA"
+            elif grep -q '(HTTP 404)' tag-error.txt; then
+              gh api "repos/$GITHUB_REPOSITORY/git/refs" --method POST \
+                -f ref="refs/tags/$reef_tag" -f sha="$GITHUB_SHA" >/dev/null
+            else
+              cat tag-error.txt >&2
+              exit 1
+            fi
+          fi
           cd dist
           sha256sum reef-*.tar.gz > SHA256SUMS
-          gh release create "$REEF_TAG" reef-*.tar.gz SHA256SUMS \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Reef $REEF_TAG" \
-            --generate-notes \
-            --verify-tag
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$reef_tag" >/dev/null 2> release-error.txt; then
+            :
+          elif grep -q '(HTTP 404)' release-error.txt; then
+            gh release create "$reef_tag" --repo "$GITHUB_REPOSITORY" \
+              --title "Reef $reef_tag" --generate-notes --verify-tag --draft
+          else
+            cat release-error.txt >&2
+            exit 1
+          fi
+          for asset in reef-*.tar.gz SHA256SUMS; do
+            if ! gh release view "$reef_tag" --repo "$GITHUB_REPOSITORY" \
+              --json assets --jq '.assets[].name' | grep -Fxq "$asset"; then
+              gh release upload "$reef_tag" "$asset" --repo "$GITHUB_REPOSITORY"
+            fi
+          done
+          gh release edit "$reef_tag" --repo "$GITHUB_REPOSITORY" --draft=false

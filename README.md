@@ -190,6 +190,10 @@ mise run build
 cargo run -- status
 ```
 
+## Release
+
+Run the **Prepare release** GitHub Actions workflow on `main` and choose `patch`, `minor`, or `major`. It verifies the current published version and opens a version-bump PR with a GitHub-signed commit. Review and merge that PR through the normal checks. The changed `.release-version` marker then starts the four-platform release workflow, which creates the unsigned `vX.Y.Z` tag and publishes archives and checksums only after its builds and tests pass. Ordinary merges do not bump or publish versions.
+
 ## License
 
 [MIT](LICENSE)
