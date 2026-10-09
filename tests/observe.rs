@@ -83,7 +83,17 @@ fn recorder_recovers_after_abrupt_exit_without_running_twice() {
     let json: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
     assert!(json["observation_count"].as_u64().unwrap() > 0);
 
-    restarted.0.kill().unwrap();
-    restarted.0.wait().unwrap();
+    let stop = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args(["observe", "stop", "--state-dir"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(wait_until(|| restarted.0.try_wait().unwrap().is_some()));
+    assert!(restarted.0.wait().unwrap().success());
     fs::remove_dir_all(dir).unwrap();
 }

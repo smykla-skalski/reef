@@ -118,7 +118,7 @@ reef observe start --interval-seconds 60 --retention-days 14 --max-storage-mib 2
 reef observe stop
 ```
 
-Use `reef observe run` to keep the recorder in the foreground. All three commands accept `--state-dir` for an alternate location; pass it to `stop` as well when using a custom directory. Stopping takes effect at the next interval. A crashed recorder releases its lock, so the next run reuses `recorder.pid` without manual cleanup. Do not delete that file while a recorder is running.
+Use `reef observe run` to keep the recorder in the foreground. All three commands accept `--state-dir` for an alternate location; pass it to `stop` as well when using a custom directory. Stopping takes effect at the next interval. A crashed recorder releases its lock, so the next run reuses its state files without manual cleanup. Do not delete `recorder.pid` or `recorder.lock` while a recorder is running.
 
 Generate a workload report from observations and default command history; add custom record files with `--records`:
 

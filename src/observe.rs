@@ -244,8 +244,7 @@ fn active_recorder_pid(path: &Path) -> io::Result<Option<u32>> {
 pub fn run(options: &ObserveOptions) -> io::Result<()> {
     let dir = state_dir(options.state_dir.as_deref())?;
     private_dir(&dir)?;
-    let lock_path = dir.join("recorder.pid");
-    let mut lock = private_file(&lock_path, false)?;
+    let lock = private_file(&dir.join("recorder.lock"), false)?;
     lock.try_lock_exclusive().map_err(|error| {
         if error.kind() == io::ErrorKind::WouldBlock {
             io::Error::new(io::ErrorKind::AlreadyExists, "recorder already running")
@@ -253,7 +252,8 @@ pub fn run(options: &ObserveOptions) -> io::Result<()> {
             error
         }
     })?;
-    lock.set_len(0)?;
+    let mut pid_file = private_file(&dir.join("recorder.pid"), false)?;
+    pid_file.set_len(0)?;
     let stop_path = dir.join(format!("stop-{}", std::process::id()));
     if stop_path.exists() {
         fs::remove_file(&stop_path)?;
@@ -269,9 +269,9 @@ pub fn run(options: &ObserveOptions) -> io::Result<()> {
         .process(pid)
         .ok_or_else(|| io::Error::other("cannot identify recorder process"))?
         .start_time();
-    writeln!(lock, "{} {started}", std::process::id())?;
+    writeln!(pid_file, "{} {started}", std::process::id())?;
     let result = record_loop(&dir, &stop_path, options);
-    lock.set_len(0)?;
+    pid_file.set_len(0)?;
     result
 }
 
