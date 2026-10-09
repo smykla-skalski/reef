@@ -44,6 +44,7 @@ fn reports_empty_range_with_unavailable_command_measurements() {
         ])
         .arg(&fixture.0)
         .args(["--format", "json"])
+        .env("HOME", &fixture.0)
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -77,6 +78,7 @@ fn reads_records_and_never_prints_private_identity() {
         .arg("--records")
         .arg(&path)
         .args(["--format", "json"])
+        .env("HOME", &fixture.0)
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -105,6 +107,7 @@ fn rejects_malformed_records_without_partial_report() {
         .arg("--records")
         .arg(&path)
         .args(["--format", "json"])
+        .env("HOME", &fixture.0)
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -136,6 +139,7 @@ fn repeated_record_path_does_not_count_a_command_twice() {
         .arg("--records")
         .arg(&path)
         .args(["--format", "json"])
+        .env("HOME", &fixture.0)
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -143,4 +147,49 @@ fn repeated_record_path_does_not_count_a_command_twice() {
     assert_eq!(report["command_count"], 1);
     assert_eq!(report["categories"][0]["wall_ms"], 1000);
     assert_eq!(report["peak_command_concurrency"], 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn report_reads_default_history_without_records_flag() {
+    let fixture = Fixture::new();
+    let run = reef()
+        .args([
+            "run",
+            "--category",
+            "build",
+            "--identity",
+            "private-project",
+            "--",
+            "sh",
+            "-c",
+            "exit 7",
+        ])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+    assert_eq!(run.status.code(), Some(7));
+
+    let output = reef()
+        .args([
+            "report",
+            "--from",
+            "2020-01-01T00:00:00Z",
+            "--to",
+            "2100-01-01T00:00:00Z",
+            "--state-dir",
+        ])
+        .arg(&fixture.0)
+        .args(["--format", "json"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["command_measurements_available"], true);
+    assert_eq!(report["command_count"], 1);
+    assert_eq!(report["categories"][0]["category"], "build");
+    assert_eq!(report["categories"][0]["failed_or_cancelled"], 1);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("private-project"));
 }

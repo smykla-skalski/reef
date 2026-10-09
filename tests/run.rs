@@ -29,6 +29,10 @@ impl Fixture {
     fn record(&self) -> PathBuf {
         self.0.join("measurements.jsonl")
     }
+
+    fn history(&self) -> PathBuf {
+        self.0.join(".local/state/reef/history")
+    }
 }
 
 impl Drop for Fixture {
@@ -46,6 +50,174 @@ fn unix_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis()
+}
+
+#[test]
+fn default_run_saves_private_measurement_without_command_text() {
+    let fixture = Fixture::new();
+    let output = reef()
+        .args([
+            "run",
+            "--category",
+            "test",
+            "--identity",
+            "safe-job",
+            "--",
+            "sh",
+            "-c",
+            "printf 'child-output\\n'; exit 7",
+        ])
+        .env("HOME", &fixture.0)
+        .env("PRIVATE_TEST_SECRET", "do-not-save-me")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(output.stdout, b"child-output\n");
+    let paths: Vec<_> = fs::read_dir(fixture.history()).unwrap().collect();
+    assert_eq!(paths.len(), 1);
+    let path = paths[0].as_ref().unwrap().path();
+    let saved = fs::read_to_string(&path).unwrap();
+    let record: Value = serde_json::from_str(saved.trim()).unwrap();
+    assert_eq!(record["category"], "test");
+    assert_eq!(record["identity"], "safe-job");
+    assert_eq!(record["status"], "failed");
+    assert_eq!(record["exit_code"], 7);
+    assert!(record["started_at_unix_ms"].as_u64().is_some());
+    assert!(record["ended_at_unix_ms"].as_u64().is_some());
+    assert!(record["tree_cpu_ms"].as_u64().is_some());
+    assert!(!saved.contains("child-output"));
+    assert!(!saved.contains("do-not-save-me"));
+    assert!(!saved.contains("printf"));
+    assert_eq!(
+        fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(fixture.history())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+}
+
+#[test]
+fn no_record_disables_default_history_for_one_run() {
+    let fixture = Fixture::new();
+    let output = reef()
+        .args(["run", "--no-record", "--", "sh", "-c", "exit 7"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(7));
+    assert!(!fixture.history().exists());
+}
+
+#[test]
+fn custom_record_does_not_duplicate_into_default_history() {
+    let fixture = Fixture::new();
+    let output = reef()
+        .args(["run", "--record"])
+        .arg(fixture.record())
+        .args(["--", "sh", "-c", "exit 7"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(7));
+    assert!(fixture.record().exists());
+    assert!(!fixture.history().exists());
+}
+
+#[test]
+fn history_write_failure_warns_without_changing_child_result() {
+    let fixture = Fixture::new();
+    let home = fixture.0.join("not-a-directory");
+    fs::write(&home, "occupied").unwrap();
+    let output = reef()
+        .args(["run", "--", "sh", "-c", "printf 'child-output\\n'; exit 7"])
+        .env("HOME", home)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(output.stdout, b"child-output\n");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot save measurement"));
+}
+
+#[test]
+fn symlinked_history_is_rejected_without_writing_outside_reef() {
+    let fixture = Fixture::new();
+    let parent = fixture.0.join(".local/state/reef");
+    let outside = fixture.0.join("outside");
+    fs::create_dir_all(&parent).unwrap();
+    fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, parent.join("history")).unwrap();
+    let output = reef()
+        .args(["run", "--", "sh", "-c", "exit 7"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(7));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot save measurement"));
+    assert_eq!(fs::read_dir(outside).unwrap().count(), 0);
+}
+
+#[test]
+fn default_history_records_cancelled_command() {
+    let fixture = Fixture::new();
+    let ready = fixture.0.join("ready-default");
+    let mut child = reef()
+        .args(["run", "--", "sh", "-c", "touch \"$REEF_READY\"; sleep 30"])
+        .env("HOME", &fixture.0)
+        .env("REEF_READY", &ready)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(Instant::now() < deadline, "command never started");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    kill(
+        Pid::from_raw(i32::try_from(child.id()).unwrap()),
+        Signal::SIGTERM,
+    )
+    .unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(143));
+    let path = fs::read_dir(fixture.history())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let record: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(record["status"], "cancelled");
+    assert_eq!(record["signal"], 15);
+}
+
+#[test]
+fn recording_modes_cannot_be_combined() {
+    let fixture = Fixture::new();
+    let marker = fixture.0.join("not-started");
+    let output = reef()
+        .args(["run", "--record"])
+        .arg(fixture.record())
+        .args(["--no-record", "--", "sh", "-c", "touch \"$REEF_MARKER\""])
+        .env("REEF_MARKER", &marker)
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!marker.exists());
+    assert!(!fixture.history().exists());
 }
 
 #[test]
@@ -352,6 +524,36 @@ fn concurrent_runs_append_complete_records() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(records.len(), 24);
+}
+
+#[test]
+fn concurrent_default_history_contains_complete_records() {
+    let fixture = Fixture::new();
+    let children: Vec<_> = (0..16)
+        .map(|number| {
+            reef()
+                .args(["run", "--identity", &format!("job-{number}"), "--"])
+                .args(["sh", "-c", ":"])
+                .env("HOME", &fixture.0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for mut child in children {
+        assert!(child.wait().unwrap().success());
+    }
+
+    let records: Vec<_> = fs::read_dir(fixture.history())
+        .unwrap()
+        .map(|entry| {
+            let bytes = fs::read(entry.unwrap().path()).unwrap();
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        })
+        .collect();
+    assert_eq!(records.len(), 16);
+    assert!(records.iter().all(|record| record["status"] == "success"));
 }
 
 #[test]
