@@ -215,6 +215,7 @@ pub fn submit(options: &Options) -> io::Result<u8> {
         }
         if policy.local_fallback {
             eprintln!("reef: requesting fresh local scheduler admission");
+            let limits = crate::contain::Limits::default();
             return schedule::schedule(schedule::RunOptions {
                 command: &options.command,
                 category: &options.category,
@@ -223,6 +224,7 @@ pub fn submit(options: &Options) -> io::Result<u8> {
                 cpu: options.cpu,
                 memory_mib: options.memory_mib,
                 state_dir: options.state_dir.as_deref(),
+                limits: &limits,
             });
         }
         return Err(error);

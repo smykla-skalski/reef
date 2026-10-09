@@ -4,6 +4,8 @@ mod agents;
 mod cache;
 #[cfg(unix)]
 mod cache_impact;
+#[cfg(unix)]
+mod contain;
 mod history;
 mod observe;
 #[cfg(unix)]
@@ -39,6 +41,16 @@ enum Command {
     Cache {
         #[command(subcommand)]
         command: CacheCommand,
+    },
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    ContainExec {
+        #[arg(long)]
+        snapshot: PathBuf,
+        #[arg(long)]
+        expected_json: String,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
     },
     /// Launch a coding agent with resource-aware command shims.
     #[cfg(unix)]
@@ -96,6 +108,8 @@ enum Command {
         no_record: bool,
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        #[command(flatten)]
+        limits: contain::Limits,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -307,6 +321,12 @@ fn main() -> std::process::ExitCode {
             status::print();
             std::process::ExitCode::SUCCESS
         }
+        #[cfg(target_os = "linux")]
+        Command::ContainExec {
+            snapshot,
+            expected_json,
+            command,
+        } => command_result(contain::exec_payload(&command, &snapshot, &expected_json)),
         #[cfg(unix)]
         Command::Cache { command } => cache_command(command),
         #[cfg(unix)]
@@ -353,6 +373,7 @@ fn main() -> std::process::ExitCode {
             record,
             no_record,
             state_dir,
+            limits,
             command,
         } => command_result(schedule::schedule(schedule::RunOptions {
             command: &command,
@@ -362,6 +383,7 @@ fn main() -> std::process::ExitCode {
             cpu,
             memory_mib,
             state_dir: state_dir.as_deref(),
+            limits: &limits,
         })),
         #[cfg(unix)]
         Command::Queue { state_dir } => result(schedule::queue(state_dir.as_deref())),
