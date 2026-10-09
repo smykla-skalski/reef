@@ -8,6 +8,9 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+mod compare;
+pub use compare::{CompareOptions, run_compare};
+
 #[derive(Debug, clap::Args)]
 pub struct Options {
     /// Start of the range, inclusive, in RFC 3339 format. Defaults to 24 hours ago.
