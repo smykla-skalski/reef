@@ -109,13 +109,32 @@ jobs:
             reef_tag="$GITHUB_REF_NAME"
           else
             reef_tag="v$(<.release-version)"
-            gh api "repos/$GITHUB_REPOSITORY/git/refs" --method POST \
-              -f ref="refs/tags/$reef_tag" -f sha="$GITHUB_SHA" >/dev/null
+            if tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$reef_tag" \
+              --jq 'select(.object.type == "commit") | .object.sha' 2> tag-error.txt); then
+              test "$tag_sha" = "$GITHUB_SHA"
+            elif grep -q '(HTTP 404)' tag-error.txt; then
+              gh api "repos/$GITHUB_REPOSITORY/git/refs" --method POST \
+                -f ref="refs/tags/$reef_tag" -f sha="$GITHUB_SHA" >/dev/null
+            else
+              cat tag-error.txt >&2
+              exit 1
+            fi
           fi
           cd dist
           sha256sum reef-*.tar.gz > SHA256SUMS
-          gh release create "$reef_tag" reef-*.tar.gz SHA256SUMS \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Reef $reef_tag" \
-            --generate-notes \
-            --verify-tag
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$reef_tag" >/dev/null 2> release-error.txt; then
+            :
+          elif grep -q '(HTTP 404)' release-error.txt; then
+            gh release create "$reef_tag" --repo "$GITHUB_REPOSITORY" \
+              --title "Reef $reef_tag" --generate-notes --verify-tag --draft
+          else
+            cat release-error.txt >&2
+            exit 1
+          fi
+          for asset in reef-*.tar.gz SHA256SUMS; do
+            if ! gh release view "$reef_tag" --repo "$GITHUB_REPOSITORY" \
+              --json assets --jq '.assets[].name' | grep -Fxq "$asset"; then
+              gh release upload "$reef_tag" "$asset" --repo "$GITHUB_REPOSITORY"
+            fi
+          done
+          gh release edit "$reef_tag" --repo "$GITHUB_REPOSITORY" --draft=false
