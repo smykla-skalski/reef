@@ -13,6 +13,18 @@ use wait4::Wait4;
 
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(20);
 
+pub trait Admission {
+    fn started(&mut self, pid: u32) -> io::Result<()>;
+    fn status(&mut self) -> io::Result<AdmissionStatus>;
+    fn finished(&mut self) -> io::Result<()>;
+}
+
+pub enum AdmissionStatus {
+    Active,
+    Cancelled,
+    Disconnected,
+}
+
 #[derive(Serialize)]
 struct Measurement<'a> {
     category: &'a str,
@@ -84,80 +96,55 @@ pub fn run(
     identity: &str,
     record: Option<&Path>,
 ) -> io::Result<u8> {
+    run_with(command, category, identity, record, None)
+}
+
+pub fn run_with(
+    command: &[String],
+    category: &str,
+    identity: &str,
+    record: Option<&Path>,
+    mut admission: Option<&mut dyn Admission>,
+) -> io::Result<u8> {
     let mut record_file = open_optional_record(record);
 
     let mut signals = platform::signals()?;
     let started_at_unix_ms = unix_ms();
     let start = Instant::now();
     let interactive = io::stdin().is_terminal() && platform::has_foreground_stdin();
-    let mut process = command_process(command, interactive);
+    let mut process = command_process(command, interactive, admission.is_some());
     let mut child = match process.spawn() {
         Ok(child) => child,
         Err(error) => {
-            let code = if error.kind() == io::ErrorKind::NotFound {
-                127
-            } else {
-                126
-            };
-            let measurement = Measurement {
+            return Ok(spawn_failed(
+                &error,
                 category,
                 identity,
-                status: "failed",
-                exit_code: Some(code),
-                signal: None,
                 started_at_unix_ms,
-                ended_at_unix_ms: unix_ms(),
-                wall_ms: start.elapsed().as_millis(),
-                cpu_ms: 0,
-                peak_memory_bytes: 0,
-                tree_cpu_ms: 0,
-                tree_peak_memory_bytes: 0,
-                tree_usage_complete: false,
-            };
-            eprintln!("reef: command could not start: {error}");
-            report(&measurement, record_file.as_mut());
-            return Ok(u8::try_from(code).unwrap_or(1));
+                start,
+                record_file.as_mut(),
+            ));
         }
     };
-    let foreground = if interactive {
-        platform::wait_stopped(child.id())?;
-        let guard = platform::Foreground::activate(child.id())?;
-        platform::resume(child.id())?;
-        Some(guard)
-    } else {
-        None
-    };
-    let root = Pid::from_u32(child.id());
+    let foreground = prepare_child(&mut child, interactive, &mut admission)?;
     let mut sampler = TreeSampler::default();
-    let mut forwarded = None;
-    let mut interrupted_at = None;
-
-    let result = loop {
-        sampler.sample(root);
-        for signal in signals.pending() {
-            platform::forward(child.id(), signal)?;
-            if forwarded.is_none() {
-                interrupted_at = Some(Instant::now());
-            }
-            forwarded = Some(signal);
-        }
-        if let Some(result) = child.try_wait4()? {
-            break result;
-        }
-        if interrupted_at.is_some_and(|time| time.elapsed() >= Duration::from_secs(2)) {
-            platform::force_stop(child.id())?;
-        }
-        std::thread::sleep(SAMPLE_INTERVAL);
-    };
+    let (result, forwarded, scheduler_lost, scheduler_cancelled) =
+        wait_child(&mut child, &mut sampler, &mut signals, &mut admission)?;
     let exit_signal = platform::exit_signal(result.status);
-    if forwarded.is_some() || exit_signal.is_some() {
+    if (admission.is_some() && !scheduler_cancelled)
+        || forwarded.is_some()
+        || (exit_signal.is_some() && !scheduler_cancelled)
+    {
         cleanup_group(child.id())?;
     }
     drop(foreground);
     let cpu_ms = (result.rusage.utime + result.rusage.stime).as_millis();
     let signal = exit_signal;
     let exit_code = result.status.code();
-    let status = if forwarded.is_some() || signal.is_some_and(platform::is_interrupt_signal) {
+    let status = if scheduler_cancelled
+        || forwarded.is_some()
+        || signal.is_some_and(platform::is_interrupt_signal)
+    {
         "cancelled"
     } else if result.status.success() {
         "success"
@@ -180,10 +167,146 @@ pub fn run(
         tree_usage_complete: false,
     };
     report(&measurement, record_file.as_mut());
+    if scheduler_lost {
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "scheduler disconnected; command stopped",
+        ));
+    }
+    if let Some(lease) = admission.as_mut() {
+        lease.finished()?;
+    }
+    if scheduler_cancelled {
+        return Ok(130);
+    }
     Ok(exit_code.map_or_else(
         || 128_u8.saturating_add(u8::try_from(signal.or(forwarded).unwrap_or(1)).unwrap_or(1)),
         |code| u8::try_from(code).unwrap_or(1),
     ))
+}
+
+fn prepare_child(
+    child: &mut std::process::Child,
+    interactive: bool,
+    admission: &mut Option<&mut dyn Admission>,
+) -> io::Result<Option<platform::Foreground>> {
+    if (interactive || admission.is_some())
+        && let Err(error) = platform::wait_stopped(child.id())
+    {
+        let _ = platform::force_stop(child.id());
+        let _ = child.wait();
+        return Err(error);
+    }
+    if let Some(lease) = admission.as_mut()
+        && let Err(error) = lease.started(child.id())
+    {
+        platform::force_stop(child.id())?;
+        let _ = child.wait();
+        return Err(error);
+    }
+    let foreground = if interactive {
+        match platform::Foreground::activate(child.id()) {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                let _ = platform::force_stop(child.id());
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    if (interactive || admission.is_some())
+        && let Err(error) = platform::resume(child.id())
+    {
+        let _ = platform::force_stop(child.id());
+        let _ = child.wait();
+        return Err(error);
+    }
+    Ok(foreground)
+}
+
+fn wait_child(
+    child: &mut std::process::Child,
+    sampler: &mut TreeSampler,
+    signals: &mut signal_hook::iterator::Signals,
+    admission: &mut Option<&mut dyn Admission>,
+) -> io::Result<(wait4::ResUse, Option<i32>, bool, bool)> {
+    let root = Pid::from_u32(child.id());
+    let mut forwarded = None;
+    let mut interrupted_at = None;
+    let mut scheduler_lost = false;
+    let mut scheduler_cancelled = false;
+    loop {
+        sampler.sample(root);
+        if let Some(lease) = admission.as_mut() {
+            match lease.status().unwrap_or(AdmissionStatus::Disconnected) {
+                AdmissionStatus::Cancelled if !scheduler_cancelled => {
+                    let _ = platform::force_stop(child.id());
+                    scheduler_cancelled = true;
+                }
+                AdmissionStatus::Disconnected if !scheduler_lost => {
+                    platform::force_stop(child.id())?;
+                    scheduler_lost = true;
+                }
+                _ => {}
+            }
+        }
+        for signal in signals.pending() {
+            platform::forward(child.id(), signal)?;
+            if forwarded.is_none() {
+                interrupted_at = Some(Instant::now());
+            }
+            forwarded = Some(signal);
+        }
+        if let Some(result) = child.try_wait4()? {
+            if let Some(lease) = admission.as_mut() {
+                match lease.status().unwrap_or(AdmissionStatus::Disconnected) {
+                    AdmissionStatus::Cancelled => scheduler_cancelled = true,
+                    AdmissionStatus::Disconnected => scheduler_lost = true,
+                    AdmissionStatus::Active => {}
+                }
+            }
+            return Ok((result, forwarded, scheduler_lost, scheduler_cancelled));
+        }
+        if interrupted_at.is_some_and(|time| time.elapsed() >= Duration::from_secs(2)) {
+            platform::force_stop(child.id())?;
+        }
+        std::thread::sleep(SAMPLE_INTERVAL);
+    }
+}
+
+fn spawn_failed(
+    error: &io::Error,
+    category: &str,
+    identity: &str,
+    started_at_unix_ms: u128,
+    start: Instant,
+    record_file: Option<&mut File>,
+) -> u8 {
+    let code = if error.kind() == io::ErrorKind::NotFound {
+        127
+    } else {
+        126
+    };
+    let measurement = Measurement {
+        category,
+        identity,
+        status: "failed",
+        exit_code: Some(code),
+        signal: None,
+        started_at_unix_ms,
+        ended_at_unix_ms: unix_ms(),
+        wall_ms: start.elapsed().as_millis(),
+        cpu_ms: 0,
+        peak_memory_bytes: 0,
+        tree_cpu_ms: 0,
+        tree_peak_memory_bytes: 0,
+        tree_usage_complete: false,
+    };
+    eprintln!("reef: command could not start: {error}");
+    report(&measurement, record_file);
+    u8::try_from(code).unwrap_or(1)
 }
 
 fn unix_ms() -> u128 {
@@ -193,8 +316,8 @@ fn unix_ms() -> u128 {
         .as_millis()
 }
 
-fn command_process(command: &[String], interactive: bool) -> Command {
-    let mut process = if interactive {
+fn command_process(command: &[String], interactive: bool, scheduled: bool) -> Command {
+    let mut process = if interactive || scheduled {
         let mut wrapper = Command::new("/bin/sh");
         wrapper
             .arg("-c")
@@ -211,6 +334,9 @@ fn command_process(command: &[String], interactive: bool) -> Command {
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    if scheduled {
+        process.env("REEF_ADMITTED", "1");
+    }
     platform::isolate(&mut process);
     process
 }

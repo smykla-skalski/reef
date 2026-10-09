@@ -28,6 +28,28 @@ reef run --category build --identity project-build --record measurements.jsonl -
 
 `reef run` returns the command's exit code, including when saving a measurement fails. Its measurement includes Unix start and end timestamps in milliseconds, wall time, CPU time, and peak resident memory. The `tree_*` fields combine the direct child's kernel usage with 20 ms process-tree samples. `tree_usage_complete` is always `false` because descendants that start and exit between samples can be missed. Records contain only the category, label, status, timestamps, and measurements. Reef never saves command arguments or environment variables. New record files are mode `0600`; Reef skips persistence to public files and invalid paths while still running the command.
 
+## Shared scheduling (Unix)
+
+Start one scheduler per workstation, ideally under your user service manager:
+
+```console
+reef serve --cpu 6 --memory-mib 12288 --max-running 4
+```
+
+The scheduler runs in the foreground. Without explicit limits it reserves one logical CPU and 30% of physical memory for other work; `--max-running` defaults to the CPU budget. Its private Unix socket lives in `~/.local/state/reef/schedule/reef.sock`. Only one server can bind that path. Use `--state-dir` on every command to select another private directory.
+
+Queue a measured command with its estimated peak resource cost:
+
+```console
+reef schedule --cpu 2 --memory-mib 4096 --category build --identity kuma-build -- cargo build
+reef queue
+reef cancel 3
+```
+
+`reef queue` prints request IDs, safe labels, estimates, and queued/running states as JSON. Admission is FIFO, with no backfill: a later small job cannot pass a larger one at the head of the queue. Zero or over-budget estimates fail immediately. The defaults per command are one CPU and 1024 MiB. A queued command can be cancelled by ID or with Ctrl-C. Cancellation, failure, client termination, and normal completion release its reservation. If the server disappears, queued commands fail and running clients stop their process group. A command never starts when the scheduler is unavailable. Scheduled children inherit `REEF_ADMITTED=1` so a nested Reef shim can run without requesting another reservation; this marker is a coordination hint, not a security boundary.
+
+Scheduling reserves estimated capacity before a command starts. It does not enforce actual CPU or memory consumption on macOS; Linux containment is tracked separately. Estimate commands from `reef run` measurements and leave headroom for interactive apps. The daemon holds job state only in memory and never receives command arguments or environment variables.
+
 Start a background recorder with no project configuration:
 
 ```console
@@ -57,7 +79,6 @@ The default range is the last 24 hours. Its start is inclusive and its end is ex
 ## Planned capabilities
 
 - Attribute resource cost to agents and containers
-- Apply one global concurrency and resource budget across independent agents
 - Reserve CPU and memory for the developer's interactive applications
 - Reuse compatible results and persistent build caches
 - Offload work when local capacity is insufficient
