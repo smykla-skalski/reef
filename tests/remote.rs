@@ -296,10 +296,12 @@ fn missing_identity_uses_fresh_local_scheduler_admission() {
     let history = fixture.0.join(".local/state/reef/history");
     let record = fs::read_dir(history)
         .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .unwrap();
     let saved: serde_json::Value = serde_json::from_slice(&fs::read(record).unwrap()).unwrap();
     assert_eq!(saved["identity"], "job");
     assert_eq!(saved["status"], "success");

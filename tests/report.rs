@@ -57,6 +57,35 @@ fn reports_empty_range_with_unavailable_command_measurements() {
 }
 
 #[test]
+fn explicit_records_work_without_a_home_directory() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("measurements.jsonl");
+    fs::write(&path, "{\"category\":\"build\",\"status\":\"success\",\"started_at_unix_ms\":1767225600000,\"ended_at_unix_ms\":1767225601000,\"wall_ms\":1000,\"tree_cpu_ms\":500,\"tree_peak_memory_bytes\":4096}\n").unwrap();
+    let output = reef()
+        .args([
+            "report",
+            "--from",
+            "2026-01-01T00:00:00Z",
+            "--to",
+            "2026-01-02T00:00:00Z",
+            "--state-dir",
+        ])
+        .arg(&fixture.0)
+        .arg("--records")
+        .arg(&path)
+        .args(["--format", "json"])
+        .env_remove("HOME")
+        .env_remove("USERPROFILE")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["command_count"], 1);
+    assert_eq!(report["categories"][0]["category"], "build");
+}
+
+#[test]
 fn reads_records_and_never_prints_private_identity() {
     let fixture = Fixture::new();
     let path = fixture.0.join("measurements.jsonl");

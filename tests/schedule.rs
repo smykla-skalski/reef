@@ -110,10 +110,12 @@ fn scheduled_command_saves_default_history() {
     let history = fixture.path.join(".local/state/reef/history");
     let path = fs::read_dir(history)
         .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .unwrap();
     let record: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
     assert_eq!(record["category"], "test");
     assert_eq!(record["status"], "failed");

@@ -33,6 +33,17 @@ impl Fixture {
     fn history(&self) -> PathBuf {
         self.0.join(".local/state/reef/history")
     }
+
+    fn history_records(&self) -> Vec<PathBuf> {
+        fs::read_dir(self.history())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            })
+            .collect()
+    }
 }
 
 impl Drop for Fixture {
@@ -74,10 +85,10 @@ fn default_run_saves_private_measurement_without_command_text() {
 
     assert_eq!(output.status.code(), Some(7));
     assert_eq!(output.stdout, b"child-output\n");
-    let paths: Vec<_> = fs::read_dir(fixture.history()).unwrap().collect();
+    let paths = fixture.history_records();
     assert_eq!(paths.len(), 1);
-    let path = paths[0].as_ref().unwrap().path();
-    let saved = fs::read_to_string(&path).unwrap();
+    let path = &paths[0];
+    let saved = fs::read_to_string(path).unwrap();
     let record: Value = serde_json::from_str(saved.trim()).unwrap();
     assert_eq!(record["category"], "test");
     assert_eq!(record["identity"], "safe-job");
@@ -168,6 +179,30 @@ fn symlinked_history_is_rejected_without_writing_outside_reef() {
 }
 
 #[test]
+fn pruning_keeps_user_file_that_resembles_history() {
+    let fixture = Fixture::new();
+    let first = reef()
+        .args(["run", "--", "/usr/bin/true"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let user_file = fixture.history().join("command-1-1-1.jsonl");
+    fs::write(&user_file, "personal data").unwrap();
+    fs::set_permissions(&user_file, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let second = reef()
+        .args(["run", "--", "/usr/bin/true"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+
+    assert!(second.status.success());
+    assert_eq!(fs::read(&user_file).unwrap(), b"personal data");
+    assert_eq!(fixture.history_records().len(), 3);
+}
+
+#[test]
 fn default_history_records_cancelled_command() {
     let fixture = Fixture::new();
     let ready = fixture.0.join("ready-default");
@@ -191,12 +226,7 @@ fn default_history_records_cancelled_command() {
     )
     .unwrap();
     assert_eq!(child.wait().unwrap().code(), Some(143));
-    let path = fs::read_dir(fixture.history())
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let path = fixture.history_records().remove(0);
     let record: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
     assert_eq!(record["status"], "cancelled");
     assert_eq!(record["signal"], 15);
@@ -545,10 +575,11 @@ fn concurrent_default_history_contains_complete_records() {
         assert!(child.wait().unwrap().success());
     }
 
-    let records: Vec<_> = fs::read_dir(fixture.history())
-        .unwrap()
+    let records: Vec<_> = fixture
+        .history_records()
+        .into_iter()
         .map(|entry| {
-            let bytes = fs::read(entry.unwrap().path()).unwrap();
+            let bytes = fs::read(entry).unwrap();
             serde_json::from_slice::<Value>(&bytes).unwrap()
         })
         .collect();
