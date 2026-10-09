@@ -194,8 +194,8 @@ fn failed_execution_is_counted_but_not_used_as_a_cost_sample() {
 #[test]
 fn concurrent_first_time_cache_keys_keep_every_miss_event() {
     let fixture = Fixture::new();
-    let start = std::sync::Arc::new(std::sync::Barrier::new(16));
-    let work: Vec<_> = (0..16)
+    let start = std::sync::Arc::new(std::sync::Barrier::new(32));
+    let work: Vec<_> = (0..32)
         .map(|number| {
             let start = start.clone();
             let repo = fixture.repo.clone();
@@ -217,14 +217,39 @@ fn concurrent_first_time_cache_keys_keep_every_miss_event() {
     for worker in work {
         let output = worker.join().unwrap();
         assert!(output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            !String::from_utf8_lossy(&output.stderr).contains("cannot save cache impact event")
+            !stderr.contains("cannot save cache impact event"),
+            "{stderr}"
         );
+        assert!(!stderr.contains("cannot prune cache"), "{stderr}");
     }
     let impact = fixture.impact();
-    assert_eq!(impact["misses"], 16);
+    assert_eq!(impact["misses"], 32);
     assert_eq!(impact["hits"], 0);
     assert!(impact["estimated_reused_wall_ms"].is_null());
+}
+
+#[test]
+fn status_ignores_unpublished_entries() {
+    let fixture = Fixture::new();
+    let first = fixture.run("printf ok");
+    assert!(first.status.success());
+    let pending = fixture
+        .cache
+        .join("entries")
+        .join(format!(".{}.123", "a".repeat(64)));
+    fs::create_dir(&pending).unwrap();
+
+    let status = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args(["cache", "status", "--cache-dir"])
+        .arg(&fixture.cache)
+        .output()
+        .unwrap();
+
+    assert!(status.status.success());
+    let value: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(value["entries"], 1);
 }
 
 #[test]

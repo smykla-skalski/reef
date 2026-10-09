@@ -621,8 +621,19 @@ fn entries(root: &Path) -> io::Result<Vec<(PathBuf, u64, SystemTime)>> {
     let mut found = Vec::new();
     for item in fs::read_dir(root.join("entries"))? {
         let item = item?;
+        let name = item.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.len() != 64 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
         let path = item.path();
-        let metadata = fs::symlink_metadata(&path)?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             continue;
         }
@@ -672,7 +683,11 @@ pub fn prune(cache_dir: Option<&Path>, max_storage_mib: u64) -> io::Result<()> {
         }
         let expired = load_entry(&path, None)?.is_none();
         if expired || size > limit {
-            fs::remove_dir_all(&path)?;
+            match fs::remove_dir_all(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
             size = size.saturating_sub(bytes);
         }
     }
