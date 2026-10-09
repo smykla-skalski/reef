@@ -15,7 +15,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
   actions: write
 
 concurrency:
@@ -72,7 +71,7 @@ jobs:
           cargo build --release --locked
           test "$(target/release/reef --version)" = "reef $NEXT_VERSION"
 
-      - name: Open version-bump PR
+      - name: Create version-bump branch
         env:
           GH_TOKEN: ${{ github.token }}
           NEXT_VERSION: ${{ steps.version.outputs.next }}
@@ -115,12 +114,14 @@ jobs:
           fi
           [[ "$commit_sha" =~ ^[0-9a-f]{40}$ ]]
           gh api "repos/$GITHUB_REPOSITORY/commits/$commit_sha" --jq '.commit.verification.verified' | grep -qx true
-          body=$(printf '## Motivation\n\n> Changelog: skip\n\nPublish Reef v%s from the merged source with a reviewed version bump.\n\n## Implementation information\n\n- Update the package, lockfile, and release marker to v%s\n- Publish the tag and four native archives only after this PR merges\n' "$NEXT_VERSION" "$NEXT_VERSION")
-          pr_number=$(gh pr list --repo "$GITHUB_REPOSITORY" --base main --head "$branch" \
-            --state open --json number --jq '.[0].number // empty')
-          if [[ -z "$pr_number" ]]; then
-            gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" \
-              --title "chore(release): bump Reef to $NEXT_VERSION" --body "$body"
-          fi
           gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$branch"
           gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$branch"
+          {
+            printf '## Release branch ready\n\n'
+            printf -- '- Branch: %s\n' "$branch"
+            printf -- '- [Open the version-bump PR](https://github.com/%s/compare/main...%s?expand=1)\n\n' \
+              "$GITHUB_REPOSITORY" "$branch"
+            printf 'Suggested title: chore(release): bump Reef to %s\n\n' "$NEXT_VERSION"
+            printf 'Suggested PR changelog line:\n\n> Changelog: skip\n\n'
+            printf 'The tag and archives publish after the PR merges.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
