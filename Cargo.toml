@@ -1,6 +1,6 @@
 [package]
 name = "reef"
-version = "0.1.0"
+version = "0.0.1"
 description = "Resource-aware scheduling for coding agents"
 authors = ["Marcin Skalski"]
 edition = "2024"
@@ -14,10 +14,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+fs2 = "0.4.3"
 
 [target.'cfg(unix)'.dependencies]
 blake3 = "1"
-fs2 = "0.4.3"
 nix = { version = "0.31.3", features = ["fs", "process", "signal", "term", "user"] }
 signal-hook = "=0.4.4"
 wait4 = "0.2.0"

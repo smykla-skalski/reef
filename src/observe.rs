@@ -1,4 +1,5 @@
 use crate::ObserveOptions;
+use fs2::FileExt;
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -57,7 +58,7 @@ fn private_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn private_file(path: &Path, create_new: bool) -> io::Result<File> {
+fn private_file(path: &Path, create_new: bool, append: bool) -> io::Result<File> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(io::Error::other("state file must not be a symlink"));
@@ -66,7 +67,7 @@ fn private_file(path: &Path, create_new: bool) -> io::Result<File> {
         _ => {}
     }
     let mut options = OpenOptions::new();
-    options.write(true).append(true).create(true);
+    options.read(true).write(true).append(append).create(true);
     if create_new {
         options.create_new(true);
     }
@@ -203,7 +204,7 @@ fn append(dir: &Path, observation: &Observation, options: &ObserveOptions) -> io
         },
         |(_, path, _)| path.clone(),
     );
-    let mut file = private_file(&path, false)?;
+    let mut file = private_file(&path, false, true)?;
     file.write_all(&line)?;
     file.write_all(b"\n")?;
     file.sync_data()?;
@@ -243,17 +244,20 @@ fn active_recorder_pid(path: &Path) -> io::Result<Option<u32>> {
 pub fn run(options: &ObserveOptions) -> io::Result<()> {
     let dir = state_dir(options.state_dir.as_deref())?;
     private_dir(&dir)?;
-    let lock_path = dir.join("recorder.pid");
-    let mut lock = private_file(&lock_path, true).map_err(|error| {
-        if error.kind() == io::ErrorKind::AlreadyExists {
-            io::Error::new(
-                error.kind(),
-                "recorder already running or stale recorder.pid",
-            )
+    let lock = private_file(&dir.join("recorder.lock"), false, false)
+        .map_err(|error| io::Error::new(error.kind(), format!("open recorder lock: {error}")))?;
+    lock.try_lock_exclusive().map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            io::Error::new(io::ErrorKind::AlreadyExists, "recorder already running")
         } else {
-            error
+            io::Error::new(error.kind(), format!("lock recorder: {error}"))
         }
     })?;
+    let mut pid_file = private_file(&dir.join("recorder.pid"), false, false)
+        .map_err(|error| io::Error::new(error.kind(), format!("open recorder PID: {error}")))?;
+    pid_file
+        .set_len(0)
+        .map_err(|error| io::Error::new(error.kind(), format!("clear recorder PID: {error}")))?;
     let stop_path = dir.join(format!("stop-{}", std::process::id()));
     if stop_path.exists() {
         fs::remove_file(&stop_path)?;
@@ -269,9 +273,9 @@ pub fn run(options: &ObserveOptions) -> io::Result<()> {
         .process(pid)
         .ok_or_else(|| io::Error::other("cannot identify recorder process"))?
         .start_time();
-    writeln!(lock, "{} {started}", std::process::id())?;
+    writeln!(pid_file, "{} {started}", std::process::id())?;
     let result = record_loop(&dir, &stop_path, options);
-    fs::remove_file(lock_path)?;
+    pid_file.set_len(0)?;
     result
 }
 
@@ -309,14 +313,11 @@ pub fn start(options: &ObserveOptions) -> io::Result<()> {
     let dir = state_dir(options.state_dir.as_deref())?;
     private_dir(&dir)?;
     let lock_path = dir.join("recorder.pid");
-    if lock_path.exists() {
-        if active_recorder_pid(&lock_path)?.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "recorder already running",
-            ));
-        }
-        fs::remove_file(&lock_path)?;
+    if lock_path.exists() && active_recorder_pid(&lock_path)?.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "recorder already running",
+        ));
     }
     let mut child = platform::spawn_detached(options, &dir)?;
     for _ in 0..20 {
@@ -343,7 +344,7 @@ pub fn stop(dir: Option<&Path>) -> io::Result<()> {
     let pid = active_recorder_pid(&dir.join("recorder.pid"))?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "recorder is not running"))?;
     let stop_path = dir.join(format!("stop-{pid}"));
-    match private_file(&stop_path, true) {
+    match private_file(&stop_path, true, false) {
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error),
