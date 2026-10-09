@@ -78,8 +78,12 @@ fn now_ms() -> io::Result<u64> {
 }
 
 fn private_dir(path: &Path, create: bool) -> io::Result<bool> {
-    if create && !path.exists() {
-        fs::DirBuilder::new().mode(0o700).create(path)?;
+    if create {
+        match fs::DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
     }
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -97,6 +101,27 @@ fn private_dir(path: &Path, create: bool) -> io::Result<bool> {
         ));
     }
     Ok(true)
+}
+
+fn events_lock(dir: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(dir.join("events.lock"))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != nix::unistd::Uid::current().as_raw()
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cache impact lock must be a private owned file",
+        ));
+    }
+    Ok(file)
 }
 
 fn event_files(dir: &Path) -> io::Result<Vec<(u64, PathBuf, u64)>> {
@@ -155,13 +180,7 @@ fn prune(dir: &Path, now: u64) -> io::Result<()> {
 fn save(root: &Path, event: &Event) -> io::Result<()> {
     let dir = root.join("impact");
     private_dir(&dir, true)?;
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(dir.join("events.lock"))?;
+    let lock = events_lock(&dir)?;
     fs2::FileExt::lock_exclusive(&lock)?;
     let suffix = format!(
         "{}-{}-{}",
@@ -220,6 +239,8 @@ pub fn report(cache_dir: Option<&Path>, from_ms: u128, to_ms: u128) -> io::Resul
     if !private_dir(&dir, false)? {
         return Ok(Impact::default());
     }
+    let lock = events_lock(&dir)?;
+    fs2::FileExt::lock_shared(&lock)?;
     let mut events = Vec::new();
     for (_, path, _) in event_files(&dir)? {
         let mut bytes = Vec::new();
@@ -261,9 +282,48 @@ pub fn report(cache_dir: Option<&Path>, from_ms: u128, to_ms: u128) -> io::Resul
             samples.insert(event.key, cost);
         }
     }
-    if impact.hits == 0 {
-        impact.estimated_reused_wall_ms = Some(0);
-        impact.estimated_reused_cpu_ms = Some(0);
-    }
     Ok(impact)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn report_waits_for_active_cache_history_write() {
+        let root = std::env::temp_dir().join(format!(
+            "reef-cache-impact-lock-{}-{}",
+            std::process::id(),
+            now_ms().unwrap()
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let dir = root.join("impact");
+        private_dir(&dir, true).unwrap();
+        let lock = events_lock(&dir).unwrap();
+        fs2::FileExt::lock_exclusive(&lock).unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let report_root = root.clone();
+        let reader = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            done_tx
+                .send(report(Some(&report_root), 0, u128::MAX))
+                .unwrap();
+        });
+
+        ready_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(200)).is_err());
+        drop(lock);
+        assert!(
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap()
+                .available
+        );
+        reader.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
 }
