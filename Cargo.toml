@@ -19,7 +19,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 blake3 = "1"
 fs2 = "0.4.3"
 nix = { version = "0.31.3", features = ["fs", "process", "signal", "term", "user"] }
-signal-hook = "0.3.18"
+signal-hook = "=0.4.4"
 wait4 = "0.2.0"
 
 [lints.rust]
