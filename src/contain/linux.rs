@@ -725,6 +725,17 @@ mod tests {
     }
 
     #[test]
+    fn memory_limit_keeps_helper_alive_after_workload_oom() {
+        let limits = Limits {
+            memory_cap_mib: Some(64),
+            ..Limits::default()
+        };
+        let properties = limits.properties().unwrap();
+        assert!(properties.contains(&"MemoryMax=67108864".into()));
+        assert!(properties.contains(&"OOMPolicy=continue".into()));
+    }
+
+    #[test]
     fn passes_dollars_verbatim_with_expansion_disabled() {
         let command = ["sh".to_owned(), "-c".to_owned(), "echo $HOME $$".to_owned()];
         let scope = scope_command(

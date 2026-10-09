@@ -72,6 +72,7 @@ impl Limits {
                 io::Error::new(io::ErrorKind::InvalidInput, "memory limit overflows")
             })?;
             properties.push(format!("MemoryMax={bytes}"));
+            properties.push("OOMPolicy=continue".into());
         }
         if let Some(tasks) = self.tasks {
             properties.push(format!("TasksMax={}", u64::from(tasks) + 1));
