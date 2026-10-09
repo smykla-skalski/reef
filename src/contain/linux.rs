@@ -569,15 +569,9 @@ fn io_device_key(path: &Path) -> io::Result<String> {
     let device = if metadata.file_type().is_block_device() {
         metadata.rdev()
     } else {
-        let output = Command::new("findmnt")
-            .args(["--noheadings", "--output", "SOURCE", "--target"])
-            .arg(path)
-            .output()?;
-        if !output.status.success() {
-            return Err(io::Error::other("cannot resolve I/O backing device"));
-        }
-        let source = String::from_utf8(output.stdout).map_err(io::Error::other)?;
-        let block = source_block_device(source.trim())
+        ensure_supported_io_filesystem(&findmnt_value(path, "FSTYPE")?)?;
+        let source = findmnt_value(path, "SOURCE")?;
+        let block = source_block_device(&source)
             .ok_or_else(|| io::Error::other("I/O path is not backed by a simple block device"))?;
         let metadata = fs::metadata(block)?;
         if !metadata.file_type().is_block_device() {
@@ -589,6 +583,33 @@ fn io_device_key(path: &Path) -> io::Result<String> {
     let minor = (device & 0xff) | ((device >> 12) & 0xffff_ff00);
     let sysfs = fs::canonicalize(format!("/sys/dev/block/{major}:{minor}"))?;
     whole_disk_key(&sysfs)
+}
+
+fn ensure_supported_io_filesystem(fstype: &str) -> io::Result<()> {
+    if fstype == "btrfs" {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Btrfs directory I/O limits are unsupported; use a block-device path",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn findmnt_value(path: &Path, column: &str) -> io::Result<String> {
+    let output = Command::new("findmnt")
+        .args(["--noheadings", "--output", column, "--target"])
+        .arg(path)
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other("cannot resolve I/O backing device"));
+    }
+    let value = String::from_utf8(output.stdout).map_err(io::Error::other)?;
+    let value = value.trim();
+    if value.is_empty() || value.lines().count() != 1 {
+        return Err(io::Error::other("cannot resolve I/O backing device"));
+    }
+    Ok(value.to_owned())
 }
 
 fn source_block_device(source: &str) -> Option<&str> {
@@ -665,8 +686,8 @@ fn own_cgroup() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        counter, missing_controller, scope_absent, scope_command, source_block_device,
-        verify_number, whole_disk_key,
+        counter, ensure_supported_io_filesystem, missing_controller, scope_absent, scope_command,
+        source_block_device, verify_number, whole_disk_key,
     };
     use crate::contain::Limits;
     use std::fs;
@@ -732,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_subvolume_source_to_parent_disk() {
+    fn resolves_partition_source_to_parent_disk() {
         assert_eq!(
             source_block_device("/dev/vdb1[/scon/containers/test/rootfs]"),
             Some("/dev/vdb1")
@@ -749,6 +770,14 @@ mod tests {
         fs::write(partition.join("partition"), "1\n").unwrap();
         assert_eq!(whole_disk_key(&partition).unwrap(), "254:16");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_btrfs_directory_io_limits() {
+        assert!(ensure_supported_io_filesystem("ext4").is_ok());
+        let error = ensure_supported_io_filesystem("btrfs").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("Btrfs directory I/O limits"));
     }
 
     #[test]
