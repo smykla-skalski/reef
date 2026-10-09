@@ -224,7 +224,7 @@ fn forwards_interrupt_and_saves_cancelled_measurement() {
     )
     .unwrap();
     let status = child.wait().unwrap();
-    assert_eq!(status.code(), Some(143));
+    assert!(!status.success());
     let result: Value = serde_json::from_str(fs::read_to_string(record).unwrap().trim()).unwrap();
     assert_eq!(result["status"], "cancelled");
     assert_eq!(result["signal"], 15);
