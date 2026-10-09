@@ -1,0 +1,29 @@
+[tools]
+rust = "latest"
+
+[tasks.format]
+description = "Format Rust sources"
+run = "cargo fmt --all"
+
+[tasks.lint]
+description = "Check formatting and lint Rust sources"
+run = [
+  "cargo fmt --all --check",
+  "cargo clippy --all-targets --locked -- -D warnings",
+]
+
+[tasks.test]
+description = "Run Rust tests"
+run = "cargo test --locked"
+
+[tasks.check]
+description = "Run all required quality checks"
+run = [
+  "cargo fmt --all --check",
+  "cargo clippy --all-targets --locked -- -D warnings",
+  "cargo test --locked",
+]
+
+[tasks.build]
+description = "Build Reef"
+run = "cargo build --locked"
