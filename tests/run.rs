@@ -527,7 +527,26 @@ fn cancellation_stops_descendants_that_ignore_the_forwarded_signal() {
     )
     .unwrap();
     let status = child.wait().unwrap();
-    let alive = kill(Pid::from_raw(descendant), None).is_ok();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let alive = loop {
+        let output = Command::new("ps")
+            .args(["-o", "stat=", "-p", &descendant.to_string()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&output.stdout);
+        assert!(output.stderr.is_empty(), "ps failed: {output:?}");
+        assert!(
+            output.status.success() || (output.status.code() == Some(1) && state.is_empty()),
+            "ps failed: {output:?}"
+        );
+        if state.is_empty() || state.trim_start().starts_with('Z') {
+            break false;
+        }
+        if Instant::now() >= deadline {
+            break true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     if alive {
         let _ = kill(Pid::from_raw(descendant), Signal::SIGKILL);
     }

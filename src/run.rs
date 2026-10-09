@@ -1,9 +1,11 @@
 mod platform;
 
+use crate::contain::{Boundary, Containment, Limits};
 use crate::history;
 use fs2::FileExt;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
@@ -54,6 +56,7 @@ struct Measurement<'a> {
     tree_cpu_ms: u128,
     tree_peak_memory_bytes: u64,
     tree_usage_complete: bool,
+    limit_boundaries: Vec<Boundary>,
 }
 
 #[derive(Default)]
@@ -118,15 +121,39 @@ pub fn run_with(
     category: &str,
     identity: &str,
     record: RecordMode<'_>,
-    mut admission: Option<&mut dyn Admission>,
+    admission: Option<&mut dyn Admission>,
 ) -> io::Result<u8> {
+    run_with_limits(
+        command,
+        category,
+        identity,
+        record,
+        admission,
+        &Limits::default(),
+    )
+}
+
+pub fn run_with_limits(
+    command: &[String],
+    category: &str,
+    identity: &str,
+    record: RecordMode<'_>,
+    mut admission: Option<&mut dyn Admission>,
+    limits: &Limits,
+) -> io::Result<u8> {
+    let mut containment = Containment::prepare(limits)?;
     let mut record_writer = open_record_writer(record);
 
     let mut signals = platform::signals()?;
     let started_at_unix_ms = unix_ms();
     let start = Instant::now();
     let interactive = io::stdin().is_terminal() && platform::has_foreground_stdin();
-    let mut process = command_process(command, interactive, admission.is_some());
+    let mut process = command_process(
+        command,
+        interactive,
+        admission.is_some(),
+        containment.as_ref(),
+    )?;
     let mut child = match process.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -146,8 +173,13 @@ pub fn run_with(
     };
     let foreground = prepare_child(&mut child, interactive, &mut admission)?;
     let mut sampler = TreeSampler::default();
-    let (result, forwarded, scheduler_lost, scheduler_cancelled) =
-        wait_child(&mut child, &mut sampler, &mut signals, &mut admission)?;
+    let (result, forwarded, scheduler_lost, scheduler_cancelled) = wait_child(
+        &mut child,
+        &mut sampler,
+        &mut signals,
+        &mut admission,
+        &mut containment,
+    )?;
     let exit_signal = platform::exit_signal(result.status);
     let cpu_ms = (result.rusage.utime + result.rusage.stime).as_millis();
     let signal = exit_signal;
@@ -176,15 +208,23 @@ pub fn run_with(
         tree_cpu_ms: sampler.cpu_ms().max(cpu_ms),
         tree_peak_memory_bytes: sampler.peak_memory_bytes.max(result.rusage.maxrss),
         tree_usage_complete: false,
+        limit_boundaries: containment
+            .as_ref()
+            .map_or_else(Vec::new, Containment::boundaries),
     };
     report(&measurement, &mut record_writer);
-    if (admission.is_some() && !scheduler_cancelled)
+    let group_cleanup = if (admission.is_some() && !scheduler_cancelled)
         || forwarded.is_some()
         || (exit_signal.is_some() && !scheduler_cancelled)
     {
-        cleanup_group(child.id())?;
-    }
+        cleanup_group(child.id())
+    } else {
+        Ok(())
+    };
     drop(foreground);
+    let scope_cleanup = containment.as_ref().map_or(Ok(()), Containment::finish);
+    group_cleanup?;
+    scope_cleanup?;
     if scheduler_lost {
         return Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
@@ -249,6 +289,7 @@ fn wait_child(
     sampler: &mut TreeSampler,
     signals: &mut signal_hook::iterator::Signals,
     admission: &mut Option<&mut dyn Admission>,
+    containment: &mut Option<Containment>,
 ) -> io::Result<(wait4::ResUse, Option<i32>, bool, bool)> {
     let root = Pid::from_u32(child.id());
     let mut forwarded = None;
@@ -257,13 +298,18 @@ fn wait_child(
     let mut scheduler_cancelled = false;
     loop {
         sampler.sample(root);
+        if let Some(scope) = containment.as_mut() {
+            scope.sample();
+        }
         if let Some(lease) = admission.as_mut() {
             match lease.status().unwrap_or(AdmissionStatus::Disconnected) {
                 AdmissionStatus::Cancelled if !scheduler_cancelled => {
+                    stop_scope(containment.as_ref());
                     let _ = platform::force_stop(child.id());
                     scheduler_cancelled = true;
                 }
                 AdmissionStatus::Disconnected if !scheduler_lost => {
+                    stop_scope(containment.as_ref());
                     platform::force_stop(child.id())?;
                     scheduler_lost = true;
                 }
@@ -271,6 +317,7 @@ fn wait_child(
             }
         }
         for signal in signals.pending() {
+            stop_scope(containment.as_ref());
             platform::forward(child.id(), signal)?;
             if forwarded.is_none() {
                 interrupted_at = Some(Instant::now());
@@ -278,6 +325,9 @@ fn wait_child(
             forwarded = Some(signal);
         }
         if let Some(result) = child.try_wait4()? {
+            if let Some(scope) = containment.as_mut() {
+                scope.sample();
+            }
             if let Some(lease) = admission.as_mut() {
                 match lease.status().unwrap_or(AdmissionStatus::Disconnected) {
                     AdmissionStatus::Cancelled => scheduler_cancelled = true,
@@ -291,6 +341,14 @@ fn wait_child(
             platform::force_stop(child.id())?;
         }
         std::thread::sleep(SAMPLE_INTERVAL);
+    }
+}
+
+fn stop_scope(containment: Option<&Containment>) {
+    if let Some(scope) = containment
+        && let Err(error) = scope.stop()
+    {
+        eprintln!("reef: cannot stop contained workload yet: {error}");
     }
 }
 
@@ -321,6 +379,7 @@ fn spawn_failed(
         tree_cpu_ms: 0,
         tree_peak_memory_bytes: 0,
         tree_usage_complete: false,
+        limit_boundaries: Vec::new(),
     };
     eprintln!("reef: command could not start: {error}");
     report(&measurement, record_writer);
@@ -334,14 +393,25 @@ fn unix_ms() -> u128 {
         .as_millis()
 }
 
-fn command_process(command: &[String], interactive: bool, scheduled: bool) -> Command {
+fn command_process(
+    command: &[String],
+    interactive: bool,
+    scheduled: bool,
+    containment: Option<&Containment>,
+) -> io::Result<Command> {
+    let command = if let Some(scope) = containment {
+        let process = scope.command(command)?;
+        scoped_command_args(&process)
+    } else {
+        command.iter().map(OsString::from).collect()
+    };
     let mut process = if interactive || scheduled {
         let mut wrapper = Command::new("/bin/sh");
         wrapper
             .arg("-c")
             .arg("kill -STOP $$; exec \"$@\"")
             .arg("reef-run")
-            .args(command);
+            .args(&command);
         wrapper
     } else {
         let mut direct = Command::new(&command[0]);
@@ -356,7 +426,13 @@ fn command_process(command: &[String], interactive: bool, scheduled: bool) -> Co
         process.env("REEF_ADMITTED", "1");
     }
     platform::isolate(&mut process);
-    process
+    Ok(process)
+}
+
+fn scoped_command_args(process: &Command) -> Vec<OsString> {
+    std::iter::once(process.get_program().to_os_string())
+        .chain(process.get_args().map(std::ffi::OsStr::to_os_string))
+        .collect()
 }
 
 fn cleanup_group(pid: u32) -> io::Result<()> {
@@ -418,4 +494,21 @@ fn open_record(path: &Path) -> io::Result<File> {
         ));
     }
     Ok(file)
+}
+
+#[cfg(test)]
+mod scoped_command_tests {
+    use super::scoped_command_args;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::process::Command;
+
+    #[test]
+    fn keeps_non_utf8_scope_arguments() {
+        let path = OsString::from_vec(vec![b'/', b't', b'm', b'p', b'/', 0xff]);
+        let mut process = Command::new("systemd-run");
+        process.arg(&path);
+        let args = scoped_command_args(&process);
+        assert_eq!(args[1].as_bytes(), path.as_bytes());
+    }
 }
