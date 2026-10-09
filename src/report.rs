@@ -203,9 +203,22 @@ fn above(used: Option<u64>, total: Option<u64>, threshold: u8) -> Option<bool> {
         .map(|(used, total)| u128::from(used) * 100 >= u128::from(total) * u128::from(threshold))
 }
 
-fn add_duration(total: &mut Option<u128>, triggered: Option<bool>, duration: u128) {
+fn add_duration(
+    total: &mut Option<u128>,
+    missing: &mut bool,
+    triggered: Option<bool>,
+    duration: u128,
+) {
+    if duration == 0 {
+        return;
+    }
     if let Some(triggered) = triggered {
-        *total = Some(total.unwrap_or_default() + u128::from(triggered) * duration);
+        if !*missing {
+            *total = Some(total.unwrap_or_default() + u128::from(triggered) * duration);
+        }
+    } else {
+        *missing = true;
+        *total = None;
     }
 }
 
@@ -226,6 +239,16 @@ fn pressure_flags(sample: &Observation, thresholds: (u8, u8, u8)) -> [Option<boo
             thresholds.2,
         ),
     ]
+}
+
+fn any_pressure(flags: [Option<bool>; 3]) -> Option<bool> {
+    if flags.contains(&Some(true)) {
+        Some(true)
+    } else if flags.contains(&None) {
+        None
+    } else {
+        Some(false)
+    }
 }
 
 fn peak_concurrency(records: &[Measurement], from: u128, to: u128) -> usize {
@@ -310,26 +333,28 @@ fn build_report(
     };
     let mut timeline = Vec::new();
     let mut observed_working_ms = 0_u128;
+    let mut covered_until = from_ms;
+    let mut missing = [false; 4];
     for sample in &samples {
         let at = u128::from(sample.at_unix_ms);
         let end = at.min(to_ms);
         let start = at
             .saturating_sub(u128::from(sample.working_ms))
-            .max(from_ms);
+            .max(covered_until);
         let duration = end.saturating_sub(start);
+        covered_until = covered_until.max(end);
         observed_working_ms += duration;
         let [cpu, memory, swap] = pressure_flags(sample, thresholds);
-        add_duration(&mut pressure.cpu_above_ms, cpu, duration);
-        add_duration(&mut pressure.memory_above_ms, memory, duration);
-        add_duration(&mut pressure.swap_above_ms, swap, duration);
-        let any = if [cpu, memory, swap].contains(&Some(true)) {
-            Some(true)
-        } else if [cpu, memory, swap].contains(&None) {
-            None
-        } else {
-            Some(false)
-        };
-        add_duration(&mut pressure.any_above_ms, any, duration);
+        add_duration(&mut pressure.cpu_above_ms, &mut missing[0], cpu, duration);
+        add_duration(
+            &mut pressure.memory_above_ms,
+            &mut missing[1],
+            memory,
+            duration,
+        );
+        add_duration(&mut pressure.swap_above_ms, &mut missing[2], swap, duration);
+        let any = any_pressure([cpu, memory, swap]);
+        add_duration(&mut pressure.any_above_ms, &mut missing[3], any, duration);
         let mut triggers = Vec::new();
         if cpu == Some(true) {
             triggers.push("cpu");
@@ -495,8 +520,12 @@ pub fn run(options: &Options) -> io::Result<()> {
         None
     } else {
         let mut all = Vec::new();
+        let mut seen = BTreeSet::new();
         for path in &options.records {
-            all.extend(read_jsonl(path)?);
+            let canonical = fs::canonicalize(path)?;
+            if seen.insert(canonical.clone()) {
+                all.extend(read_jsonl(&canonical)?);
+            }
         }
         Some(all)
     };
@@ -644,6 +673,47 @@ mod tests {
             (90, 90, 1),
         );
         assert_eq!(report.pressure.cpu_above_ms, Some(0));
+        assert!(report.pressure.any_above_ms.is_none());
+    }
+
+    #[test]
+    fn overlapping_samples_count_each_millisecond_once() {
+        let report = build_report(
+            date(0),
+            date(1_500),
+            vec![
+                sample(1_000, Some(95.0), Some(10)),
+                sample(1_500, Some(95.0), Some(10)),
+            ]
+            .into_iter()
+            .map(|mut sample| {
+                sample.working_ms = 1_000;
+                sample
+            })
+            .collect(),
+            None,
+            (90, 90, 1),
+        );
+        assert_eq!(report.observed_working_ms, 1_500);
+        assert_eq!(report.pressure.cpu_above_ms, Some(1_500));
+        assert_eq!(report.pressure.any_above_ms, Some(1_500));
+        assert_eq!(report.timeline[1].from_unix_ms, 1_000);
+    }
+
+    #[test]
+    fn missing_metric_in_any_covered_interval_marks_total_unavailable() {
+        let mut missing = sample(300, Some(10.0), None);
+        missing.memory_used_bytes = None;
+        missing.memory_total_bytes = None;
+        let report = build_report(
+            date(100),
+            date(400),
+            vec![sample(200, Some(95.0), Some(10)), missing],
+            None,
+            (90, 90, 1),
+        );
+        assert_eq!(report.pressure.cpu_above_ms, Some(100));
+        assert!(report.pressure.memory_above_ms.is_none());
         assert!(report.pressure.any_above_ms.is_none());
     }
 
