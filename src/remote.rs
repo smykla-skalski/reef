@@ -646,7 +646,7 @@ fn make_snapshot(
                 .ok_or_else(|| invalid("non-UTF-8 snapshot path"))?
                 .into(),
             bytes: metadata.len(),
-            sha256: format!("{:x}", hasher.finalize()),
+            sha256: hex_digest(hasher.finalize()),
         });
     }
     let manifest = JobManifest {
@@ -807,7 +807,7 @@ fn verify(job: &Path) -> io::Result<JobManifest> {
             return Err(invalid("worker snapshot file differs from manifest"));
         }
         let digest = Sha256::digest(fs::read(path)?);
-        if format!("{digest:x}") != entry.sha256 {
+        if hex_digest(digest) != entry.sha256 {
             return Err(invalid("worker snapshot digest mismatch"));
         }
     }
@@ -935,7 +935,18 @@ fn cache_path(root: &Path, manifest: &JobManifest) -> io::Result<PathBuf> {
             hasher.update(file.sha256.as_bytes());
         }
     }
-    Ok(root.join("cache").join(format!("{:x}", hasher.finalize())))
+    Ok(root.join("cache").join(hex_digest(hasher.finalize())))
+}
+
+fn hex_digest(digest: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = digest.as_ref();
+    let mut hex = String::with_capacity(bytes.len().saturating_mul(2));
+    for &byte in bytes {
+        hex.push(char::from(HEX[usize::from(byte >> 4)]));
+        hex.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    hex
 }
 
 fn cache_size(path: &Path) -> io::Result<u64> {
@@ -1040,7 +1051,8 @@ fn stop_group(pid: u32) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AllowedCommand, Policy, WorkerOptions, create_private_snapshot_dir, make_snapshot, worker,
+        AllowedCommand, Policy, WorkerOptions, create_private_snapshot_dir, hex_digest,
+        make_snapshot, worker,
     };
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -1118,6 +1130,11 @@ mod tests {
                 .status
                 .success()
         );
+    }
+
+    #[test]
+    fn hex_digest_uses_lowercase_zero_padded_bytes() {
+        assert_eq!(hex_digest([0, 15, 16, 255]), "000f10ff");
     }
 
     #[test]
