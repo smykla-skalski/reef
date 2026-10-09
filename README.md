@@ -67,6 +67,22 @@ The initial shims cover `go build|install|run|test|vet`, `cargo build|check|inst
 
 Nested tools launched by an admitted command run under its existing reservation. If the scheduler is unavailable, a heavy command fails with a clear error; it does not run outside the budget. Absolute executable paths, scripts that replace `PATH`, commands inside remote or cloud agent sessions, and tools outside the shim list bypass automatic routing. For those, invoke `reef schedule --category ... -- command` explicitly. Agent configurations that filter `PATH` or Reef's session variables also prevent automatic routing.
 
+## Output cache (Unix)
+
+Explicitly opt in for a command that only reads inputs and writes stdout or stderr:
+
+```console
+reef cache run -- cargo metadata --no-deps --format-version 1
+reef cache status
+reef cache prune --max-storage-mib 256
+```
+
+The command must run in a Git worktree. Reef hashes its executable, arguments, working directory, operating system, architecture, environment, recognized toolchain versions, and the contents and modes of Git tracked and untracked nonignored files. Use `--input path` for any file the command reads outside that set, including ignored build inputs and files outside the worktree. A changed input invalidates the result. `--ttl-seconds` defaults to 3600; `--max-storage-mib` defaults to 256. Requests for the same key wait on one execution and replay its successful stdout and stderr. Failed, interrupted, oversized, or input-changing commands are not stored. Each stream is captured up to 16 MiB; larger output still streams but is not cached.
+
+Cached commands receive closed standard input. They must be noninteractive and deterministic for their declared inputs. Reef does not restore files created by a command, so do not cache a build or any test with required file side effects. Commands that depend on network state, time, ignored files, or undeclared files are not safe to cache. Cache hits replay stdout and stderr without running the command; they do not create a new resource measurement or scheduler reservation. This initial cache path is standalone; placing `reef schedule` around it reserves capacity for every caller before a cache hit is known.
+
+The cache lives in a private user directory at `~/.local/state/reef/cache`. `--cache-dir` selects another private directory outside the worktree. Cache metadata stores only opaque hashes, timestamps, and sizes; it does not store command arguments, environment variables, or input file contents. Output is stored verbatim and can contain secrets, so enable caching only for commands whose output is safe to retain locally. Reef evicts its own expired and least recently used entries without touching Cargo, Go, or other external tool caches. `reef cache status` reports its entry count and byte size.
+
 Start a background recorder with no project configuration:
 
 ```console
@@ -96,7 +112,7 @@ The default range is the last 24 hours. Its start is inclusive and its end is ex
 ## Planned capabilities
 
 - Attribute resource cost to agents and containers
-- Reuse compatible results and persistent build caches
+- Restore build artifacts before allowing build cache hits
 - Offload work when local capacity is insufficient
 
 An opt-in trusted SSH worker path is implemented behind a disabled-by-default policy. Its setup, recovery behavior, and unmeasured real-host release gate are documented in [experimental remote offload](docs/remote.md).

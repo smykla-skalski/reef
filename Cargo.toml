@@ -16,8 +16,9 @@ sha2 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [target.'cfg(unix)'.dependencies]
+blake3 = "1"
 fs2 = "0.4.3"
-nix = { version = "0.31.3", features = ["process", "signal", "term", "user"] }
+nix = { version = "0.31.3", features = ["fs", "process", "signal", "term", "user"] }
 signal-hook = "0.3.18"
 wait4 = "0.2.0"
 
