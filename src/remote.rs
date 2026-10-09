@@ -586,17 +586,15 @@ fn make_snapshot(
     if paths.len() > MAX_FILES {
         return Err(invalid("snapshot exceeds file-count limit"));
     }
-    let path = std::env::temp_dir().join(format!(
+    let candidate = std::env::temp_dir().join(format!(
         "reef-snapshot-{:x}{:x}",
         std::process::id(),
         now_nanos()
     ));
-    fs::create_dir(&path)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+    let path = create_private_snapshot_dir(&candidate)?;
     let snapshot = Snapshot { path };
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(snapshot.path.join("source"))?;
+    let source_root = snapshot.path.join("source");
+    create_private_snapshot_subdir(&source_root)?;
     let mut files = Vec::new();
     let mut total = 0_u64;
     for relative in paths {
@@ -619,8 +617,8 @@ fn make_snapshot(
         if total > MAX_BYTES {
             return Err(invalid("snapshot exceeds 100 MiB"));
         }
-        let destination = snapshot.path.join("source").join(&relative);
-        fs::create_dir_all(destination.parent().expect("file parent"))?;
+        let destination = source_root.join(&relative);
+        create_private_snapshot_parents(&source_root, &relative)?;
         let mut input = File::open(&source)?;
         let mut output = File::create(&destination)?;
         let mut hasher = Sha256::new();
@@ -658,8 +656,59 @@ fn make_snapshot(
         command: command.to_vec(),
         files,
     };
-    serde_json::to_writer(File::create(snapshot.path.join("job.json"))?, &manifest)?;
+    let manifest_path = snapshot.path.join("job.json");
+    serde_json::to_writer(File::create(&manifest_path)?, &manifest)?;
+    fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600))?;
     Ok(snapshot)
+}
+
+fn create_private_snapshot_subdir(path: &Path) -> io::Result<()> {
+    fs::DirBuilder::new().mode(0o700).create(path)?;
+    if let Err(error) = fs::set_permissions(path, fs::Permissions::from_mode(0o700)) {
+        let _ = fs::remove_dir(path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn create_private_snapshot_parents(source_root: &Path, relative: &Path) -> io::Result<()> {
+    let mut directory = source_root.to_path_buf();
+    if let Some(parent) = relative.parent() {
+        for component in parent.components() {
+            directory.push(component.as_os_str());
+            match create_private_snapshot_subdir(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn create_private_snapshot_dir(candidate: &Path) -> io::Result<PathBuf> {
+    for attempt in 0..128 {
+        let path = if attempt == 0 {
+            candidate.to_path_buf()
+        } else {
+            candidate.with_file_name(format!(
+                "{}-{attempt:x}",
+                candidate
+                    .file_name()
+                    .expect("snapshot name")
+                    .to_string_lossy()
+            ))
+        };
+        match create_private_snapshot_subdir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "cannot reserve a unique snapshot directory",
+    ))
 }
 
 pub fn worker(options: &WorkerOptions) -> io::Result<u8> {
@@ -989,7 +1038,9 @@ fn stop_group(pid: u32) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AllowedCommand, Policy, WorkerOptions, make_snapshot, worker};
+    use super::{
+        AllowedCommand, Policy, WorkerOptions, create_private_snapshot_dir, make_snapshot, worker,
+    };
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
@@ -1065,6 +1116,27 @@ mod tests {
                 .unwrap()
                 .status
                 .success()
+        );
+    }
+
+    #[test]
+    fn snapshot_directory_collision_preserves_existing_content() {
+        let fixture = Fixture::new();
+        let candidate = fixture.0.join("snapshot");
+        fs::create_dir(&candidate).unwrap();
+        fs::write(candidate.join("existing.txt"), "keep").unwrap();
+        fs::create_dir(fixture.0.join("snapshot-1")).unwrap();
+
+        let snapshot = create_private_snapshot_dir(&candidate).unwrap();
+
+        assert_eq!(snapshot, fixture.0.join("snapshot-2"));
+        assert_eq!(
+            fs::read_to_string(candidate.join("existing.txt")).unwrap(),
+            "keep"
+        );
+        assert_eq!(
+            fs::metadata(snapshot).unwrap().permissions().mode() & 0o077,
+            0
         );
     }
 

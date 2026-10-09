@@ -122,6 +122,49 @@ fn disabled_policy_refuses_remote_submission_without_a_connection() {
 }
 
 #[test]
+fn restrictive_umask_allows_snapshot_before_missing_credentials() {
+    let fixture = Fixture::new();
+    let repo = repository(&fixture);
+    fs::create_dir(repo.join("nested")).unwrap();
+    fs::write(repo.join("nested/file"), "nested source\n").unwrap();
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["add", "nested/file"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let identity = fixture.0.join("missing-identity");
+    let policy = policy_file(&fixture, &["/usr/bin/true"], false, &identity);
+
+    let result = Command::new("/bin/sh")
+        .args(["-c", "umask 0700; exec \"$@\"", "sh"])
+        .arg(env!("CARGO_BIN_EXE_reef"))
+        .args(["remote", "--config"])
+        .arg(&policy)
+        .args(["--repo"])
+        .arg(&repo)
+        .args([
+            "--approve-snapshot",
+            "--identity",
+            "job",
+            "--",
+            "/usr/bin/true",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("SSH identity file"),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
 fn local_worker_cancel_confirms_termination_and_prevents_cleanup_while_running() {
     let fixture = Fixture::new();
     let root = fixture.0.join("worker");
