@@ -8,15 +8,31 @@ Reef will coordinate that work across agents and terminals. When pressure rises,
 
 ## Status
 
-Reef is under active development. The initial CLI reports current CPU, memory, and swap usage:
+Reef is under active development. The CLI reports current CPU, memory, and swap usage:
 
 ```console
 reef status
 ```
 
+Start a background recorder with no project configuration:
+
+```console
+reef observe start
+```
+
+It samples every 30 seconds, keeps seven days of observations, and limits storage to 100 MiB. Samples are JSON Lines files in `~/.local/state/reef/observe`. The directory is private to your user account on Unix. Each sample includes system CPU, memory, swap, root disk capacity, and numeric process usage with parent PIDs for tree analysis. Metrics that are unavailable are `null`. Samples include `working_ms`, capped at the configured interval so time spent asleep does not accumulate as working time. Reef stores no process names, command lines, environment variables, file contents, credentials, or tokens.
+
+Change collection limits when starting the recorder:
+
+```console
+reef observe start --interval-seconds 60 --retention-days 14 --max-storage-mib 200
+reef observe stop
+```
+
+Use `reef observe run` to keep the recorder in the foreground. All three commands accept `--state-dir` for an alternate location; pass it to `stop` as well when using a custom directory. Stopping takes effect at the next interval. If the recorder exits unexpectedly and leaves `recorder.pid`, remove that stale file before restarting.
+
 ## Planned capabilities
 
-- Record system and process-tree resource usage over several working days
 - Attribute resource cost to builds, linters, tests, agents, and containers
 - Apply one global concurrency and resource budget across independent agents
 - Reserve CPU and memory for the developer's interactive applications
