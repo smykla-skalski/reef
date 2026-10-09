@@ -156,7 +156,7 @@ fn period(
     let intervals = records.map(|records| command_intervals(records, from_ms, to_ms));
     for sample in samples {
         let at = u128::from(sample.at_unix_ms);
-        if at < from_ms || at > to_ms {
+        if at < from_ms || at >= to_ms {
             continue;
         }
         if let Some(swap) = sample.swap_used_bytes {
@@ -351,10 +351,11 @@ pub fn run_compare(options: &CompareOptions) -> io::Result<()> {
     }
     let samples = observations(&state_dir(options.state_dir.as_deref())?)?;
     let default_paths = history::paths()?;
-    let records = if default_paths.is_none() && options.records.is_empty() {
+    let explicit_records = !options.records.is_empty();
+    let records = if default_paths.is_none() && !explicit_records {
         None
     } else {
-        let mut all = Vec::new();
+        let mut all: Vec<Measurement> = Vec::new();
         let mut seen = BTreeSet::new();
         for path in default_paths.iter().flatten().chain(options.records.iter()) {
             let canonical = fs::canonicalize(path)?;
@@ -363,6 +364,22 @@ pub fn run_compare(options: &CompareOptions) -> io::Result<()> {
             }
         }
         Some(all)
+    };
+    // The first retained default record is the earliest point at which we can
+    // establish coverage. Pruning can remove an earlier period while leaving
+    // later records, so an empty category list alone does not prove zero work.
+    let default_history_start = (!explicit_records)
+        .then(|| {
+            records
+                .as_deref()
+                .and_then(|all| all.iter().map(|record| record.started_at_unix_ms).min())
+        })
+        .flatten();
+    let records_for = |from: DateTime<Utc>| {
+        let from_ms = u128::try_from(from.timestamp_millis()).unwrap_or_default();
+        (explicit_records || default_history_start.is_some_and(|start| from_ms >= start))
+            .then_some(records.as_deref())
+            .flatten()
     };
     let thresholds = (
         options.cpu_threshold,
@@ -375,14 +392,14 @@ pub fn run_compare(options: &CompareOptions) -> io::Result<()> {
             options.baseline_from,
             options.baseline_to,
             &samples,
-            records.as_deref(),
+            records_for(options.baseline_from),
             thresholds,
         ),
         comparison: period(
             options.comparison_from,
             options.comparison_to,
             &samples,
-            records.as_deref(),
+            records_for(options.comparison_from),
             thresholds,
         ),
     };

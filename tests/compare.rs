@@ -90,7 +90,8 @@ fn comparison_normalizes_pressure_and_counts_completed_commands() {
         comparison["baseline"]["pressure_without_measured_command_overlap_percent"],
         50.0
     );
-    assert_eq!(comparison["baseline"]["swap_growth_bytes"], 100);
+    assert!(comparison["baseline"]["swap_growth_bytes"].is_null());
+    assert_eq!(comparison["comparison"]["swap_growth_bytes"], 50);
     assert_eq!(comparison["baseline"]["completed_command_count"], 1);
     assert_eq!(
         comparison["baseline"]["command_categories"][0]["wall_ms"],
@@ -189,4 +190,43 @@ fn rejects_overlapping_periods_before_reading_data() {
     assert!(!output.status.success());
     assert_eq!(output.stdout, Vec::<u8>::new());
     assert!(String::from_utf8_lossy(&output.stderr).contains("non-overlapping"));
+}
+
+#[cfg(unix)]
+#[test]
+fn pruned_default_history_is_unavailable_for_earlier_period() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let dir = fixture.0.join(".local/state/reef/history");
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let parent = dir.parent().unwrap();
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+    let id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let id_path = dir.join(".reef-history-id");
+    fs::write(&id_path, format!("{id}\n")).unwrap();
+    fs::set_permissions(&id_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let record_path = dir.join(format!("command-1767231000000-1-1-{id}.jsonl"));
+    fs::write(
+        &record_path,
+        "{\"category\":\"build\",\"status\":\"success\",\"started_at_unix_ms\":1767227400000,\"ended_at_unix_ms\":1767231000000,\"wall_ms\":3600000,\"tree_cpu_ms\":500000,\"tree_peak_memory_bytes\":1}\n",
+    )
+    .unwrap();
+    fs::set_permissions(&record_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let output = reef()
+        .args(args())
+        .arg("--state-dir")
+        .arg(&fixture.0)
+        .args(["--format", "json"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let comparison: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(comparison["baseline"]["command_history_available"], false);
+    assert!(comparison["baseline"]["completed_command_count"].is_null());
+    assert_eq!(comparison["comparison"]["command_history_available"], true);
+    assert_eq!(comparison["comparison"]["completed_command_count"], 1);
 }
