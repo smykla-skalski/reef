@@ -2,6 +2,7 @@
 
 use serde_json::Value;
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -93,6 +94,116 @@ fn reef() -> Command {
 
 fn has_job(jobs: &[Value], state: &str) -> bool {
     jobs.iter().any(|job| job["state"] == state)
+}
+
+fn scheduler_report(fixture: &Fixture) -> Value {
+    let output = reef()
+        .args([
+            "report",
+            "--from",
+            "2020-01-01T00:00:00Z",
+            "--to",
+            "2100-01-01T00:00:00Z",
+            "--state-dir",
+        ])
+        .arg(&fixture.path)
+        .arg("--schedule-state-dir")
+        .arg(&fixture.path)
+        .args(["--format", "json"])
+        .env("HOME", &fixture.path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn scheduler_history_reports_zero_then_completed_failed_and_rejected() {
+    let fixture = Fixture::new();
+    Fixture::wait_until(|| fixture.path.join("events.version").exists());
+    let before = scheduler_report(&fixture);
+    assert_eq!(before["scheduler"]["submitted"], 0);
+    assert_eq!(before["scheduler"]["queue_wait_p50_ms"], Value::Null);
+
+    let success = fixture
+        .schedule(&["sh", "-c", "exit 0"])
+        .env("HOME", &fixture.path)
+        .output()
+        .unwrap();
+    assert!(success.status.success());
+    let failed = fixture
+        .schedule(&["sh", "-c", "exit 7"])
+        .env("HOME", &fixture.path)
+        .output()
+        .unwrap();
+    assert_eq!(failed.status.code(), Some(7));
+    let rejected = reef()
+        .args(["schedule", "--cpu", "2", "--state-dir"])
+        .arg(&fixture.path)
+        .args(["--", "sh", "-c", "exit 0"])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+
+    let report = scheduler_report(&fixture);
+    assert_eq!(report["scheduler"]["submitted"], 2);
+    assert_eq!(report["scheduler"]["admitted"], 2);
+    assert_eq!(report["scheduler"]["completed"], 1);
+    assert_eq!(report["scheduler"]["failed"], 1);
+    assert_eq!(report["scheduler"]["rejected"], 1);
+    assert_eq!(report["scheduler"]["cancelled"], 0);
+    assert!(report["scheduler"]["queue_wait_p50_ms"].is_number());
+    assert!(report["scheduler"]["submission_to_finish_p95_ms"].is_number());
+    let event = fs::read_dir(&fixture.path)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("event-")
+        })
+        .unwrap();
+    assert_eq!(
+        fs::metadata(&event).unwrap().permissions().mode() & 0o077,
+        0
+    );
+    let raw = fs::read_to_string(event).unwrap();
+    assert!(!raw.contains("\"command\""));
+    assert!(!raw.contains("\"identity\""));
+    assert!(!raw.contains("exit 7"));
+}
+
+#[test]
+fn event_write_failure_warns_without_changing_command_status() {
+    let mut fixture = Fixture::new();
+    Fixture::wait_until(|| fixture.path.join("events.version").exists());
+    fs::set_permissions(&fixture.path, fs::Permissions::from_mode(0o500)).unwrap();
+    let output = fixture
+        .schedule(&["sh", "-c", "exit 7"])
+        .env("HOME", &fixture.path)
+        .output()
+        .unwrap();
+    fs::set_permissions(&fixture.path, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(output.status.code(), Some(7));
+    fixture.server.kill().unwrap();
+    fixture.server.wait().unwrap();
+    let mut stderr = String::new();
+    fixture
+        .server
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(
+        stderr.contains("scheduler event history unavailable"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -191,6 +302,11 @@ fn live_memory_reserve_holds_and_cancels_a_queued_command() {
         .unwrap();
     assert!(output.status.success());
     assert_eq!(client.wait_with_output().unwrap().status.code(), Some(130));
+    let report = scheduler_report(&fixture);
+    assert_eq!(report["scheduler"]["submitted"], 1);
+    assert_eq!(report["scheduler"]["admitted"], 0);
+    assert_eq!(report["scheduler"]["cancelled"], 1);
+    assert!(report["scheduler"]["wait"]["pressure"].as_u64().unwrap() > 0);
 }
 
 #[test]

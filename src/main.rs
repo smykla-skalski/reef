@@ -13,6 +13,7 @@ mod report;
 mod run;
 #[cfg(unix)]
 mod schedule;
+mod schedule_events;
 mod status;
 
 #[cfg(unix)]
