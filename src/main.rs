@@ -1,5 +1,7 @@
 #[cfg(unix)]
 mod agents;
+#[cfg(unix)]
+mod cache;
 mod observe;
 #[cfg(unix)]
 mod pressure;
@@ -28,6 +30,12 @@ struct Cli {
 enum Command {
     /// Show current machine resource usage.
     Status,
+    /// Reuse successful output-only commands with explicit opt-in.
+    #[cfg(unix)]
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
     /// Launch a coding agent with resource-aware command shims.
     #[cfg(unix)]
     Agents {
@@ -108,6 +116,40 @@ enum Command {
     },
     /// Summarize workstation observations and command measurements.
     Report(report::Options),
+}
+
+#[cfg(unix)]
+#[derive(Debug, Subcommand)]
+enum CacheCommand {
+    /// Run a pure command and replay its output on a cache hit.
+    Run {
+        /// Seconds a successful result remains reusable.
+        #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(1..))]
+        ttl_seconds: u64,
+        /// Maximum bytes held in Reef's cache, in MiB.
+        #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u64).range(1..))]
+        max_storage_mib: u64,
+        /// Additional input file outside the Git worktree; repeat as needed.
+        #[arg(long = "input")]
+        inputs: Vec<PathBuf>,
+        /// Private cache directory.
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Report the number and total size of Reef cache entries.
+    Status {
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+    },
+    /// Evict expired and least recently used Reef cache entries.
+    Prune {
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+        #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u64).range(1..))]
+        max_storage_mib: u64,
+    },
 }
 
 #[cfg(unix)]
@@ -206,6 +248,30 @@ fn parse_identity(value: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
+#[cfg(unix)]
+fn cache_command(command: CacheCommand) -> std::process::ExitCode {
+    match command {
+        CacheCommand::Run {
+            ttl_seconds,
+            max_storage_mib,
+            inputs,
+            cache_dir,
+            command,
+        } => command_result(cache::run(cache::RunOptions {
+            command: &command,
+            inputs: &inputs,
+            ttl_seconds,
+            max_storage_mib,
+            cache_dir: cache_dir.as_deref(),
+        })),
+        CacheCommand::Status { cache_dir } => result(cache::status(cache_dir.as_deref())),
+        CacheCommand::Prune {
+            cache_dir,
+            max_storage_mib,
+        } => result(cache::prune(cache_dir.as_deref(), max_storage_mib)),
+    }
+}
+
 fn main() -> std::process::ExitCode {
     #[cfg(unix)]
     if let Some(tool) = agents::shim_name() {
@@ -218,6 +284,8 @@ fn main() -> std::process::ExitCode {
             status::print();
             std::process::ExitCode::SUCCESS
         }
+        #[cfg(unix)]
+        Command::Cache { command } => cache_command(command),
         #[cfg(unix)]
         Command::Agents { command } => match command {
             AgentCommand::Launch {
@@ -232,13 +300,12 @@ fn main() -> std::process::ExitCode {
             identity,
             record,
             command,
-        } => match run::run(&command, category.as_str(), &identity, record.as_deref()) {
-            Ok(code) => std::process::ExitCode::from(code),
-            Err(error) => {
-                eprintln!("reef: {error}");
-                std::process::ExitCode::FAILURE
-            }
-        },
+        } => command_result(run::run(
+            &command,
+            category.as_str(),
+            &identity,
+            record.as_deref(),
+        )),
         #[cfg(unix)]
         Command::Serve {
             cpu,
@@ -262,7 +329,7 @@ fn main() -> std::process::ExitCode {
             record,
             state_dir,
             command,
-        } => match schedule::schedule(schedule::RunOptions {
+        } => command_result(schedule::schedule(schedule::RunOptions {
             command: &command,
             category: category.as_str(),
             identity: &identity,
@@ -270,13 +337,7 @@ fn main() -> std::process::ExitCode {
             cpu,
             memory_mib,
             state_dir: state_dir.as_deref(),
-        }) {
-            Ok(code) => std::process::ExitCode::from(code),
-            Err(error) => {
-                eprintln!("reef: {error}");
-                std::process::ExitCode::FAILURE
-            }
-        },
+        })),
         #[cfg(unix)]
         Command::Queue { state_dir } => result(schedule::queue(state_dir.as_deref())),
         #[cfg(unix)]
