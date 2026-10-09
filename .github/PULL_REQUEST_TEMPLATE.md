@@ -8,6 +8,24 @@
 
 ## Implementation information
 
-<!-- Describe the behavior and technical decisions as bullets. -->
+<!--
+Bullet list of key implementation details:
 
-<!-- Add Supporting documentation only when there are relevant links. -->
+- Technical decisions made
+- Files/components modified
+- Notable patterns or approaches used
+-->
+
+<!--
+Supporting documentation (optional):
+
+Uncomment and use this section when you have relevant links to add.
+Do NOT use placeholder values like "N/A", "none", or "-".
+If there's nothing to link, simply omit this section entirely.
+
+## Supporting documentation
+
+- [Issue #123](link)
+- [Related discussion](link)
+- [External documentation](link)
+-->
