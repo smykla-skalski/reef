@@ -75,6 +75,7 @@ impl Fixture {
             .arg("--")
             .args(args)
             .env("PATH", path)
+            .env("HOME", &self.path)
             .env("REEF_TEST_OUTPUT", self.path.join("output"));
         command
     }
@@ -127,6 +128,21 @@ fn codex_and_claude_route_heavy_commands_and_preserve_status() {
         assert!(stderr.contains("position 1"), "{stderr}");
         assert!(stderr.contains("\"category\":\"test\""), "{stderr}");
         assert!(!stderr.contains("./..."), "{stderr}");
+        let history = fixture.path.join(".local/state/reef/history");
+        let records: Vec<_> = fs::read_dir(history)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            })
+            .collect();
+        assert_eq!(records.len(), 1);
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&records[0]).unwrap()).unwrap();
+        assert_eq!(record["category"], "test");
+        assert_eq!(record["status"], "failed");
+        assert!(record["identity"].as_str().unwrap().starts_with(agent));
     }
 }
 

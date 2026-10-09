@@ -796,7 +796,7 @@ pub struct RunOptions<'a> {
     pub command: &'a [String],
     pub category: &'a str,
     pub identity: &'a str,
-    pub record: Option<&'a Path>,
+    pub record: run::RecordMode<'a>,
     pub cpu: u32,
     pub memory_mib: u64,
     pub state_dir: Option<&'a Path>,

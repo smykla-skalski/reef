@@ -2,6 +2,7 @@
 mod agents;
 #[cfg(unix)]
 mod cache;
+mod history;
 mod observe;
 #[cfg(unix)]
 mod pressure;
@@ -52,8 +53,11 @@ enum Command {
         #[arg(long, default_value = "command", value_parser = parse_identity)]
         identity: String,
         /// Append a private JSON Lines measurement record to this file.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "no_record")]
         record: Option<PathBuf>,
+        /// Do not save this command to history.
+        #[arg(long)]
+        no_record: bool,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -82,8 +86,11 @@ enum Command {
         category: Category,
         #[arg(long, default_value = "command", value_parser = parse_identity)]
         identity: String,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "no_record")]
         record: Option<PathBuf>,
+        /// Do not save this command to history.
+        #[arg(long)]
+        no_record: bool,
         #[arg(long)]
         state_dir: Option<PathBuf>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -272,6 +279,17 @@ fn cache_command(command: CacheCommand) -> std::process::ExitCode {
     }
 }
 
+#[cfg(unix)]
+fn record_mode(record: Option<&std::path::Path>, no_record: bool) -> run::RecordMode<'_> {
+    if no_record {
+        run::RecordMode::Disabled
+    } else if let Some(path) = record {
+        run::RecordMode::Custom(path)
+    } else {
+        run::RecordMode::Default
+    }
+}
+
 fn main() -> std::process::ExitCode {
     #[cfg(unix)]
     if let Some(tool) = agents::shim_name() {
@@ -299,12 +317,13 @@ fn main() -> std::process::ExitCode {
             category,
             identity,
             record,
+            no_record,
             command,
         } => command_result(run::run(
             &command,
             category.as_str(),
             &identity,
-            record.as_deref(),
+            record_mode(record.as_deref(), no_record),
         )),
         #[cfg(unix)]
         Command::Serve {
@@ -327,13 +346,14 @@ fn main() -> std::process::ExitCode {
             category,
             identity,
             record,
+            no_record,
             state_dir,
             command,
         } => command_result(schedule::schedule(schedule::RunOptions {
             command: &command,
             category: category.as_str(),
             identity: &identity,
-            record: record.as_deref(),
+            record: record_mode(record.as_deref(), no_record),
             cpu,
             memory_mib,
             state_dir: state_dir.as_deref(),

@@ -14,19 +14,20 @@ Reef is under active development. The CLI reports current CPU, memory, and swap 
 reef status
 ```
 
-Run a command with inherited input and output, and print a measurement to standard error:
+Run a command with inherited input and output, and save a measurement by default:
 
 ```console
 reef run --category test -- cargo test --locked
 ```
 
-To append a JSON Lines record, provide a private record path and an optional safe label:
+To use a custom JSON Lines record path or skip persistence for one command:
 
 ```console
 reef run --category build --identity project-build --record measurements.jsonl -- cargo build
+reef run --no-record -- cargo metadata
 ```
 
-`reef run` returns the command's exit code, including when saving a measurement fails. Its measurement includes Unix start and end timestamps in milliseconds, wall time, CPU time, and peak resident memory. The `tree_*` fields combine the direct child's kernel usage with 20 ms process-tree samples. `tree_usage_complete` is always `false` because descendants that start and exit between samples can be missed. Records contain only the category, label, status, timestamps, and measurements. Reef never saves command arguments or environment variables. New record files are mode `0600`; Reef skips persistence to public files and invalid paths while still running the command.
+`reef run`, `reef schedule`, and supported coding-agent commands save private measurements in `~/.local/state/reef/history` by default. Reef keeps at most seven days and 100 MiB there, pruning only files stamped with that history directory's private Reef identity when a new measurement arrives. `--record` writes only to the chosen custom path; `--no-record` disables persistence for that invocation. These two options cannot be combined. Reef prints the measurement to standard error and returns the child's exit code even if storage fails, with a warning on standard error. A record contains a category, validated safe label, status, Unix start and end timestamps, wall time, CPU time, and peak resident memory; it never contains command arguments or environment variables. The `tree_*` fields combine the direct child's kernel usage with 20 ms process-tree samples. `tree_usage_complete` is always `false` because descendants that start and exit between samples can be missed. The history directory is mode `0700` and its files are mode `0600` on Unix. Reef skips persistence to public custom files and invalid paths while still running the command.
 
 ## Shared scheduling (Unix)
 
@@ -65,7 +66,7 @@ Reef prepends a private directory of command shims to `PATH` for that session. T
 
 The initial shims cover `go build|install|run|test|vet`, `cargo build|check|install|test|bench|clippy` (also after `+toolchain` and global flags), `golangci-lint run`, `mise run` targets named `build`, `test`, `lint`, or `check`, and all `make` recipes except help/version requests. Unknown leading Cargo flags and unrecognized Make options are scheduled conservatively instead of bypassing the budget. Makefile content from stdin is passed through untouched. Builds, tests, and linters are tagged by category. The scheduler's safe identity combines the agent name, a session token, and a hash of the current worktree; Reef does not send or store the original command text or worktree path in scheduler state. Queue messages show the request ID, position, and reason for waiting. Defaults are one CPU and 1024 MiB per command.
 
-Nested tools launched by an admitted command run under its existing reservation. If the scheduler is unavailable, a heavy command fails with a clear error; it does not run outside the budget. Absolute executable paths, scripts that replace `PATH`, commands inside remote or cloud agent sessions, and tools outside the shim list bypass automatic routing. For those, invoke `reef schedule --category ... -- command` explicitly. Agent configurations that filter `PATH` or Reef's session variables also prevent automatic routing.
+Nested shimmed tools launched by an admitted command run under its existing reservation and are included in the outer command's measurement, not saved as separate commands. An explicit nested `reef schedule` still records its own measurement. If the scheduler is unavailable, a heavy command fails with a clear error; it does not run outside the budget. Absolute executable paths, scripts that replace `PATH`, commands inside remote or cloud agent sessions, and tools outside the shim list bypass automatic routing. For those, invoke `reef schedule --category ... -- command` explicitly. Agent configurations that filter `PATH` or Reef's session variables also prevent automatic routing.
 
 ## Output cache (Unix)
 
@@ -100,14 +101,15 @@ reef observe stop
 
 Use `reef observe run` to keep the recorder in the foreground. All three commands accept `--state-dir` for an alternate location; pass it to `stop` as well when using a custom directory. Stopping takes effect at the next interval. If the recorder exits unexpectedly and leaves `recorder.pid`, remove that stale file before restarting.
 
-Generate a workload report from observations and one or more command record files:
+Generate a workload report from observations and default command history; add custom record files with `--records`:
 
 ```console
+reef report
 reef report --records measurements.jsonl
 reef report --from 2026-10-08T00:00:00Z --to 2026-10-09T00:00:00Z --records measurements.jsonl --format json
 ```
 
-The default range is the last 24 hours. Its start is inclusive and its end is exclusive. Markdown is the default format. Without `--records`, command measurements are shown as unavailable; Reef does not infer command categories from anonymous system samples. Command totals include each whole command whose execution overlaps the range. The wall and CPU percentages are shares of measured commands, not shares of machine capacity. Concurrent command wall times can add up to more than the elapsed range. The pressure timeline lists categories active during a pressured sample; overlap alone does not establish cause. Thresholds default to 90% CPU, 90% memory, and 1% swap and can be changed with `--cpu-threshold`, `--memory-threshold`, and `--swap-threshold`. Missing metrics remain unavailable rather than becoming zero. Agent, container, and interactive categories require later instrumentation; `reef run` currently offers build, lint, test, and other.
+The default range is the last 24 hours. Its start is inclusive and its end is exclusive. Markdown is the default format. `--records` adds custom files to default history without double-counting a repeated path. If no history exists, command measurements are unavailable; if history exists but no command overlaps the range, the measured count is zero. Reef marks pressure samples with no overlapping managed command as unattributed host activity rather than assigning their cost to a measured command. Command totals include each whole command whose execution overlaps the range. The wall and CPU percentages are shares of measured commands, not shares of machine capacity. Concurrent command wall times can add up to more than the elapsed range. The pressure timeline lists categories active during a pressured sample; overlap alone does not establish cause. `--state-dir` selects the observation directory, not the default command history directory. Thresholds default to 90% CPU, 90% memory, and 1% swap and can be changed with `--cpu-threshold`, `--memory-threshold`, and `--swap-threshold`. Missing metrics remain unavailable rather than becoming zero. Agent, container, and interactive categories require later instrumentation; `reef run` currently offers build, lint, test, and other.
 
 ## Planned capabilities
 

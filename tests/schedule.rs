@@ -96,6 +96,47 @@ fn has_job(jobs: &[Value], state: &str) -> bool {
 }
 
 #[test]
+fn scheduled_command_saves_default_history() {
+    let fixture = Fixture::new();
+    let output = reef()
+        .args(["schedule", "--category", "test", "--state-dir"])
+        .arg(&fixture.path)
+        .args(["--", "sh", "-c", "exit 7"])
+        .env("HOME", &fixture.path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(7));
+    let history = fixture.path.join(".local/state/reef/history");
+    let path = fs::read_dir(history)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .unwrap();
+    let record: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(record["category"], "test");
+    assert_eq!(record["status"], "failed");
+}
+
+#[test]
+fn scheduled_command_can_disable_history() {
+    let fixture = Fixture::new();
+    let output = reef()
+        .args(["schedule", "--no-record", "--state-dir"])
+        .arg(&fixture.path)
+        .args(["--", "sh", "-c", "exit 7"])
+        .env("HOME", &fixture.path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(7));
+    assert!(!fixture.path.join(".local/state/reef/history").exists());
+}
+
+#[test]
 fn unavailable_scheduler_does_not_start_command() {
     let path = std::env::temp_dir().join(format!("reef-missing-{}", std::process::id()));
     let marker = path.join("started");

@@ -1,5 +1,6 @@
 mod platform;
 
+use crate::history;
 use fs2::FileExt;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -12,6 +13,19 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 use wait4::Wait4;
 
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(20);
+
+#[derive(Clone, Copy)]
+pub enum RecordMode<'a> {
+    Default,
+    Custom(&'a Path),
+    Disabled,
+}
+
+enum RecordWriter {
+    History,
+    Custom(File),
+    Disabled,
+}
 
 pub trait Admission {
     fn started(&mut self, pid: u32) -> io::Result<()>;
@@ -94,7 +108,7 @@ pub fn run(
     command: &[String],
     category: &str,
     identity: &str,
-    record: Option<&Path>,
+    record: RecordMode<'_>,
 ) -> io::Result<u8> {
     run_with(command, category, identity, record, None)
 }
@@ -103,10 +117,10 @@ pub fn run_with(
     command: &[String],
     category: &str,
     identity: &str,
-    record: Option<&Path>,
+    record: RecordMode<'_>,
     mut admission: Option<&mut dyn Admission>,
 ) -> io::Result<u8> {
-    let mut record_file = open_optional_record(record);
+    let mut record_writer = open_record_writer(record);
 
     let mut signals = platform::signals()?;
     let started_at_unix_ms = unix_ms();
@@ -122,7 +136,7 @@ pub fn run_with(
                 identity,
                 started_at_unix_ms,
                 start,
-                record_file.as_mut(),
+                &mut record_writer,
             ));
         }
     };
@@ -166,7 +180,7 @@ pub fn run_with(
         tree_peak_memory_bytes: sampler.peak_memory_bytes.max(result.rusage.maxrss),
         tree_usage_complete: false,
     };
-    report(&measurement, record_file.as_mut());
+    report(&measurement, &mut record_writer);
     if scheduler_lost {
         return Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
@@ -282,7 +296,7 @@ fn spawn_failed(
     identity: &str,
     started_at_unix_ms: u128,
     start: Instant,
-    record_file: Option<&mut File>,
+    record_writer: &mut RecordWriter,
 ) -> u8 {
     let code = if error.kind() == io::ErrorKind::NotFound {
         127
@@ -305,7 +319,7 @@ fn spawn_failed(
         tree_usage_complete: false,
     };
     eprintln!("reef: command could not start: {error}");
-    report(&measurement, record_file);
+    report(&measurement, record_writer);
     u8::try_from(code).unwrap_or(1)
 }
 
@@ -352,32 +366,40 @@ fn cleanup_group(pid: u32) -> io::Result<()> {
     Ok(())
 }
 
-fn emit(measurement: &Measurement<'_>, record_file: Option<&mut File>) -> io::Result<()> {
+fn emit(measurement: &Measurement<'_>, writer: &mut RecordWriter) -> io::Result<()> {
     eprintln!("reef: {}", serde_json::to_string(measurement)?);
-    if let Some(file) = record_file {
-        file.lock_exclusive()?;
-        let mut line = serde_json::to_vec(measurement)?;
-        line.push(b'\n');
-        file.write_all(&line)?;
-        FileExt::unlock(file)?;
+    match writer {
+        RecordWriter::History => history::save(measurement)?,
+        RecordWriter::Custom(file) => {
+            file.lock_exclusive()?;
+            let mut line = serde_json::to_vec(measurement)?;
+            line.push(b'\n');
+            file.write_all(&line)?;
+            FileExt::unlock(file)?;
+        }
+        RecordWriter::Disabled => {}
     }
     Ok(())
 }
 
-fn report(measurement: &Measurement<'_>, record_file: Option<&mut File>) {
-    if let Err(error) = emit(measurement, record_file) {
+fn report(measurement: &Measurement<'_>, writer: &mut RecordWriter) {
+    if let Err(error) = emit(measurement, writer) {
         eprintln!("reef: cannot save measurement: {error}");
     }
 }
 
-fn open_optional_record(record: Option<&Path>) -> Option<File> {
-    record.and_then(|path| match open_record(path) {
-        Ok(file) => Some(file),
-        Err(error) => {
-            eprintln!("reef: cannot open measurement record: {error}");
-            None
-        }
-    })
+fn open_record_writer(record: RecordMode<'_>) -> RecordWriter {
+    match record {
+        RecordMode::Default => RecordWriter::History,
+        RecordMode::Disabled => RecordWriter::Disabled,
+        RecordMode::Custom(path) => match open_record(path) {
+            Ok(file) => RecordWriter::Custom(file),
+            Err(error) => {
+                eprintln!("reef: cannot open measurement record: {error}");
+                RecordWriter::Disabled
+            }
+        },
+    }
 }
 
 fn open_record(path: &Path) -> io::Result<File> {

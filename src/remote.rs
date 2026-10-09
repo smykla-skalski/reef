@@ -1,3 +1,4 @@
+use crate::run::RecordMode;
 use crate::schedule;
 use clap::Args;
 use fs2::FileExt;
@@ -218,7 +219,7 @@ pub fn submit(options: &Options) -> io::Result<u8> {
                 command: &options.command,
                 category: &options.category,
                 identity: &options.identity,
-                record: None,
+                record: RecordMode::Default,
                 cpu: options.cpu,
                 memory_mib: options.memory_mib,
                 state_dir: options.state_dir.as_deref(),

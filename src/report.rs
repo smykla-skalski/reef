@@ -1,3 +1,4 @@
+use crate::history;
 use chrono::{DateTime, Duration, Utc};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -115,6 +116,7 @@ struct PressureEvent {
     to_unix_ms: u128,
     triggers: Vec<&'static str>,
     overlapping_categories: Option<Vec<&'static str>>,
+    attribution: &'static str,
 }
 
 fn state_dir(override_dir: Option<&Path>) -> io::Result<PathBuf> {
@@ -303,6 +305,35 @@ fn category_reports(records: &[Measurement]) -> Vec<CategoryReport> {
         .collect()
 }
 
+fn pressure_event(
+    start: u128,
+    end: u128,
+    triggers: Vec<&'static str>,
+    records: Option<&[Measurement]>,
+) -> PressureEvent {
+    let overlapping_categories: Option<Vec<&'static str>> = records.map(|records| {
+        records
+            .iter()
+            .filter(|record| record.started_at_unix_ms < end && record.ended_at_unix_ms > start)
+            .map(|record| category(&record.category))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    });
+    let attribution = match &overlapping_categories {
+        Some(categories) if categories.is_empty() => "no_measured_command_overlap",
+        Some(_) => "measured_command_overlap",
+        None => "history_unavailable",
+    };
+    PressureEvent {
+        from_unix_ms: start,
+        to_unix_ms: end,
+        triggers,
+        overlapping_categories,
+        attribution,
+    }
+}
+
 fn build_report(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
@@ -366,23 +397,7 @@ fn build_report(
             triggers.push("swap");
         }
         if !triggers.is_empty() && duration > 0 {
-            let overlapping_categories = records.as_ref().map(|records| {
-                records
-                    .iter()
-                    .filter(|record| {
-                        record.started_at_unix_ms < end && record.ended_at_unix_ms > start
-                    })
-                    .map(|record| category(&record.category))
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect()
-            });
-            timeline.push(PressureEvent {
-                from_unix_ms: start,
-                to_unix_ms: end,
-                triggers,
-                overlapping_categories,
-            });
+            timeline.push(pressure_event(start, end, triggers, records.as_deref()));
         }
     }
     let peak_host_memory_bytes = samples.iter().filter_map(|s| s.memory_used_bytes).max();
@@ -446,11 +461,11 @@ fn markdown(report: &Report) -> String {
             );
         }
         if categories.is_empty() {
-            out.push_str("\nNo commands overlap the range.\n");
+            out.push_str("\nNo Reef-managed commands overlap the range. Observed host activity remains unattributed.\n");
         }
     } else {
         out.push_str(
-            "Unavailable. Pass --records with a private JSON Lines file written by reef run.\n",
+            "No command history is available. Host activity is uninstrumented or unknown.\n",
         );
     }
     let _ = write!(
@@ -475,7 +490,7 @@ fn markdown(report: &Report) -> String {
                 || "unavailable".to_owned(),
                 |categories| {
                     if categories.is_empty() {
-                        "none measured".to_owned()
+                        "none measured (host activity unattributed)".to_owned()
                     } else {
                         categories.join(", ")
                     }
@@ -516,12 +531,13 @@ pub fn run(options: &Options) -> io::Result<()> {
         }
     }
     let samples = observations(&state_dir(options.state_dir.as_deref())?)?;
-    let records = if options.records.is_empty() {
+    let default_paths = history::paths()?;
+    let records = if default_paths.is_none() && options.records.is_empty() {
         None
     } else {
         let mut all = Vec::new();
         let mut seen = BTreeSet::new();
-        for path in &options.records {
+        for path in default_paths.iter().flatten().chain(options.records.iter()) {
             let canonical = fs::canonicalize(path)?;
             if seen.insert(canonical.clone()) {
                 all.extend(read_jsonl(&canonical)?);
@@ -619,7 +635,7 @@ mod tests {
         assert!(!report.command_measurements_available);
         assert!(report.categories.is_none());
         assert!(report.pressure.any_above_ms.is_none());
-        assert!(markdown(&report).contains("Unavailable. Pass --records"));
+        assert!(markdown(&report).contains("Host activity is uninstrumented or unknown"));
 
         let measured = build_report(
             date(100),
@@ -638,6 +654,24 @@ mod tests {
     fn simultaneous_end_and_start_do_not_overlap() {
         let records = [command("build", 100, 200, 1), command("lint", 200, 300, 1)];
         assert_eq!(peak_concurrency(&records, 100, 300), 1);
+    }
+
+    #[test]
+    fn pressure_without_managed_command_overlap_is_unattributed() {
+        let report = build_report(
+            date(100),
+            date(300),
+            vec![sample(250, Some(95.0), Some(10))],
+            Some(vec![command("build", 0, 100, 1)]),
+            (90, 90, 1),
+        );
+        assert_eq!(report.timeline.len(), 1);
+        assert_eq!(
+            report.timeline[0].attribution,
+            "no_measured_command_overlap"
+        );
+        assert_eq!(report.timeline[0].overlapping_categories, Some(vec![]));
+        assert!(markdown(&report).contains("host activity unattributed"));
     }
 
     #[test]
