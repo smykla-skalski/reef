@@ -210,10 +210,17 @@ fn pruned_default_history_is_unavailable_for_earlier_period() {
     let record_path = dir.join(format!("command-1767231000000-1-1-{id}.jsonl"));
     fs::write(
         &record_path,
-        "{\"category\":\"build\",\"status\":\"success\",\"started_at_unix_ms\":1767227400000,\"ended_at_unix_ms\":1767231000000,\"wall_ms\":3600000,\"tree_cpu_ms\":500000,\"tree_peak_memory_bytes\":1}\n",
+        "{\"category\":\"build\",\"status\":\"success\",\"started_at_unix_ms\":1767225600000,\"ended_at_unix_ms\":1767231000000,\"wall_ms\":5400000,\"tree_cpu_ms\":500000,\"tree_peak_memory_bytes\":1}\n",
     )
     .unwrap();
     fs::set_permissions(&record_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let earlier_path = dir.join(format!("command-1767228300000-1-2-{id}.jsonl"));
+    fs::write(
+        &earlier_path,
+        "{\"category\":\"test\",\"status\":\"success\",\"started_at_unix_ms\":1767227400000,\"ended_at_unix_ms\":1767228300000,\"wall_ms\":900000,\"tree_cpu_ms\":300000,\"tree_peak_memory_bytes\":1}\n",
+    )
+    .unwrap();
+    fs::set_permissions(&earlier_path, fs::Permissions::from_mode(0o600)).unwrap();
 
     let output = reef()
         .args(args())
@@ -229,4 +236,18 @@ fn pruned_default_history_is_unavailable_for_earlier_period() {
     assert!(comparison["baseline"]["completed_command_count"].is_null());
     assert_eq!(comparison["comparison"]["command_history_available"], true);
     assert_eq!(comparison["comparison"]["completed_command_count"], 1);
+
+    fs::remove_file(&earlier_path).unwrap();
+    let output = reef()
+        .args(args())
+        .arg("--state-dir")
+        .arg(&fixture.0)
+        .args(["--format", "json"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let comparison: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(comparison["baseline"]["command_history_available"], false);
+    assert!(comparison["baseline"]["completed_command_count"].is_null());
 }

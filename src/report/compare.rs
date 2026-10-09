@@ -365,19 +365,30 @@ pub fn run_compare(options: &CompareOptions) -> io::Result<()> {
         }
         Some(all)
     };
-    // The first retained default record is the earliest point at which we can
-    // establish coverage. Pruning can remove an earlier period while leaving
-    // later records, so an empty category list alone does not prove zero work.
+    // Retention prunes by the history file's save timestamp, not by a
+    // command's start. A long retained command can start before a shorter
+    // pruned command, so record start times cannot establish coverage.
     let default_history_start = (!explicit_records)
         .then(|| {
-            records
-                .as_deref()
-                .and_then(|all| all.iter().map(|record| record.started_at_unix_ms).min())
+            default_paths.as_ref().and_then(|paths| {
+                paths
+                    .iter()
+                    .filter_map(|path| {
+                        path.file_name()?
+                            .to_str()?
+                            .strip_prefix("command-")?
+                            .split('-')
+                            .next()?
+                            .parse::<u128>()
+                            .ok()
+                    })
+                    .min()
+            })
         })
         .flatten();
     let records_for = |from: DateTime<Utc>| {
         let from_ms = u128::try_from(from.timestamp_millis()).unwrap_or_default();
-        (explicit_records || default_history_start.is_some_and(|start| from_ms >= start))
+        (explicit_records || default_history_start.is_some_and(|start| from_ms > start))
             .then_some(records.as_deref())
             .flatten()
     };
