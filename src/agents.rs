@@ -154,6 +154,11 @@ fn classify(tool: &str, args: &[OsString]) -> Option<&'static str> {
             "build" | "check" | "install" => Some("build"),
             "test" | "bench" => Some("test"),
             "clippy" => Some("lint"),
+            verb if verb.starts_with('-')
+                && !matches!(verb, "--help" | "-h" | "--version" | "-V") =>
+            {
+                Some("build")
+            }
             _ => None,
         },
         "golangci-lint" if args.first()?.to_str()? == "run" => Some("lint"),
@@ -163,12 +168,7 @@ fn classify(tool: &str, args: &[OsString]) -> Option<&'static str> {
             "lint" | "check" => Some("lint"),
             _ => None,
         },
-        "make" => match make_target(args)? {
-            "build" => Some("build"),
-            "test" => Some("test"),
-            "lint" | "check" => Some("lint"),
-            _ => None,
-        },
+        "make" => make_category(args),
         _ => None,
     }
 }
@@ -193,7 +193,8 @@ fn cargo_verb(args: &[OsString]) -> Option<&str> {
         if matches!(
             arg,
             "--offline" | "--locked" | "--frozen" | "--quiet" | "-q" | "--verbose" | "-v"
-        ) || arg.starts_with("--color=")
+        ) || (arg.starts_with('-') && arg.len() > 1 && arg[1..].bytes().all(|byte| byte == b'v'))
+            || arg.starts_with("--color=")
             || arg.starts_with("--config=")
             || (arg.starts_with("-Z") && arg.len() > 2)
         {
@@ -206,33 +207,21 @@ fn cargo_verb(args: &[OsString]) -> Option<&str> {
     }
 }
 
-fn make_target(args: &[OsString]) -> Option<&str> {
-    let mut index = 0;
-    loop {
-        let arg = args.get(index)?.to_str()?;
-        if matches!(arg, "-C" | "--directory" | "-f" | "--file" | "-I") {
-            index += 2;
-        } else if arg == "-j" || arg == "--jobs" {
-            index += 1;
-            if args
-                .get(index)
-                .and_then(|next| next.to_str())
-                .is_some_and(|next| {
-                    !next.is_empty() && next.bytes().all(|byte| byte.is_ascii_digit())
-                })
-            {
-                index += 1;
-            }
-        } else if matches!(arg, "-B" | "-k" | "-s" | "--silent")
-            || arg.starts_with("-j")
-            || arg.starts_with("--jobs=")
-            || arg.starts_with("--directory=")
-            || arg.starts_with("--file=")
-        {
-            index += 1;
-        } else {
-            return Some(arg);
-        }
+fn make_category(args: &[OsString]) -> Option<&'static str> {
+    if args.len() == 1
+        && args.iter().any(|arg| {
+            arg.to_str()
+                .is_some_and(|arg| matches!(arg, "--help" | "--version" | "-h" | "-v"))
+        })
+    {
+        return None;
+    }
+    if args.iter().any(|arg| arg == "test") {
+        Some("test")
+    } else if args.iter().any(|arg| arg == "lint" || arg == "check") {
+        Some("lint")
+    } else {
+        Some("build")
     }
 }
 
@@ -290,15 +279,29 @@ mod tests {
             ("cargo", vec!["--color", "never", "test"], Some("test")),
             (
                 "cargo",
+                vec!["-vv", "test", "--no-run", "--offline"],
+                Some("test"),
+            ),
+            (
+                "cargo",
                 vec!["+nightly", "--config", "x=y", "clippy"],
                 Some("lint"),
             ),
             ("cargo", vec!["metadata"], None),
+            ("cargo", vec!["--help"], None),
+            ("cargo", vec!["--future-flag", "test"], Some("build")),
             ("golangci-lint", vec!["run"], Some("lint")),
             ("mise", vec!["run", "check"], Some("lint")),
             ("make", vec!["test"], Some("test")),
             ("make", vec!["-j8", "test"], Some("test")),
+            (
+                "make",
+                vec!["--no-print-directory", "-f", "/dev/stdin", "test"],
+                Some("test"),
+            ),
             ("make", vec!["-j", "8", "test"], Some("test")),
+            ("make", vec!["--no-print-directory"], Some("build")),
+            ("make", vec!["--help"], None),
         ] {
             let args: Vec<OsString> = args.into_iter().map(OsString::from).collect();
             assert_eq!(classify(tool, &args), expected, "{tool} {args:?}");

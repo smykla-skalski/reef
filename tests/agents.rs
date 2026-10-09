@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -149,7 +150,9 @@ fn unavailable_scheduler_never_starts_heavy_command() {
         vec!["go", "-C", "module", "test"],
         vec!["cargo", "--offline", "test"],
         vec!["cargo", "--color", "never", "test"],
+        vec!["cargo", "-vv", "test", "--no-run", "--offline"],
         vec!["make", "-j8", "test"],
+        vec!["make", "--no-print-directory", "-f", "/dev/stdin", "test"],
     ] {
         let output = fixture.launch("claude", &args).output().unwrap();
         assert!(!output.status.success(), "{args:?}");
@@ -159,6 +162,40 @@ fn unavailable_scheduler_never_starts_heavy_command() {
         );
     }
     assert!(!fixture.path.join("output").exists());
+}
+
+#[test]
+fn makefile_from_stdin_is_not_consumed_or_duplicated() {
+    for agent in ["codex", "claude"] {
+        let fixture = Fixture::new(true);
+        let fake_make = fixture.path.join("bin/make");
+        fs::remove_file(&fake_make).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/make", &fake_make).unwrap();
+        let mut child = fixture
+            .launch(
+                agent,
+                &["make", "--no-print-directory", "-f", "/dev/stdin", "test"],
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"test:\n\t@echo REEF_STDIN_OK\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{agent}: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "REEF_STDIN_OK"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("queued request"), "{agent}: {stderr}");
+    }
 }
 
 #[test]
