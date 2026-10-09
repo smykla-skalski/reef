@@ -22,7 +22,6 @@ mod schedule;
 mod schedule_events;
 mod status;
 
-#[cfg(unix)]
 use clap::ValueEnum;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
