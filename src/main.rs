@@ -1,3 +1,5 @@
+#[cfg(unix)]
+mod agents;
 mod observe;
 #[cfg(unix)]
 mod pressure;
@@ -24,6 +26,12 @@ struct Cli {
 enum Command {
     /// Show current machine resource usage.
     Status,
+    /// Launch a coding agent with resource-aware command shims.
+    #[cfg(unix)]
+    Agents {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
     /// Run a command and measure its resource cost.
     #[cfg(unix)]
     Run {
@@ -93,6 +101,37 @@ enum Command {
     Report(report::Options),
 }
 
+#[cfg(unix)]
+#[derive(Debug, Subcommand)]
+enum AgentCommand {
+    /// Launch Codex or Claude Code with a process-scoped shim path.
+    Launch {
+        #[arg(value_enum)]
+        agent: AgentName,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AgentName {
+    Codex,
+    Claude,
+}
+
+#[cfg(unix)]
+impl AgentName {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum ObserveCommand {
     /// Start a recorder that survives terminal sessions.
@@ -159,6 +198,10 @@ fn parse_identity(value: &str) -> Result<String, String> {
 }
 
 fn main() -> std::process::ExitCode {
+    #[cfg(unix)]
+    if let Some(tool) = agents::shim_name() {
+        return command_result(agents::shim(&tool));
+    }
     let cli = Cli::parse();
 
     match cli.command {
@@ -166,6 +209,14 @@ fn main() -> std::process::ExitCode {
             status::print();
             std::process::ExitCode::SUCCESS
         }
+        #[cfg(unix)]
+        Command::Agents { command } => match command {
+            AgentCommand::Launch {
+                agent,
+                state_dir,
+                args,
+            } => command_result(agents::launch(agent.as_str(), state_dir.as_deref(), &args)),
+        },
         #[cfg(unix)]
         Command::Run {
             category,
@@ -242,6 +293,17 @@ fn main() -> std::process::ExitCode {
                 std::process::ExitCode::FAILURE
             }
         },
+    }
+}
+
+#[cfg(unix)]
+fn command_result(result: std::io::Result<u8>) -> std::process::ExitCode {
+    match result {
+        Ok(code) => std::process::ExitCode::from(code),
+        Err(error) => {
+            eprintln!("reef: {error}");
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 

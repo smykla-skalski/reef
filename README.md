@@ -52,6 +52,21 @@ Scheduling reserves estimated capacity before a command starts. It does not enfo
 
 The server also samples live CPU and memory usage every second. New jobs wait during high pressure (90% CPU or memory), until both metrics stay below recovery thresholds (70% CPU and 80% memory) for five seconds. A stale or unavailable sample also holds admission. For each new job, Reef preserves one idle logical CPU on machines with more than two cores and 10% of physical memory by default; it never stops a running job because pressure rose. The admission check counts active reservations alongside sampled usage, which can hold more work than necessary when a running job already contributes to that sample. Use `--cpu-reserve`, `--memory-reserve-mib`, `--cpu-high-percent`, `--cpu-recover-percent`, `--memory-high-percent`, `--memory-recover-percent`, and `--recovery-seconds` on `reef serve` to tune the policy. Reserve values must be below machine capacity and each recovery threshold must be below its high threshold. `--no-pressure` disables live admission checks when needed for isolated testing. At critical pressure (98% CPU or 97% memory), the server logs a notice with the safe labels of tracked workloads and points to `reef queue`. Notices repeat at most once per minute.
 
+## Coding-agent commands (Unix)
+
+Start the scheduler, then launch a local Codex or Claude Code CLI session through Reef:
+
+```console
+reef agents launch codex
+reef agents launch claude -- --model sonnet
+```
+
+Reef prepends a private directory of command shims to `PATH` for that session. The agent's normal command approval runs before shell command resolution. A supported heavy tool invocation then enters the shared scheduler automatically; light subcommands use the original executable. No agent settings, hooks, shell profiles, or global `PATH` are changed. Closing the agent session removes the modified environment. Use `--state-dir` before `--` to select a scheduler state directory.
+
+The initial shims cover `go build|install|run|test|vet`, `cargo build|check|install|test|bench|clippy` (also after `+toolchain` and global flags), `golangci-lint run`, `mise run` targets named `build`, `test`, `lint`, or `check`, and all `make` recipes except help/version requests. Unknown leading Cargo flags and unrecognized Make options are scheduled conservatively instead of bypassing the budget. Makefile content from stdin is passed through untouched. Builds, tests, and linters are tagged by category. The scheduler's safe identity combines the agent name, a session token, and a hash of the current worktree; Reef does not send or store the original command text or worktree path in scheduler state. Queue messages show the request ID, position, and reason for waiting. Defaults are one CPU and 1024 MiB per command.
+
+Nested tools launched by an admitted command run under its existing reservation. If the scheduler is unavailable, a heavy command fails with a clear error; it does not run outside the budget. Absolute executable paths, scripts that replace `PATH`, commands inside remote or cloud agent sessions, and tools outside the shim list bypass automatic routing. For those, invoke `reef schedule --category ... -- command` explicitly. Agent configurations that filter `PATH` or Reef's session variables also prevent automatic routing.
+
 Start a background recorder with no project configuration:
 
 ```console
