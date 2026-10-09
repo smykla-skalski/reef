@@ -73,6 +73,27 @@ impl Fixture {
             .args(["--", "sh", "-c", script]);
         command
     }
+
+    fn impact(&self) -> Value {
+        let output = Command::new(env!("CARGO_BIN_EXE_reef"))
+            .args([
+                "report",
+                "--from",
+                "2020-01-01T00:00:00Z",
+                "--to",
+                "2100-01-01T00:00:00Z",
+                "--state-dir",
+            ])
+            .arg(self.root.join("observe"))
+            .arg("--cache-dir")
+            .arg(&self.cache)
+            .args(["--format", "json"])
+            .env("HOME", &self.root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["cache"].clone()
+    }
 }
 
 impl Drop for Fixture {
@@ -105,6 +126,88 @@ fn repeats_a_success_without_running_the_command_again() {
     assert_eq!(fs::read_to_string(&fixture.counter).unwrap(), "1");
     assert!(String::from_utf8_lossy(&first.stderr).contains("cache miss"));
     assert!(String::from_utf8_lossy(&second.stderr).contains("cache hit"));
+}
+
+#[test]
+fn reports_key_based_reuse_without_recording_command_text() {
+    let fixture = Fixture::new();
+    assert_eq!(fixture.impact()["available"], false);
+    let first = fixture.run(COUNT);
+    let second = fixture.run(COUNT);
+    assert!(first.status.success());
+    assert!(second.status.success());
+    let impact = fixture.impact();
+    assert_eq!(impact["available"], true);
+    assert_eq!(impact["hits"], 1);
+    assert_eq!(impact["misses"], 1);
+    assert_eq!(impact["estimate_sample_count"], 1);
+    assert_eq!(impact["estimate_missing_sample_count"], 0);
+    assert!(impact["estimated_reused_wall_ms"].as_u64().is_some());
+    assert!(impact["estimated_reused_cpu_ms"].as_u64().is_some());
+    for entry in fs::read_dir(fixture.cache.join("impact")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|value| value == "json") {
+            let contents = fs::read_to_string(&path).unwrap();
+            assert!(!contents.contains(COUNT));
+            assert!(!contents.contains("REEF_TEST_COUNTER"));
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+}
+
+#[test]
+fn missing_cost_sample_is_unavailable_not_zero_savings() {
+    let fixture = Fixture::new();
+    fixture.run(COUNT);
+    let impact_dir = fixture.cache.join("impact");
+    for entry in fs::read_dir(&impact_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|value| value == "json") {
+            fs::remove_file(path).unwrap();
+        }
+    }
+    fixture.run(COUNT);
+    let impact = fixture.impact();
+    assert_eq!(impact["hits"], 1);
+    assert_eq!(impact["estimate_sample_count"], 0);
+    assert_eq!(impact["estimate_missing_sample_count"], 1);
+    assert!(impact["estimated_reused_wall_ms"].is_null());
+    assert!(impact["estimated_reused_cpu_ms"].is_null());
+}
+
+#[test]
+fn failed_execution_is_counted_but_not_used_as_a_cost_sample() {
+    let fixture = Fixture::new();
+    let first = fixture.run("exit 7");
+    assert_eq!(first.status.code(), Some(7));
+    let impact = fixture.impact();
+    assert_eq!(impact["misses"], 1);
+    assert_eq!(impact["failed_or_uncacheable"], 1);
+    assert_eq!(impact["hits"], 0);
+    assert_eq!(impact["estimated_reused_wall_ms"], 0);
+}
+
+#[test]
+fn event_write_failure_warns_without_changing_cached_output() {
+    let fixture = Fixture::new();
+    let first = fixture.run(COUNT);
+    assert!(first.status.success());
+    fs::set_permissions(
+        fixture.cache.join("impact"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    let second = fixture.run(COUNT);
+
+    assert!(second.status.success());
+    assert_eq!(second.stdout, first.stdout);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(stderr.contains("cache hit"));
+    assert!(stderr.contains("cannot save cache impact event"));
 }
 
 #[test]
@@ -348,6 +451,10 @@ fn concurrent_equivalent_requests_share_one_execution() {
     assert_eq!(first.stdout, b"count:1\n");
     assert_eq!(second.stdout, b"count:1\n");
     assert_eq!(fs::read_to_string(&fixture.counter).unwrap(), "1");
+    let impact = fixture.impact();
+    assert_eq!(impact["hits"], 1);
+    assert_eq!(impact["shared_executions"], 1);
+    assert_eq!(impact["misses"], 1);
 }
 
 #[test]

@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use crate::cache_impact;
 use crate::history;
 use crate::schedule_events;
 use chrono::{DateTime, Duration, Utc};
@@ -29,6 +31,10 @@ pub struct Options {
     /// Scheduler state directory containing private intervention events.
     #[arg(long)]
     schedule_state_dir: Option<PathBuf>,
+    /// Cache directory used by `reef cache run`.
+    #[cfg(unix)]
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
     /// Report format.
     #[arg(long, value_enum, default_value_t = Format::Markdown)]
     format: Format,
@@ -93,6 +99,8 @@ struct Report {
     pressure: PressureReport,
     timeline: Vec<PressureEvent>,
     scheduler: Option<schedule_events::Summary>,
+    #[cfg(unix)]
+    cache: cache_impact::Impact,
 }
 
 #[derive(Serialize)]
@@ -437,6 +445,8 @@ fn build_report(
         pressure,
         timeline,
         scheduler,
+        #[cfg(unix)]
+        cache: cache_impact::Impact::default(),
     }
 }
 
@@ -544,6 +554,10 @@ fn markdown(report: &Report) -> String {
     } else {
         out.push_str("Unavailable: no scheduler event history.\n");
     }
+    #[cfg(unix)]
+    {
+        out.push_str(&cache_impact::markdown(&report.cache));
+    }
     out
 }
 
@@ -583,7 +597,7 @@ pub fn run(options: &Options) -> io::Result<()> {
         }
         Some(all)
     };
-    let report = build_report(
+    let mut report = build_report(
         from,
         to,
         samples,
@@ -610,6 +624,15 @@ pub fn run(options: &Options) -> io::Result<()> {
             }
         },
     );
+    #[cfg(unix)]
+    {
+        report.cache = cache_impact::report(
+            options.cache_dir.as_deref(),
+            u128::try_from(from.timestamp_millis()).unwrap_or_default(),
+            u128::try_from(to.timestamp_millis()).unwrap_or_default(),
+        )?;
+        report.empty = report.empty && report.cache.hits == 0 && report.cache.misses == 0;
+    }
     match options.format {
         Format::Markdown => print!("{}", markdown(&report)),
         Format::Json => println!("{}", serde_json::to_string_pretty(&report)?),

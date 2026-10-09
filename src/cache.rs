@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use wait4::Wait4;
+
+use crate::cache_impact::{self, Kind};
 
 const MIB: u64 = 1_048_576;
 const MAX_CAPTURE: usize = 16 * 1024 * 1024;
@@ -46,6 +49,8 @@ struct Output {
     complete: bool,
     code: u8,
     interrupted: bool,
+    wall_ms: u128,
+    cpu_ms: u128,
 }
 
 struct CachedOutput {
@@ -53,7 +58,7 @@ struct CachedOutput {
     stderr: Vec<u8>,
 }
 
-fn cache_path(override_path: Option<&Path>) -> io::Result<PathBuf> {
+pub(crate) fn cache_path(override_path: Option<&Path>) -> io::Result<PathBuf> {
     if let Some(path) = override_path {
         return Ok(path.to_path_buf());
     }
@@ -439,6 +444,7 @@ fn group_exists(pid: u32) -> io::Result<bool> {
 }
 
 fn execute(command: &[String], signals: &mut Signals) -> io::Result<Output> {
+    let start = Instant::now();
     let mut process = Command::new(&command[0]);
     process
         .args(&command[1..])
@@ -461,8 +467,8 @@ fn execute(command: &[String], signals: &mut Signals) -> io::Result<Output> {
                 interrupted_at.get_or_insert_with(Instant::now);
             }
         }
-        if let Some(status) = child.try_wait()? {
-            break status;
+        if let Some(result) = child.try_wait4()? {
+            break result;
         }
         if interrupted_at.is_some_and(|at: Instant| at.elapsed() >= Duration::from_secs(2)) {
             forward(child.id(), Signal::SIGKILL)?;
@@ -482,8 +488,8 @@ fn execute(command: &[String], signals: &mut Signals) -> io::Result<Output> {
     let (stderr, err_complete) = err_thread
         .join()
         .map_err(|_| io::Error::other("stderr reader panicked"))??;
-    let code = status.code().map_or_else(
-        || 128_u8.saturating_add(u8::try_from(status.signal().unwrap_or(1)).unwrap_or(1)),
+    let code = status.status.code().map_or_else(
+        || 128_u8.saturating_add(u8::try_from(status.status.signal().unwrap_or(1)).unwrap_or(1)),
         |code| u8::try_from(code).unwrap_or(1),
     );
     Ok(Output {
@@ -492,6 +498,8 @@ fn execute(command: &[String], signals: &mut Signals) -> io::Result<Output> {
         complete: out_complete && err_complete,
         code,
         interrupted,
+        wall_ms: start.elapsed().as_millis(),
+        cpu_ms: (status.rusage.utime + status.rusage.stime).as_millis(),
     })
 }
 
@@ -513,10 +521,12 @@ pub fn run(options: RunOptions<'_>) -> io::Result<u8> {
     loop {
         let digest = key(options.command, options.inputs)?;
         let lock = open_lock(&root.join("locks").join(&digest))?;
+        let mut waited = false;
         loop {
             match lock.try_lock_exclusive() {
                 Ok(()) => break,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    waited = true;
                     if signals.pending().next().is_some() {
                         return Ok(130);
                     }
@@ -540,37 +550,71 @@ pub fn run(options: RunOptions<'_>) -> io::Result<u8> {
             io::stdout().write_all(&cached.stdout)?;
             io::stderr().write_all(&cached.stderr)?;
             eprintln!("reef: cache hit");
+            cache_impact::record(
+                &root,
+                &digest,
+                if waited { Kind::Shared } else { Kind::Hit },
+                None,
+            );
             let _ = OpenOptions::new()
                 .read(true)
                 .open(path.join("entry.json"))?
                 .set_modified(SystemTime::now());
             return Ok(0);
         }
-        if path.exists() {
-            fs::remove_dir_all(&path)?;
-        }
-        eprintln!("reef: cache miss");
-        let output = execute(options.command, &mut signals)?;
-        if output.code == 0 && !output.interrupted && output.complete {
-            match key(options.command, options.inputs) {
-                Ok(after) if digest == after => {
-                    if let Err(error) = publish(&root, &digest, options.ttl_seconds, &output) {
-                        eprintln!("reef: cannot save cache entry: {error}");
-                    }
-                }
-                Ok(_) => {
-                    eprintln!("reef: cache inputs changed during execution; result not stored");
-                }
-                Err(error) => eprintln!("reef: cannot recheck cache inputs: {error}"),
-            }
-        }
-        let code = output.code;
+        let code = execute_and_cache(&root, &digest, options, &mut signals)?;
         drop(lock);
         if let Err(error) = prune(Some(&root), options.max_storage_mib) {
             eprintln!("reef: cannot prune cache: {error}");
         }
         return Ok(code);
     }
+}
+
+fn execute_and_cache(
+    root: &Path,
+    digest: &str,
+    options: RunOptions<'_>,
+    signals: &mut Signals,
+) -> io::Result<u8> {
+    let path = entry_path(root, digest);
+    if path.exists() {
+        fs::remove_dir_all(&path)?;
+    }
+    eprintln!("reef: cache miss");
+    let output = match execute(options.command, signals) {
+        Ok(output) => output,
+        Err(error) => {
+            cache_impact::record(root, digest, Kind::Uncacheable, None);
+            return Err(error);
+        }
+    };
+    let mut reusable = false;
+    if output.code == 0 && !output.interrupted && output.complete {
+        match key(options.command, options.inputs) {
+            Ok(after) if digest == after => {
+                match publish(root, digest, options.ttl_seconds, &output) {
+                    Ok(()) => reusable = true,
+                    Err(error) => eprintln!("reef: cannot save cache entry: {error}"),
+                }
+            }
+            Ok(_) => {
+                eprintln!("reef: cache inputs changed during execution; result not stored");
+            }
+            Err(error) => eprintln!("reef: cannot recheck cache inputs: {error}"),
+        }
+    }
+    cache_impact::record(
+        root,
+        digest,
+        if reusable {
+            Kind::Miss
+        } else {
+            Kind::Uncacheable
+        },
+        Some((output.wall_ms, output.cpu_ms)),
+    );
+    Ok(output.code)
 }
 
 fn entries(root: &Path) -> io::Result<Vec<(PathBuf, u64, SystemTime)>> {
