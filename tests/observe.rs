@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -20,10 +21,25 @@ fn recorder(dir: &Path) -> Recorder {
             .arg(dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap(),
     )
+}
+
+fn child_failure(recorder: &mut Recorder) -> String {
+    let status = recorder.0.try_wait().unwrap();
+    let mut stderr = String::new();
+    if status.is_some() {
+        recorder
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+    }
+    format!("status: {status:?}; stderr: {stderr}")
 }
 
 fn wait_until(mut ready: impl FnMut() -> bool) -> bool {
@@ -49,9 +65,11 @@ fn recorder_recovers_after_abrupt_exit_without_running_twice() {
     ));
     let mut first = recorder(&dir);
     let lock = dir.join("recorder.pid");
-    assert!(wait_until(
-        || fs::read_to_string(&lock).is_ok_and(|text| !text.is_empty())
-    ));
+    assert!(
+        wait_until(|| fs::read_to_string(&lock).is_ok_and(|text| !text.is_empty())),
+        "{}",
+        child_failure(&mut first)
+    );
 
     let mut duplicate = recorder(&dir);
     assert!(wait_until(|| duplicate.0.try_wait().unwrap().is_some()));
