@@ -800,6 +800,7 @@ pub struct RunOptions<'a> {
     pub cpu: u32,
     pub memory_mib: u64,
     pub state_dir: Option<&'a Path>,
+    pub limits: &'a crate::contain::Limits,
 }
 
 pub fn schedule(options: RunOptions<'_>) -> io::Result<u8> {
@@ -811,9 +812,10 @@ pub fn schedule(options: RunOptions<'_>) -> io::Result<u8> {
         cpu,
         memory_mib,
         state_dir,
+        limits,
     } = options;
     if std::env::var_os("REEF_ADMITTED").as_deref() == Some(std::ffi::OsStr::new("1")) {
-        return run::run(command, category, identity, record);
+        return run::run_with_limits(command, category, identity, record, None, limits);
     }
     let mut stream = connect(state_dir)?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
@@ -866,7 +868,14 @@ pub fn schedule(options: RunOptions<'_>) -> io::Result<u8> {
                         stream,
                         cancelled: false,
                     };
-                    return run::run_with(command, category, identity, record, Some(&mut lease));
+                    return run::run_with_limits(
+                        command,
+                        category,
+                        identity,
+                        record,
+                        Some(&mut lease),
+                        limits,
+                    );
                 }
                 Reply::Cancelled { id: cancelled } if cancelled == id => return Ok(130),
                 Reply::Error { message } => return Err(io::Error::other(message)),

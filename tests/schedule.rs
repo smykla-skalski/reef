@@ -153,6 +153,32 @@ fn unavailable_scheduler_does_not_start_command() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("scheduler unavailable"));
 }
 
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn explicit_cgroup_limit_fails_before_command_starts() {
+    let fixture = Fixture::new();
+    let marker = fixture.path.join("unexpected-contained-start");
+    let output = reef()
+        .arg("schedule")
+        .arg("--state-dir")
+        .arg(&fixture.path)
+        .args([
+            "--limit-memory-mib",
+            "128",
+            "--",
+            "sh",
+            "-c",
+            "touch \"$REEF_MARKER\"",
+        ])
+        .env("REEF_MARKER", &marker)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!marker.exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cgroup limits require Linux"));
+    Fixture::wait_until(|| fixture.jobs().is_empty());
+}
+
 #[test]
 fn live_memory_reserve_holds_and_cancels_a_queued_command() {
     let mut system = sysinfo::System::new();

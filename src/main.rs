@@ -2,6 +2,7 @@
 mod agents;
 #[cfg(unix)]
 mod cache;
+mod contain;
 mod history;
 mod observe;
 #[cfg(unix)]
@@ -36,6 +37,16 @@ enum Command {
     Cache {
         #[command(subcommand)]
         command: CacheCommand,
+    },
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    ContainExec {
+        #[arg(long)]
+        snapshot: PathBuf,
+        #[arg(long)]
+        expected_json: String,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
     },
     /// Launch a coding agent with resource-aware command shims.
     #[cfg(unix)]
@@ -93,6 +104,8 @@ enum Command {
         no_record: bool,
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        #[command(flatten)]
+        limits: contain::Limits,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -302,6 +315,12 @@ fn main() -> std::process::ExitCode {
             status::print();
             std::process::ExitCode::SUCCESS
         }
+        #[cfg(target_os = "linux")]
+        Command::ContainExec {
+            snapshot,
+            expected_json,
+            command,
+        } => command_result(contain::exec_payload(&command, &snapshot, &expected_json)),
         #[cfg(unix)]
         Command::Cache { command } => cache_command(command),
         #[cfg(unix)]
@@ -348,6 +367,7 @@ fn main() -> std::process::ExitCode {
             record,
             no_record,
             state_dir,
+            limits,
             command,
         } => command_result(schedule::schedule(schedule::RunOptions {
             command: &command,
@@ -357,6 +377,7 @@ fn main() -> std::process::ExitCode {
             cpu,
             memory_mib,
             state_dir: state_dir.as_deref(),
+            limits: &limits,
         })),
         #[cfg(unix)]
         Command::Queue { state_dir } => result(schedule::queue(state_dir.as_deref())),
@@ -366,20 +387,7 @@ fn main() -> std::process::ExitCode {
         Command::Remote(options) => command_result(remote::submit(&options)),
         #[cfg(unix)]
         Command::RemoteWorker(options) => command_result(remote::worker(&options)),
-        Command::Observe { command } => {
-            let result = match command {
-                ObserveCommand::Start(options) => observe::start(&options),
-                ObserveCommand::Run(options) => observe::run(&options),
-                ObserveCommand::Stop { state_dir } => observe::stop(state_dir.as_deref()),
-            };
-            match result {
-                Ok(()) => std::process::ExitCode::SUCCESS,
-                Err(error) => {
-                    eprintln!("reef: {error}");
-                    std::process::ExitCode::FAILURE
-                }
-            }
-        }
+        Command::Observe { command } => observe_command(command),
         Command::Report(options) => match report::run(&options) {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(error) => {
@@ -387,6 +395,21 @@ fn main() -> std::process::ExitCode {
                 std::process::ExitCode::FAILURE
             }
         },
+    }
+}
+
+fn observe_command(command: ObserveCommand) -> std::process::ExitCode {
+    let result = match command {
+        ObserveCommand::Start(options) => observe::start(&options),
+        ObserveCommand::Run(options) => observe::run(&options),
+        ObserveCommand::Stop { state_dir } => observe::stop(state_dir.as_deref()),
+    };
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("reef: {error}");
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
