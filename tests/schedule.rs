@@ -177,6 +177,28 @@ fn invalid_pressure_policy_fails_before_creating_server_state() {
 }
 
 #[test]
+fn zero_recovery_threshold_is_rejected_before_server_state() {
+    let path = std::env::temp_dir().join(format!(
+        "reef-zero-recovery-{}-{}",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    for metric in ["cpu", "memory"] {
+        let output = reef()
+            .arg("serve")
+            .arg(format!("--{metric}-recover-percent"))
+            .arg("0")
+            .arg("--state-dir")
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("invalid pressure thresholds"));
+        assert!(!path.exists());
+    }
+}
+
+#[test]
 fn shared_budget_queues_exposes_and_cancels_a_request() {
     let fixture = Fixture::new();
     let ready = fixture.path.join("first-started");

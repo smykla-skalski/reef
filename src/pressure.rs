@@ -80,7 +80,9 @@ impl Policy {
             || options.cpu_high_percent > 100
             || options.memory_high_percent == 0
             || options.memory_high_percent > 100
+            || options.cpu_recover_percent == 0
             || options.cpu_recover_percent >= options.cpu_high_percent
+            || options.memory_recover_percent == 0
             || options.memory_recover_percent >= options.memory_high_percent
             || options.recovery_seconds == 0
         {
@@ -371,6 +373,12 @@ mod tests {
         assert!(Policy::new(value, 8, 16 * 1024 * MIB).is_err());
         value = options();
         value.memory_reserve_mib = Some(16 * 1024);
+        assert!(Policy::new(value, 8, 16 * 1024 * MIB).is_err());
+        value = options();
+        value.cpu_recover_percent = 0;
+        assert!(Policy::new(value, 8, 16 * 1024 * MIB).is_err());
+        value = options();
+        value.memory_recover_percent = 0;
         assert!(Policy::new(value, 8, 16 * 1024 * MIB).is_err());
     }
 }
