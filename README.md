@@ -36,7 +36,7 @@ Start one scheduler per workstation, ideally under your user service manager:
 reef serve --cpu 6 --memory-mib 12288 --max-running 4
 ```
 
-The scheduler runs in the foreground. Without explicit limits it reserves one logical CPU and 30% of physical memory for other work; `--max-running` defaults to the CPU budget. Its private Unix socket lives in `~/.local/state/reef/schedule/reef.sock`. Only one server can bind that path. Use `--state-dir` on every command to select another private directory.
+The scheduler runs in the foreground. Without explicit limits its static budget reserves one logical CPU and 30% of physical memory for other work; `--max-running` defaults to the CPU budget. Its private Unix socket lives in `~/.local/state/reef/schedule/reef.sock`. Only one server can bind that path. Use `--state-dir` on every command to select another private directory.
 
 Queue a measured command with its estimated peak resource cost:
 
@@ -49,6 +49,8 @@ reef cancel 3
 `reef queue` prints request IDs, safe labels, estimates, and queued/running states as JSON. Admission is FIFO, with no backfill: a later small job cannot pass a larger one at the head of the queue. Zero or over-budget estimates fail immediately. The defaults per command are one CPU and 1024 MiB. A queued command can be cancelled by ID or with Ctrl-C. Cancellation, failure, client termination, and normal completion release its reservation. If the server disappears, queued commands fail and running clients stop their process group. A command never starts when the scheduler is unavailable. Scheduled children inherit `REEF_ADMITTED=1` so a nested Reef shim can run without requesting another reservation; this marker is a coordination hint, not a security boundary.
 
 Scheduling reserves estimated capacity before a command starts. It does not enforce actual CPU or memory consumption on macOS; Linux containment is tracked separately. Estimate commands from `reef run` measurements and leave headroom for interactive apps. The daemon holds job state only in memory and never receives command arguments or environment variables.
+
+The server also samples live CPU and memory usage every second. New jobs wait during high pressure (90% CPU or memory), until both metrics stay below recovery thresholds (70% CPU and 80% memory) for five seconds. A stale or unavailable sample also holds admission. For each new job, Reef preserves one idle logical CPU on machines with more than two cores and 10% of physical memory by default; it never stops a running job because pressure rose. The admission check counts active reservations alongside sampled usage, which can hold more work than necessary when a running job already contributes to that sample. Use `--cpu-reserve`, `--memory-reserve-mib`, `--cpu-high-percent`, `--cpu-recover-percent`, `--memory-high-percent`, `--memory-recover-percent`, and `--recovery-seconds` on `reef serve` to tune the policy. Reserve values must be below machine capacity and each recovery threshold must be below its high threshold. `--no-pressure` disables live admission checks when needed for isolated testing. At critical pressure (98% CPU or 97% memory), the server logs a notice with the safe labels of tracked workloads and points to `reef queue`. Notices repeat at most once per minute.
 
 Start a background recorder with no project configuration:
 
@@ -79,7 +81,6 @@ The default range is the last 24 hours. Its start is inclusive and its end is ex
 ## Planned capabilities
 
 - Attribute resource cost to agents and containers
-- Reserve CPU and memory for the developer's interactive applications
 - Reuse compatible results and persistent build caches
 - Offload work when local capacity is insufficient
 

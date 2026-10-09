@@ -1,4 +1,6 @@
 mod observe;
+#[cfg(unix)]
+mod pressure;
 mod report;
 #[cfg(unix)]
 mod run;
@@ -48,6 +50,8 @@ enum Command {
         max_running: Option<u32>,
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        #[command(flatten)]
+        pressure: pressure::Options,
     },
     /// Queue a command under the shared CPU and memory budget.
     #[cfg(unix)]
@@ -181,11 +185,13 @@ fn main() -> std::process::ExitCode {
             memory_mib,
             max_running,
             state_dir,
+            pressure,
         } => result(schedule::serve(
             cpu,
             memory_mib,
             max_running,
             state_dir.as_deref(),
+            pressure,
         )),
         #[cfg(unix)]
         Command::Schedule {
