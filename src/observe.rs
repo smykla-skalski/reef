@@ -418,18 +418,30 @@ fn fold_agent_segments(dir: &Path, now: u64, options: &ObserveOptions) -> io::Re
         if timestamp / 3_600_000 >= current_hour {
             continue;
         }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("agent-samples-"))
+            .ok_or_else(|| io::Error::other("invalid agent sample segment"))?;
+        let target = dir.join(format!("agent-rollups-{name}"));
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                fs::remove_file(path)?;
+                continue;
+            }
+            Ok(_) => return Err(io::Error::other("rollup target must be a regular file")),
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            Err(_) => {}
+        }
         let mut rollups = BTreeMap::new();
         for line in BufReader::new(File::open(&path)?).lines() {
             let tick: AgentTick = serde_json::from_str(&line?).map_err(io::Error::other)?;
             fold_tick(&mut rollups, &tick);
         }
-        let target = dir.join(format!(
-            "agent-rollups-{timestamp}-{}.jsonl",
-            std::process::id()
-        ));
         let temporary = dir.join(format!(
-            "agent-rollups-{timestamp}-{}.tmp",
-            std::process::id()
+            "agent-rollups-{timestamp}-{}-{}.tmp",
+            std::process::id(),
+            now_ms()?
         ));
         let mut file = private_file(&temporary, true, false)?;
         for rollup in rollups.values() {
@@ -836,6 +848,48 @@ mod tests {
         assert_eq!(rollup["observed_working_ms"], 2_000);
         assert_eq!(rollup["cpu_core_ms_estimate"], 1_000.0);
         assert_eq!(rollup["peak_memory_bytes"], 400);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn retry_after_rollup_publish_does_not_duplicate_load() {
+        let dir =
+            std::env::temp_dir().join(format!("reef-agent-fold-retry-test-{}", std::process::id()));
+        private_dir(&dir).unwrap();
+        let tick = AgentTick {
+            at_unix_ms: 3_600_100,
+            working_ms: 1_000,
+            agents: vec![AgentObservation {
+                kind: "codex".to_owned(),
+                root_pid: 42,
+                process_count: 1,
+                cpu_percent: Some(50.0),
+                memory_bytes: 400,
+                read_bytes: None,
+                written_bytes: None,
+            }],
+        };
+        append_agent_tick(&dir, &tick, &options(&dir)).unwrap();
+        let raw = segments_with_prefix(&dir, "agent-samples-").unwrap()[0]
+            .1
+            .clone();
+        fold_agent_segments(&dir, 7_200_000, &options(&dir)).unwrap();
+        append_agent_tick(&dir, &tick, &options(&dir)).unwrap();
+        assert_eq!(
+            segments_with_prefix(&dir, "agent-samples-").unwrap()[0].1,
+            raw
+        );
+
+        fold_agent_segments(&dir, 7_200_000, &options(&dir)).unwrap();
+
+        assert_eq!(
+            segments_with_prefix(&dir, "agent-samples-").unwrap(),
+            Vec::new()
+        );
+        assert_eq!(
+            segments_with_prefix(&dir, "agent-rollups-").unwrap().len(),
+            1
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 }
