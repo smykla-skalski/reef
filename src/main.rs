@@ -2,6 +2,8 @@ mod observe;
 mod report;
 #[cfg(unix)]
 mod run;
+#[cfg(unix)]
+mod schedule;
 mod status;
 
 #[cfg(unix)]
@@ -34,6 +36,49 @@ enum Command {
         record: Option<PathBuf>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+    /// Start the shared scheduler in the foreground.
+    #[cfg(unix)]
+    Serve {
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        cpu: Option<u32>,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        memory_mib: Option<u64>,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        max_running: Option<u32>,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Queue a command under the shared CPU and memory budget.
+    #[cfg(unix)]
+    Schedule {
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        cpu: u32,
+        #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u64).range(1..))]
+        memory_mib: u64,
+        #[arg(long, value_enum, default_value_t = Category::Other)]
+        category: Category,
+        #[arg(long, default_value = "command", value_parser = parse_identity)]
+        identity: String,
+        #[arg(long)]
+        record: Option<PathBuf>,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Show queued and running requests.
+    #[cfg(unix)]
+    Queue {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Cancel a queued or running request.
+    #[cfg(unix)]
+    Cancel {
+        id: u64,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
     },
     /// Record resource usage over time.
     Observe {
@@ -130,6 +175,46 @@ fn main() -> std::process::ExitCode {
                 std::process::ExitCode::FAILURE
             }
         },
+        #[cfg(unix)]
+        Command::Serve {
+            cpu,
+            memory_mib,
+            max_running,
+            state_dir,
+        } => result(schedule::serve(
+            cpu,
+            memory_mib,
+            max_running,
+            state_dir.as_deref(),
+        )),
+        #[cfg(unix)]
+        Command::Schedule {
+            cpu,
+            memory_mib,
+            category,
+            identity,
+            record,
+            state_dir,
+            command,
+        } => match schedule::schedule(schedule::RunOptions {
+            command: &command,
+            category: category.as_str(),
+            identity: &identity,
+            record: record.as_deref(),
+            cpu,
+            memory_mib,
+            state_dir: state_dir.as_deref(),
+        }) {
+            Ok(code) => std::process::ExitCode::from(code),
+            Err(error) => {
+                eprintln!("reef: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        },
+        #[cfg(unix)]
+        Command::Queue { state_dir } => result(schedule::queue(state_dir.as_deref())),
+        #[cfg(unix)]
+        Command::Cancel { id, state_dir } => result(schedule::cancel(id, state_dir.as_deref())),
         Command::Observe { command } => {
             let result = match command {
                 ObserveCommand::Start(options) => observe::start(&options),
@@ -151,5 +236,16 @@ fn main() -> std::process::ExitCode {
                 std::process::ExitCode::FAILURE
             }
         },
+    }
+}
+
+#[cfg(unix)]
+fn result(result: std::io::Result<()>) -> std::process::ExitCode {
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("reef: {error}");
+            std::process::ExitCode::FAILURE
+        }
     }
 }
