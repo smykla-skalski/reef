@@ -85,6 +85,34 @@ struct AgentSample {
 }
 
 #[derive(Debug, Deserialize)]
+struct AgentTick {
+    at_unix_ms: u64,
+    working_ms: u64,
+    agents: Vec<AgentSample>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentRollup {
+    minute_unix_ms: u64,
+    kind: String,
+    active_samples: usize,
+    observed_working_ms: u128,
+    cpu_core_ms_estimate: f64,
+    peak_cpu_percent: f64,
+    peak_memory_bytes: u64,
+    read_bytes: u64,
+    written_bytes: u64,
+    peak_processes: usize,
+    peak_roots: usize,
+}
+
+#[derive(Default)]
+struct AgentData {
+    ticks: Vec<AgentTick>,
+    rollups: Vec<AgentRollup>,
+}
+
+#[derive(Debug, Deserialize)]
 struct Measurement {
     category: String,
     status: String,
@@ -101,6 +129,8 @@ struct Report {
     to: String,
     empty: bool,
     observation_count: usize,
+    agent_observation_count: usize,
+    agent_rollup_count: usize,
     observed_working_ms: u128,
     command_measurements_available: bool,
     command_count: Option<usize>,
@@ -230,6 +260,62 @@ fn observations(dir: &Path) -> io::Result<Vec<Observation>> {
     samples.sort_by_key(|sample| sample.at_unix_ms);
     samples.dedup_by_key(|sample| sample.at_unix_ms);
     Ok(samples)
+}
+
+fn agent_ticks(dir: &Path) -> io::Result<Vec<AgentTick>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with("agent-samples-"))
+            && Path::new(&name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+            && entry.file_type()?.is_file()
+        {
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+    let mut ticks = Vec::new();
+    for path in paths {
+        ticks.extend(read_jsonl(&path)?);
+    }
+    ticks.sort_by_key(|tick: &AgentTick| tick.at_unix_ms);
+    ticks.dedup_by_key(|tick| tick.at_unix_ms);
+    Ok(ticks)
+}
+
+fn agent_rollups(dir: &Path) -> io::Result<Vec<AgentRollup>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with("agent-rollups-"))
+            && Path::new(&name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+            && entry.file_type()?.is_file()
+        {
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+    let mut rollups = Vec::new();
+    for path in paths {
+        rollups.extend(read_jsonl(&path)?);
+    }
+    Ok(rollups)
 }
 
 fn category(value: &str) -> &'static str {
@@ -461,6 +547,99 @@ fn accumulate_agents(
     }
 }
 
+fn accumulate_agent_ticks(
+    load: &mut BTreeMap<String, AgentLoad>,
+    ticks: &[AgentTick],
+    from_ms: u128,
+    to_ms: u128,
+) {
+    let mut covered_until = from_ms;
+    for tick in ticks {
+        let at = u128::from(tick.at_unix_ms);
+        let end = at.min(to_ms);
+        let start = at
+            .saturating_sub(u128::from(tick.working_ms))
+            .max(covered_until)
+            .max(from_ms);
+        let duration = end.saturating_sub(start);
+        covered_until = covered_until.max(end);
+        if duration > 0 {
+            accumulate_agents(load, &tick.agents, duration);
+        }
+    }
+}
+
+fn accumulate_agent_rollups(load: &mut BTreeMap<String, AgentLoad>, rollups: &[AgentRollup]) {
+    for rollup in rollups {
+        let kind = agent_kind(&rollup.kind).to_owned();
+        let group = load.entry(kind.clone()).or_insert_with(|| AgentLoad {
+            kind,
+            ..AgentLoad::default()
+        });
+        group.active_samples += rollup.active_samples;
+        group.observed_working_ms += rollup.observed_working_ms;
+        group.cpu_core_ms_estimate += rollup.cpu_core_ms_estimate;
+        group.peak_cpu_percent = group.peak_cpu_percent.max(rollup.peak_cpu_percent);
+        group.peak_memory_bytes = group.peak_memory_bytes.max(rollup.peak_memory_bytes);
+        group.read_bytes += rollup.read_bytes;
+        group.written_bytes += rollup.written_bytes;
+        group.peak_processes = group.peak_processes.max(rollup.peak_processes);
+        group.peak_roots = group.peak_roots.max(rollup.peak_roots);
+    }
+}
+
+fn rollups_in_range(rollups: Vec<AgentRollup>, from_ms: u128, to_ms: u128) -> Vec<AgentRollup> {
+    rollups
+        .into_iter()
+        .filter(|rollup| {
+            let start = u128::from(rollup.minute_unix_ms);
+            start < to_ms && start + 60_000 > from_ms
+        })
+        .collect()
+}
+
+fn rolled_minutes(rollups: &[AgentRollup]) -> BTreeSet<u64> {
+    rollups.iter().map(|rollup| rollup.minute_unix_ms).collect()
+}
+
+fn ticks_in_range(ticks: Vec<AgentTick>, from_ms: u128, to_ms: u128) -> Vec<AgentTick> {
+    ticks
+        .into_iter()
+        .filter(|tick| {
+            let at = u128::from(tick.at_unix_ms);
+            at > from_ms && at.saturating_sub(u128::from(tick.working_ms)) < to_ms
+        })
+        .collect()
+}
+
+fn observations_in_range(
+    samples: Vec<Observation>,
+    from_ms: u128,
+    to_ms: u128,
+) -> Vec<Observation> {
+    samples
+        .into_iter()
+        .filter(|sample| {
+            let at = u128::from(sample.at_unix_ms);
+            at > from_ms && at.saturating_sub(u128::from(sample.working_ms)) < to_ms
+        })
+        .collect()
+}
+
+fn records_in_range(
+    records: Option<Vec<Measurement>>,
+    from_ms: u128,
+    to_ms: u128,
+) -> Option<Vec<Measurement>> {
+    records.map(|records| {
+        records
+            .into_iter()
+            .filter(|record| record.started_at_unix_ms < to_ms && record.ended_at_unix_ms > from_ms)
+            .collect()
+    })
+}
+
+#[cfg(test)]
 fn build_report(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
@@ -469,21 +648,35 @@ fn build_report(
     thresholds: (u8, u8, u8),
     scheduler: Option<schedule_events::Summary>,
 ) -> Report {
+    build_report_with_ticks(
+        from,
+        to,
+        samples,
+        AgentData::default(),
+        records,
+        thresholds,
+        scheduler,
+    )
+}
+
+fn build_report_with_ticks(
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    samples: Vec<Observation>,
+    agent_data: AgentData,
+    records: Option<Vec<Measurement>>,
+    thresholds: (u8, u8, u8),
+    scheduler: Option<schedule_events::Summary>,
+) -> Report {
     let from_ms = u128::try_from(from.timestamp_millis()).unwrap_or_default();
     let to_ms = u128::try_from(to.timestamp_millis()).unwrap_or_default();
-    let samples: Vec<_> = samples
-        .into_iter()
-        .filter(|sample| {
-            let at = u128::from(sample.at_unix_ms);
-            at > from_ms && at.saturating_sub(u128::from(sample.working_ms)) < to_ms
-        })
-        .collect();
-    let records = records.map(|records| {
-        records
-            .into_iter()
-            .filter(|record| record.started_at_unix_ms < to_ms && record.ended_at_unix_ms > from_ms)
-            .collect::<Vec<_>>()
-    });
+    let samples = observations_in_range(samples, from_ms, to_ms);
+    let mut agent_ticks = ticks_in_range(agent_data.ticks, from_ms, to_ms);
+    let agent_rollups = rollups_in_range(agent_data.rollups, from_ms, to_ms);
+    let rolled_minutes = rolled_minutes(&agent_rollups);
+    agent_ticks.retain(|tick| !rolled_minutes.contains(&(tick.at_unix_ms / 60_000 * 60_000)));
+    let tick_times: BTreeSet<_> = agent_ticks.iter().map(|tick| tick.at_unix_ms).collect();
+    let records = records_in_range(records, from_ms, to_ms);
     let mut pressure = PressureReport {
         cpu_threshold_percent: thresholds.0,
         memory_threshold_percent: thresholds.1,
@@ -494,7 +687,9 @@ fn build_report(
     let mut observed_working_ms = 0_u128;
     let mut covered_until = from_ms;
     let mut missing = [false; 4];
-    let agents_available = samples.iter().any(|sample| sample.agents.is_some());
+    let agents_available = !agent_ticks.is_empty()
+        || !agent_rollups.is_empty()
+        || samples.iter().any(|sample| sample.agents.is_some());
     let mut agent_load: BTreeMap<String, AgentLoad> = BTreeMap::new();
     for sample in &samples {
         let at = u128::from(sample.at_unix_ms);
@@ -505,7 +700,10 @@ fn build_report(
         let duration = end.saturating_sub(start);
         covered_until = covered_until.max(end);
         observed_working_ms += duration;
-        if let Some(agent_samples) = &sample.agents {
+        if !tick_times.contains(&sample.at_unix_ms)
+            && !rolled_minutes.contains(&(sample.at_unix_ms / 60_000 * 60_000))
+            && let Some(agent_samples) = &sample.agents
+        {
             accumulate_agents(&mut agent_load, agent_samples, duration);
         }
         let [cpu, memory, swap] = pressure_flags(sample, thresholds);
@@ -530,6 +728,8 @@ fn build_report(
             ));
         }
     }
+    accumulate_agent_ticks(&mut agent_load, &agent_ticks, from_ms, to_ms);
+    accumulate_agent_rollups(&mut agent_load, &agent_rollups);
     let peak_host_memory_bytes = samples.iter().filter_map(|s| s.memory_used_bytes).max();
     let swap_values: Vec<_> = samples.iter().filter_map(|s| s.swap_used_bytes).collect();
     let swap_growth_bytes = (swap_values.len() >= 2)
@@ -543,11 +743,15 @@ fn build_report(
         from: from.to_rfc3339(),
         to: to.to_rfc3339(),
         empty: samples.is_empty()
+            && agent_ticks.is_empty()
+            && agent_rollups.is_empty()
             && command_count.unwrap_or_default() == 0
             && scheduler
                 .as_ref()
                 .is_none_or(|summary| summary.submitted == 0 && summary.rejected == 0),
         observation_count: samples.len(),
+        agent_observation_count: agent_ticks.len(),
+        agent_rollup_count: agent_rollups.len(),
         observed_working_ms,
         command_measurements_available: records.is_some(),
         command_count,
@@ -627,11 +831,13 @@ fn agents_markdown(agents: Option<&[AgentLoad]>) -> String {
 
 fn markdown(report: &Report) -> String {
     let mut out = format!(
-        "# Reef workload report\n\n- Range: {} to {} (end exclusive)\n- Empty: {}\n- Observations: {}\n- Observed working time: {} ms\n- Peak host memory: {} bytes\n- Swap growth: {} bytes\n- Peak command concurrency: {}\n\n",
+        "# Reef workload report\n\n- Range: {} to {} (end exclusive)\n- Empty: {}\n- Host observations: {}\n- Agent observations: {}\n- Agent rollups: {}\n- Observed working time: {} ms\n- Peak host memory: {} bytes\n- Swap growth: {} bytes\n- Peak command concurrency: {}\n\n",
         report.from,
         report.to,
         report.empty,
         report.observation_count,
+        report.agent_observation_count,
+        report.agent_rollup_count,
         report.observed_working_ms,
         printable(report.peak_host_memory_bytes),
         printable(report.swap_growth_bytes),
@@ -741,7 +947,10 @@ pub fn run(options: &Options) -> io::Result<()> {
             ));
         }
     }
-    let samples = observations(&state_dir(options.state_dir.as_deref())?)?;
+    let dir = state_dir(options.state_dir.as_deref())?;
+    let samples = observations(&dir)?;
+    let agent_samples = agent_ticks(&dir)?;
+    let agent_summaries = agent_rollups(&dir)?;
     let default_paths = history::paths()?;
     let records = if default_paths.is_none() && options.records.is_empty() {
         None
@@ -756,10 +965,14 @@ pub fn run(options: &Options) -> io::Result<()> {
         }
         Some(all)
     };
-    let report = build_report(
+    let report = build_report_with_ticks(
         from,
         to,
         samples,
+        AgentData {
+            ticks: agent_samples,
+            rollups: agent_summaries,
+        },
         records,
         (
             options.cpu_threshold,
@@ -1041,5 +1254,120 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("secret-command-arguments"));
         assert_eq!(report.categories.unwrap()[0].category, "other");
+    }
+
+    #[test]
+    fn short_agent_session_is_reported_without_host_sample() {
+        let report = build_report_with_ticks(
+            date(1_000),
+            date(5_000),
+            vec![],
+            AgentData {
+                ticks: vec![AgentTick {
+                    at_unix_ms: 3_000,
+                    working_ms: 1_000,
+                    agents: vec![AgentSample {
+                        kind: "codex".to_owned(),
+                        root_pid: 42,
+                        process_count: 1,
+                        cpu_percent: Some(50.0),
+                        memory_bytes: 400,
+                        read_bytes: Some(10),
+                        written_bytes: Some(20),
+                    }],
+                }],
+                rollups: vec![],
+            },
+            None,
+            (90, 90, 1),
+            None,
+        );
+
+        assert!(!report.empty);
+        assert_eq!(report.observation_count, 0);
+        assert_eq!(report.agent_observation_count, 1);
+        let agent = &report.agents.unwrap()[0];
+        assert_eq!(agent.kind, "codex");
+        assert_eq!(agent.cpu_core_ms_estimate, 500.0);
+        assert_eq!(agent.peak_memory_bytes, 400);
+    }
+
+    #[test]
+    fn partial_agent_tick_is_clipped_to_report_window() {
+        let report = build_report_with_ticks(
+            date(0),
+            date(1_000),
+            vec![],
+            AgentData {
+                ticks: vec![AgentTick {
+                    at_unix_ms: 1_500,
+                    working_ms: 1_000,
+                    agents: vec![AgentSample {
+                        kind: "codex".to_owned(),
+                        root_pid: 42,
+                        process_count: 1,
+                        cpu_percent: Some(50.0),
+                        memory_bytes: 400,
+                        read_bytes: None,
+                        written_bytes: None,
+                    }],
+                }],
+                rollups: vec![],
+            },
+            None,
+            (90, 90, 1),
+            None,
+        );
+
+        let agent = &report.agents.unwrap()[0];
+        assert_eq!(agent.observed_working_ms, 500);
+        assert_eq!(agent.cpu_core_ms_estimate, 250.0);
+    }
+
+    #[test]
+    fn folded_agent_load_does_not_double_count_raw_samples() {
+        let report = build_report_with_ticks(
+            date(60_000),
+            date(120_000),
+            vec![],
+            AgentData {
+                ticks: vec![AgentTick {
+                    at_unix_ms: 61_000,
+                    working_ms: 1_000,
+                    agents: vec![AgentSample {
+                        kind: "claude".to_owned(),
+                        root_pid: 42,
+                        process_count: 1,
+                        cpu_percent: Some(50.0),
+                        memory_bytes: 400,
+                        read_bytes: None,
+                        written_bytes: None,
+                    }],
+                }],
+                rollups: vec![AgentRollup {
+                    minute_unix_ms: 60_000,
+                    kind: "claude".to_owned(),
+                    active_samples: 2,
+                    observed_working_ms: 2_000,
+                    cpu_core_ms_estimate: 1_000.0,
+                    peak_cpu_percent: 50.0,
+                    peak_memory_bytes: 500,
+                    read_bytes: 20,
+                    written_bytes: 40,
+                    peak_processes: 2,
+                    peak_roots: 1,
+                }],
+            },
+            None,
+            (90, 90, 1),
+            None,
+        );
+
+        assert_eq!(report.agent_observation_count, 0);
+        assert_eq!(report.agent_rollup_count, 1);
+        let agent = &report.agents.unwrap()[0];
+        assert_eq!(agent.active_samples, 2);
+        assert_eq!(agent.cpu_core_ms_estimate, 1_000.0);
+        assert_eq!(agent.peak_memory_bytes, 500);
     }
 }

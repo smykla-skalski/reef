@@ -15,9 +15,19 @@ impl Drop for Recorder {
 }
 
 fn recorder(dir: &Path) -> Recorder {
+    recorder_at_interval(dir, "1")
+}
+
+fn recorder_at_interval(dir: &Path, interval: &str) -> Recorder {
     Recorder(
         Command::new(env!("CARGO_BIN_EXE_reef"))
-            .args(["observe", "run", "--interval-seconds", "1", "--state-dir"])
+            .args([
+                "observe",
+                "run",
+                "--interval-seconds",
+                interval,
+                "--state-dir",
+            ])
             .arg(dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -25,6 +35,56 @@ fn recorder(dir: &Path) -> Recorder {
             .spawn()
             .unwrap(),
     )
+}
+
+#[test]
+fn short_registered_session_is_visible_before_first_host_snapshot() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("reef-short-agent-{}-{nonce}", std::process::id()));
+    let marked = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args(["agents", "observe", "codex", "--pid"])
+        .arg(std::process::id().to_string())
+        .arg("--state-dir")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(marked.status.success(), "{marked:?}");
+    let mut running = recorder_at_interval(&dir, "60");
+
+    assert!(
+        wait_until(|| fs::read_dir(&dir).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("agent-samples-")
+            })
+        })),
+        "{}",
+        child_failure(&mut running)
+    );
+    let report = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args(["report", "--state-dir"])
+        .arg(&dir)
+        .args(["--format", "json"])
+        .output()
+        .unwrap();
+    assert!(report.status.success(), "{report:?}");
+    let json: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(json["observation_count"], 0);
+    assert_eq!(json["agents"][0]["kind"], "codex");
+    assert_eq!(json["agents"][0]["active_samples"], 1);
+    let stopped = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args(["observe", "stop", "--state-dir"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(stopped.status.success());
+    assert!(wait_until(|| running.0.try_wait().unwrap().is_some()));
+    fs::remove_dir_all(dir).unwrap();
 }
 
 fn child_failure(recorder: &mut Recorder) -> String {
