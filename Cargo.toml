@@ -1,0 +1,19 @@
+[package]
+name = "reef"
+version = "0.1.0"
+description = "Resource-aware scheduling for coding agents"
+authors = ["Marcin Skalski"]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/smykla-skalski/reef"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"

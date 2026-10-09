@@ -1,0 +1,37 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:best-practices",
+    ":semanticCommits",
+    ":gitSignOff",
+    ":dependencyDashboard",
+    ":label(dependencies)",
+    ":rebaseStalePrs",
+    ":enableVulnerabilityAlertsWithAdditionalLabel(kind/security)",
+    ":prConcurrentLimit20",
+    "helpers:pinGitHubActionDigests",
+    "security:openssf-scorecard",
+    "group:linters"
+  ],
+  "osvVulnerabilityAlerts": true,
+  "internalChecksFilter": "strict",
+  "automergeStrategy": "squash",
+  "platformAutomerge": false,
+  "minimumReleaseAgeBehaviour": "timestamp-required",
+  "packageRules": [
+    {
+      "description": "Automerge updates with a verified release age of at least seven days",
+      "matchUpdateTypes": ["major", "minor", "patch", "digest"],
+      "minimumReleaseAge": "7 days",
+      "automerge": true
+    },
+    {
+      "addLabels": ["area/ci"],
+      "commitMessageTopic": "{{depName}} action",
+      "description": "GitHub Actions dependencies",
+      "matchManagers": ["github-actions"],
+      "semanticCommitType": "ci"
+    }
+  ],
+  "vulnerabilityAlerts": { "automerge": false }
+}
