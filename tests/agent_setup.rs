@@ -184,11 +184,13 @@ fn installs_bundled_plugin_and_checks_it_without_rewriting() {
     let config = TestConfig::new();
     assert!(!config.reef(true).status.success());
     assert!(!config.0.exists());
-    assert!(config.reef(false).status.success());
+    let update = config.reef(false);
+    assert!(update.status.success(), "{update:?}");
     let expected = include_str!("../integrations/opencode/reef-observe.js");
     assert_eq!(fs::read_to_string(config.plugin()).unwrap(), expected);
     assert!(config.reef(true).status.success());
-    assert!(config.reef(false).status.success());
+    let update = config.reef(false);
+    assert!(update.status.success(), "{update:?}");
 }
 
 #[test]
@@ -204,7 +206,8 @@ fn updates_only_a_reef_managed_plugin() {
 
     fs::write(config.plugin(), "// Managed by Reef. Old version\n").unwrap();
     assert!(!config.reef(true).status.success());
-    assert!(config.reef(false).status.success());
+    let update = config.reef(false);
+    assert!(update.status.success(), "{update:?}");
     assert_eq!(
         fs::read_to_string(config.plugin()).unwrap(),
         include_str!("../integrations/opencode/reef-observe.js")
@@ -227,7 +230,8 @@ fn adopts_the_exact_plugin_shipped_before_setup_existed() {
         fs::set_permissions(config.plugin(), permissions).unwrap();
     }
     assert!(!config.reef(true).status.success());
-    assert!(config.reef(false).status.success());
+    let update = config.reef(false);
+    assert!(update.status.success(), "{update:?}");
     assert_eq!(fs::read_to_string(config.plugin()).unwrap(), current);
 }
 

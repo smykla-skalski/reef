@@ -296,12 +296,39 @@ fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
         let mut file = options.open(&temporary)?;
         file.write_all(data)?;
         file.sync_all()?;
-        fs::rename(&temporary, path)
+        replace_file(&temporary, path, nonce)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+#[cfg(unix)]
+fn replace_file(temporary: &Path, path: &Path, _nonce: u128) -> io::Result<()> {
+    fs::rename(temporary, path)
+}
+
+#[cfg(windows)]
+fn replace_file(temporary: &Path, path: &Path, nonce: u128) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::rename(temporary, path),
+        Err(error) => Err(error),
+        Ok(metadata) if !metadata.file_type().is_file() => Err(io::Error::other(format!(
+            "refusing non-regular configuration file: {}",
+            path.display()
+        ))),
+        Ok(_) => {
+            let backup =
+                path.with_file_name(format!(".reef-setup-{}-{nonce}.backup", std::process::id()));
+            fs::rename(path, &backup)?;
+            if let Err(error) = fs::rename(temporary, path) {
+                fs::rename(&backup, path)?;
+                return Err(error);
+            }
+            fs::remove_file(backup)
+        }
+    }
 }
 
 fn default_config_dir(home: &Path, home_overridden: bool) -> PathBuf {
