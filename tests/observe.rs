@@ -115,3 +115,95 @@ fn recorder_recovers_after_abrupt_exit_without_running_twice() {
     assert!(restarted.0.wait().unwrap().success());
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn registered_agent_is_reported_without_scheduling_its_process() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir =
+        std::env::temp_dir().join(format!("reef-passive-agent-{}-{nonce}", std::process::id()));
+    let marked = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args(["agents", "observe", "codex", "--pid"])
+        .arg(std::process::id().to_string())
+        .arg("--state-dir")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        marked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&marked.stderr)
+    );
+    let mut running = recorder(&dir);
+    assert!(
+        wait_until(|| {
+            fs::read_dir(&dir).unwrap().flatten().any(|entry| {
+                entry.file_name().to_string_lossy().starts_with("samples-")
+                    && entry.metadata().unwrap().len() > 0
+            })
+        }),
+        "{}",
+        child_failure(&mut running)
+    );
+    let report = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args(["report", "--state-dir"])
+        .arg(&dir)
+        .args(["--format", "json"])
+        .output()
+        .unwrap();
+    assert!(report.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(json["agents"][0]["kind"], "codex");
+    assert!(json["agents"][0]["peak_processes"].as_u64().unwrap() >= 1);
+    let stopped = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args(["observe", "stop", "--state-dir"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(stopped.status.success());
+    assert!(wait_until(|| running.0.try_wait().unwrap().is_some()));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_hook_finds_its_cli_ancestor_without_a_pid_argument() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("reef-agent-hook-{}-{nonce}", std::process::id()));
+    fs::create_dir(&dir).unwrap();
+    let script = dir.join("codex");
+    let staged_script = dir.join("codex.tmp");
+    fs::write(
+        &staged_script,
+        b"#!/bin/sh\nset -e\n\"$1\" agents observe codex --state-dir \"$2\"\nsleep 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&staged_script, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::rename(&staged_script, &script).unwrap();
+    let output = Command::new(&script)
+        .arg(env!("CARGO_BIN_EXE_reef"))
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let registration = fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("agent-"))
+        .unwrap();
+    let json: serde_json::Value =
+        serde_json::from_slice(&fs::read(registration.path()).unwrap()).unwrap();
+    assert_eq!(json["kind"], "codex");
+    fs::remove_dir_all(dir).unwrap();
+}

@@ -1,3 +1,4 @@
+mod agent_observe;
 #[cfg(unix)]
 mod agents;
 #[cfg(unix)]
@@ -53,7 +54,6 @@ enum Command {
         command: Vec<String>,
     },
     /// Launch a coding agent with resource-aware command shims.
-    #[cfg(unix)]
     Agents {
         #[command(subcommand)]
         command: AgentCommand,
@@ -178,10 +178,10 @@ enum CacheCommand {
     },
 }
 
-#[cfg(unix)]
 #[derive(Debug, Subcommand)]
 enum AgentCommand {
     /// Launch Codex or Claude Code with a process-scoped shim path.
+    #[cfg(unix)]
     Launch {
         #[arg(value_enum)]
         agent: AgentName,
@@ -189,6 +189,17 @@ enum AgentCommand {
         state_dir: Option<PathBuf>,
         #[arg(last = true)]
         args: Vec<String>,
+    },
+    /// Register a new agent process for passive observation.
+    Observe {
+        #[arg(value_enum)]
+        agent: agent_observe::AgentKind,
+        /// Process ID for integrations that launch agents directly.
+        #[arg(long)]
+        pid: Option<u32>,
+        /// Observation directory used by the recorder.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
     },
 }
 
@@ -309,6 +320,22 @@ fn record_mode(record: Option<&std::path::Path>, no_record: bool) -> run::Record
     }
 }
 
+fn agent_command(command: AgentCommand) -> std::process::ExitCode {
+    match command {
+        #[cfg(unix)]
+        AgentCommand::Launch {
+            agent,
+            state_dir,
+            args,
+        } => command_result(agents::launch(agent.as_str(), state_dir.as_deref(), &args)),
+        AgentCommand::Observe {
+            agent,
+            pid,
+            state_dir,
+        } => result(agent_observe::mark(agent, pid, state_dir.as_deref())),
+    }
+}
+
 fn main() -> std::process::ExitCode {
     #[cfg(unix)]
     if let Some(tool) = agents::shim_name() {
@@ -329,14 +356,7 @@ fn main() -> std::process::ExitCode {
         } => command_result(contain::exec_payload(&command, &snapshot, &expected_json)),
         #[cfg(unix)]
         Command::Cache { command } => cache_command(command),
-        #[cfg(unix)]
-        Command::Agents { command } => match command {
-            AgentCommand::Launch {
-                agent,
-                state_dir,
-                args,
-            } => command_result(agents::launch(agent.as_str(), state_dir.as_deref(), &args)),
-        },
+        Command::Agents { command } => agent_command(command),
         #[cfg(unix)]
         Command::Run {
             category,
@@ -433,7 +453,6 @@ fn command_result(result: std::io::Result<u8>) -> std::process::ExitCode {
     }
 }
 
-#[cfg(unix)]
 fn result(result: std::io::Result<()>) -> std::process::ExitCode {
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,

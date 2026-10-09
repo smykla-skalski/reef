@@ -70,6 +70,18 @@ struct Observation {
     memory_total_bytes: Option<u64>,
     swap_used_bytes: Option<u64>,
     swap_total_bytes: Option<u64>,
+    agents: Option<Vec<AgentSample>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentSample {
+    kind: String,
+    root_pid: u32,
+    process_count: usize,
+    cpu_percent: Option<f64>,
+    memory_bytes: u64,
+    read_bytes: Option<u64>,
+    written_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,6 +110,7 @@ struct Report {
     peak_command_concurrency: Option<usize>,
     pressure: PressureReport,
     timeline: Vec<PressureEvent>,
+    agents: Option<Vec<AgentLoad>>,
     scheduler: Option<schedule_events::Summary>,
     #[cfg(unix)]
     cache: cache_impact::Impact,
@@ -113,6 +126,20 @@ struct CategoryReport {
     cpu_ms: u128,
     cpu_percent_of_measured: f64,
     peak_memory_bytes: u64,
+}
+
+#[derive(Default, Serialize)]
+struct AgentLoad {
+    kind: String,
+    active_samples: usize,
+    observed_working_ms: u128,
+    cpu_core_ms_estimate: f64,
+    peak_cpu_percent: f64,
+    peak_memory_bytes: u64,
+    read_bytes: u64,
+    written_bytes: u64,
+    peak_processes: usize,
+    peak_roots: usize,
 }
 
 #[derive(Default, Serialize)]
@@ -132,7 +159,17 @@ struct PressureEvent {
     to_unix_ms: u128,
     triggers: Vec<&'static str>,
     overlapping_categories: Option<Vec<&'static str>>,
+    overlapping_agents: Option<Vec<&'static str>>,
     attribution: &'static str,
+}
+
+fn agent_kind(value: &str) -> &'static str {
+    match value {
+        "codex" => "codex",
+        "claude" => "claude",
+        "opencode" => "opencode",
+        _ => "other",
+    }
 }
 
 fn state_dir(override_dir: Option<&Path>) -> io::Result<PathBuf> {
@@ -269,6 +306,20 @@ fn any_pressure(flags: [Option<bool>; 3]) -> Option<bool> {
     }
 }
 
+fn pressure_triggers([cpu, memory, swap]: [Option<bool>; 3]) -> Vec<&'static str> {
+    let mut triggers = Vec::new();
+    if cpu == Some(true) {
+        triggers.push("cpu");
+    }
+    if memory == Some(true) {
+        triggers.push("memory");
+    }
+    if swap == Some(true) {
+        triggers.push("swap");
+    }
+    triggers
+}
+
 fn peak_concurrency(records: &[Measurement], from: u128, to: u128) -> usize {
     let mut events = Vec::new();
     for record in records {
@@ -326,6 +377,7 @@ fn pressure_event(
     end: u128,
     triggers: Vec<&'static str>,
     records: Option<&[Measurement]>,
+    agents: Option<&[AgentSample]>,
 ) -> PressureEvent {
     let overlapping_categories: Option<Vec<&'static str>> = records.map(|records| {
         records
@@ -336,17 +388,76 @@ fn pressure_event(
             .into_iter()
             .collect()
     });
-    let attribution = match &overlapping_categories {
-        Some(categories) if categories.is_empty() => "no_measured_command_overlap",
-        Some(_) => "measured_command_overlap",
-        None => "history_unavailable",
+    let overlapping_agents = agents.map(|agents| {
+        agents
+            .iter()
+            .map(|agent| agent_kind(&agent.kind))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    });
+    let attribution = match (&overlapping_categories, &overlapping_agents) {
+        (Some(categories), _) if !categories.is_empty() => "measured_command_overlap",
+        (_, Some(agents)) if !agents.is_empty() => "agent_process_overlap",
+        (Some(_), _) => "no_measured_command_overlap",
+        (None, _) => "history_unavailable",
     };
     PressureEvent {
         from_unix_ms: start,
         to_unix_ms: end,
         triggers,
         overlapping_categories,
+        overlapping_agents,
         attribution,
+    }
+}
+
+fn accumulate_agents(
+    load: &mut BTreeMap<String, AgentLoad>,
+    agents: &[AgentSample],
+    duration: u128,
+) {
+    let mut by_kind: BTreeMap<&str, Vec<&AgentSample>> = BTreeMap::new();
+    for agent in agents {
+        by_kind
+            .entry(agent_kind(&agent.kind))
+            .or_default()
+            .push(agent);
+    }
+    for (kind, sessions) in by_kind {
+        let group = load.entry(kind.to_owned()).or_insert_with(|| AgentLoad {
+            kind: kind.to_owned(),
+            ..AgentLoad::default()
+        });
+        let cpu: f64 = sessions.iter().filter_map(|agent| agent.cpu_percent).sum();
+        let memory: u64 = sessions
+            .iter()
+            .map(|agent| agent.memory_bytes)
+            .fold(0, u64::saturating_add);
+        let duration = u32::try_from(duration).unwrap_or(u32::MAX);
+        group.active_samples += 1;
+        group.observed_working_ms += u128::from(duration);
+        group.cpu_core_ms_estimate += cpu.max(0.0) * f64::from(duration) / 100.0;
+        group.peak_cpu_percent = group.peak_cpu_percent.max(cpu);
+        group.peak_memory_bytes = group.peak_memory_bytes.max(memory);
+        group.read_bytes += sessions
+            .iter()
+            .filter_map(|agent| agent.read_bytes)
+            .fold(0, u64::saturating_add);
+        group.written_bytes += sessions
+            .iter()
+            .filter_map(|agent| agent.written_bytes)
+            .fold(0, u64::saturating_add);
+        group.peak_processes = group
+            .peak_processes
+            .max(sessions.iter().map(|agent| agent.process_count).sum());
+        group.peak_roots = group.peak_roots.max(
+            sessions
+                .iter()
+                .map(|agent| agent.root_pid)
+                .collect::<BTreeSet<_>>()
+                .len(),
+        );
     }
 }
 
@@ -383,6 +494,8 @@ fn build_report(
     let mut observed_working_ms = 0_u128;
     let mut covered_until = from_ms;
     let mut missing = [false; 4];
+    let agents_available = samples.iter().any(|sample| sample.agents.is_some());
+    let mut agent_load: BTreeMap<String, AgentLoad> = BTreeMap::new();
     for sample in &samples {
         let at = u128::from(sample.at_unix_ms);
         let end = at.min(to_ms);
@@ -392,6 +505,9 @@ fn build_report(
         let duration = end.saturating_sub(start);
         covered_until = covered_until.max(end);
         observed_working_ms += duration;
+        if let Some(agent_samples) = &sample.agents {
+            accumulate_agents(&mut agent_load, agent_samples, duration);
+        }
         let [cpu, memory, swap] = pressure_flags(sample, thresholds);
         add_duration(&mut pressure.cpu_above_ms, &mut missing[0], cpu, duration);
         add_duration(
@@ -403,18 +519,15 @@ fn build_report(
         add_duration(&mut pressure.swap_above_ms, &mut missing[2], swap, duration);
         let any = any_pressure([cpu, memory, swap]);
         add_duration(&mut pressure.any_above_ms, &mut missing[3], any, duration);
-        let mut triggers = Vec::new();
-        if cpu == Some(true) {
-            triggers.push("cpu");
-        }
-        if memory == Some(true) {
-            triggers.push("memory");
-        }
-        if swap == Some(true) {
-            triggers.push("swap");
-        }
+        let triggers = pressure_triggers([cpu, memory, swap]);
         if !triggers.is_empty() && duration > 0 {
-            timeline.push(pressure_event(start, end, triggers, records.as_deref()));
+            timeline.push(pressure_event(
+                start,
+                end,
+                triggers,
+                records.as_deref(),
+                sample.agents.as_deref(),
+            ));
         }
     }
     let peak_host_memory_bytes = samples.iter().filter_map(|s| s.memory_used_bytes).max();
@@ -444,6 +557,7 @@ fn build_report(
         peak_command_concurrency,
         pressure,
         timeline,
+        agents: agents_available.then(|| agent_load.into_values().collect()),
         scheduler,
         #[cfg(unix)]
         cache: cache_impact::Impact::default(),
@@ -478,6 +592,35 @@ fn scheduler_markdown(scheduler: Option<&schedule_events::Summary>) -> String {
         );
     } else {
         out.push_str("Unavailable: no scheduler event history.\n");
+    }
+    out
+}
+
+fn agents_markdown(agents: Option<&[AgentLoad]>) -> String {
+    let mut out = String::from("\n## Passive agent load\n\n");
+    if let Some(agents) = agents {
+        out.push_str("Sampled process-tree usage. CPU core-ms and RSS are estimates; overlap with command measurements is expected.\n\n");
+        out.push_str("| Agent | Active samples | CPU core-ms | Peak CPU % | Peak RSS bytes | Read bytes | Written bytes | Peak processes | Peak roots |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+        for agent in agents {
+            let _ = writeln!(
+                out,
+                "| {} | {} | {:.0} | {:.1} | {} | {} | {} | {} | {} |",
+                agent.kind,
+                agent.active_samples,
+                agent.cpu_core_ms_estimate,
+                agent.peak_cpu_percent,
+                agent.peak_memory_bytes,
+                agent.read_bytes,
+                agent.written_bytes,
+                agent.peak_processes,
+                agent.peak_roots
+            );
+        }
+        if agents.is_empty() {
+            out.push_str("\nNo registered agent process was active in the range.\n");
+        }
+    } else {
+        out.push_str("Unavailable: observations predate passive agent attribution.\n");
     }
     out
 }
@@ -520,6 +663,7 @@ fn markdown(report: &Report) -> String {
             "No command history is available. Host activity is uninstrumented or unknown.\n",
         );
     }
+    out.push_str(&agents_markdown(report.agents.as_deref()));
     let _ = write!(
         out,
         "\n## Pressure\n\n- CPU >= {}%: {} ms\n- Memory >= {}%: {} ms\n- Swap >= {}%: {} ms\n- Any threshold: {} ms\n\n## Pressure timeline\n\n",
@@ -550,11 +694,21 @@ fn markdown(report: &Report) -> String {
             );
             let _ = writeln!(
                 out,
-                "- {}..{} ms: {}; overlapping categories: {}",
+                "- {}..{} ms: {}; overlapping categories: {}; overlapping agents: {}",
                 event.from_unix_ms,
                 event.to_unix_ms,
                 event.triggers.join(", "),
-                categories
+                categories,
+                event.overlapping_agents.as_ref().map_or_else(
+                    || "unavailable".to_owned(),
+                    |agents| {
+                        if agents.is_empty() {
+                            "none".to_owned()
+                        } else {
+                            agents.join(", ")
+                        }
+                    }
+                )
             );
         }
     }
@@ -664,7 +818,38 @@ mod tests {
             memory_total_bytes: Some(1000),
             swap_used_bytes: swap,
             swap_total_bytes: Some(1000),
+            agents: None,
         }
+    }
+
+    #[test]
+    fn passive_agent_load_is_reported_without_managed_command_history() {
+        let mut observation = sample(200, Some(95.0), Some(10));
+        observation.agents = Some(vec![AgentSample {
+            kind: "codex".to_owned(),
+            root_pid: 42,
+            process_count: 3,
+            cpu_percent: Some(150.0),
+            memory_bytes: 500,
+            read_bytes: Some(100),
+            written_bytes: Some(50),
+        }]);
+        let report = build_report(
+            date(100),
+            date(300),
+            vec![observation],
+            None,
+            (90, 90, 1),
+            None,
+        );
+        let agent = &report.agents.as_ref().unwrap()[0];
+        assert_eq!(agent.kind, "codex");
+        assert_eq!(agent.active_samples, 1);
+        assert_eq!(agent.cpu_core_ms_estimate, 150.0);
+        assert_eq!(agent.peak_memory_bytes, 500);
+        assert_eq!(agent.peak_roots, 1);
+        assert_eq!(report.timeline[0].attribution, "agent_process_overlap");
+        assert_eq!(report.timeline[0].overlapping_agents, Some(vec!["codex"]));
     }
 
     fn command(category: &str, start: u128, end: u128, cpu: u128) -> Measurement {
@@ -790,6 +975,7 @@ mod tests {
                 memory_total_bytes: None,
                 swap_used_bytes: None,
                 swap_total_bytes: None,
+                agents: None,
             }],
             None,
             (90, 90, 1),

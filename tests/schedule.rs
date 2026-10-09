@@ -38,7 +38,15 @@ impl Fixture {
             .spawn()
             .unwrap();
         let fixture = Self { path, server };
-        Self::wait_until(|| fixture.path.join("reef.sock").exists());
+        Self::wait_until(|| {
+            reef()
+                .args(["queue", "--state-dir"])
+                .arg(&fixture.path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        });
         fixture
     }
 

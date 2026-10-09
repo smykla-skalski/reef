@@ -1,6 +1,8 @@
 use crate::ObserveOptions;
+use crate::agent_observe;
 use fs2::FileExt;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -24,6 +26,7 @@ struct Observation {
     root_disk_available_bytes: Option<u64>,
     root_disk_total_bytes: Option<u64>,
     processes: Vec<ProcessObservation>,
+    agents: Vec<AgentObservation>,
 }
 
 #[derive(Serialize)]
@@ -36,7 +39,18 @@ struct ProcessObservation {
     written_bytes: Option<u64>,
 }
 
-fn state_dir(override_dir: Option<&Path>) -> io::Result<PathBuf> {
+#[derive(Serialize)]
+struct AgentObservation {
+    kind: &'static str,
+    root_pid: u32,
+    process_count: usize,
+    cpu_percent: Option<f32>,
+    memory_bytes: u64,
+    read_bytes: Option<u64>,
+    written_bytes: Option<u64>,
+}
+
+pub(crate) fn state_dir(override_dir: Option<&Path>) -> io::Result<PathBuf> {
     if let Some(path) = override_dir {
         return Ok(path.to_path_buf());
     }
@@ -45,7 +59,7 @@ fn state_dir(override_dir: Option<&Path>) -> io::Result<PathBuf> {
     Ok(PathBuf::from(home).join(".local/state/reef/observe"))
 }
 
-fn private_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn private_dir(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
     if fs::symlink_metadata(path)?.file_type().is_symlink() {
         return Err(io::Error::other("state directory must not be a symlink"));
@@ -58,7 +72,7 @@ fn private_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn private_file(path: &Path, create_new: bool, append: bool) -> io::Result<File> {
+pub(crate) fn private_file(path: &Path, create_new: bool, append: bool) -> io::Result<File> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(io::Error::other("state file must not be a symlink"));
@@ -94,7 +108,12 @@ fn now_ms() -> io::Result<u64> {
         .map_err(io::Error::other)
 }
 
-fn sample(system: &mut System, disks: &mut Disks, working_ms: u64) -> io::Result<Observation> {
+fn sample(
+    system: &mut System,
+    disks: &mut Disks,
+    dir: &Path,
+    working_ms: u64,
+) -> io::Result<Observation> {
     system.refresh_cpu_usage();
     system.refresh_memory();
     system.refresh_processes_specifics(
@@ -130,6 +149,8 @@ fn sample(system: &mut System, disks: &mut Disks, working_ms: u64) -> io::Result
         })
         .collect();
     processes.sort_by_key(|process| process.pid);
+    let roots = agent_observe::registrations(dir, system)?;
+    let agents = agent_observations(&processes, &roots);
     let memory_total = system.total_memory();
     let swap_total = system.total_swap();
     Ok(Observation {
@@ -146,7 +167,60 @@ fn sample(system: &mut System, disks: &mut Disks, working_ms: u64) -> io::Result
         root_disk_available_bytes: root.map(sysinfo::Disk::available_space),
         root_disk_total_bytes: root.map(sysinfo::Disk::total_space),
         processes,
+        agents,
     })
+}
+
+fn agent_observations(
+    processes: &[ProcessObservation],
+    roots: &std::collections::HashMap<u32, agent_observe::Registration>,
+) -> Vec<AgentObservation> {
+    let parents: std::collections::HashMap<_, _> = processes
+        .iter()
+        .map(|process| (process.pid, process.parent_pid))
+        .collect();
+    let mut groups: BTreeMap<u32, AgentObservation> = BTreeMap::new();
+    for process in processes {
+        let mut pid = process.pid;
+        let mut owner = None;
+        // No valid ancestry chain can be longer than the process snapshot.
+        for _ in 0..=processes.len() {
+            if let Some(root) = roots.get(&pid) {
+                owner = Some(root);
+                break;
+            }
+            let Some(parent) = parents.get(&pid).copied().flatten() else {
+                break;
+            };
+            pid = parent;
+        }
+        let Some(root) = owner else { continue };
+        let group = groups.entry(root.pid).or_insert_with(|| AgentObservation {
+            kind: root.kind.as_str(),
+            root_pid: root.pid,
+            process_count: 0,
+            cpu_percent: None,
+            memory_bytes: 0,
+            read_bytes: None,
+            written_bytes: None,
+        });
+        group.process_count += 1;
+        group.cpu_percent = sum_metric(group.cpu_percent, process.cpu_percent);
+        group.memory_bytes = group
+            .memory_bytes
+            .saturating_add(process.memory_bytes.unwrap_or_default());
+        group.read_bytes = sum_metric(group.read_bytes, process.read_bytes);
+        group.written_bytes = sum_metric(group.written_bytes, process.written_bytes);
+    }
+    groups.into_values().collect()
+}
+
+fn sum_metric<T: std::ops::Add<Output = T>>(left: Option<T>, right: Option<T>) -> Option<T> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left + right),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
 }
 
 fn segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf, u64)>> {
@@ -303,7 +377,7 @@ fn record_loop(dir: &Path, stop_path: &Path, options: &ObserveOptions) -> io::Re
         previous = std::time::Instant::now();
         append(
             dir,
-            &sample(&mut system, &mut disks, working_ms(elapsed, interval))?,
+            &sample(&mut system, &mut disks, dir, working_ms(elapsed, interval))?,
             options,
         )?;
     }
@@ -378,6 +452,7 @@ mod tests {
             root_disk_available_bytes: None,
             root_disk_total_bytes: None,
             processes: vec![],
+            agents: vec![],
         }
     }
 
@@ -468,5 +543,80 @@ mod tests {
         assert_eq!(active_recorder_pid(&path).unwrap(), None);
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn descendant_load_belongs_to_nearest_registered_agent() {
+        let roots = std::collections::HashMap::from([
+            (
+                10,
+                agent_observe::Registration {
+                    kind: agent_observe::AgentKind::Codex,
+                    pid: 10,
+                    start_time: 1,
+                },
+            ),
+            (
+                12,
+                agent_observe::Registration {
+                    kind: agent_observe::AgentKind::Claude,
+                    pid: 12,
+                    start_time: 1,
+                },
+            ),
+        ]);
+        let process = |pid, parent_pid, cpu_percent, memory_bytes| ProcessObservation {
+            pid,
+            parent_pid,
+            cpu_percent: Some(cpu_percent),
+            memory_bytes: Some(memory_bytes),
+            read_bytes: Some(5),
+            written_bytes: Some(7),
+        };
+        let agents = agent_observations(
+            &[
+                process(10, None, 2.0, 100),
+                process(11, Some(10), 3.0, 200),
+                process(12, Some(11), 4.0, 300),
+                process(13, Some(12), 5.0, 400),
+                process(14, None, 6.0, 500),
+            ],
+            &roots,
+        );
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].kind, "codex");
+        assert_eq!(agents[0].process_count, 2);
+        assert_eq!(agents[0].cpu_percent, Some(5.0));
+        assert_eq!(agents[0].memory_bytes, 300);
+        assert_eq!(agents[1].kind, "claude");
+        assert_eq!(agents[1].process_count, 2);
+        assert_eq!(agents[1].cpu_percent, Some(9.0));
+        assert_eq!(agents[1].memory_bytes, 700);
+    }
+
+    #[test]
+    fn deep_process_tree_is_fully_attributed() {
+        let roots = std::collections::HashMap::from([(
+            10,
+            agent_observe::Registration {
+                kind: agent_observe::AgentKind::Codex,
+                pid: 10,
+                start_time: 1,
+            },
+        )]);
+        let processes = (10..=80)
+            .map(|pid| ProcessObservation {
+                pid,
+                parent_pid: (pid > 10).then_some(pid - 1),
+                cpu_percent: Some(1.0),
+                memory_bytes: Some(1),
+                read_bytes: Some(1),
+                written_bytes: Some(1),
+            })
+            .collect::<Vec<_>>();
+        let agents = agent_observations(&processes, &roots);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].process_count, 71);
+        assert_eq!(agents[0].memory_bytes, 71);
     }
 }
