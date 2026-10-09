@@ -38,12 +38,29 @@ enum Request {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Reply {
-    Queued { id: u64 },
-    Granted { id: u64 },
-    Cancelled { id: u64 },
-    Snapshot { jobs: Vec<JobView> },
+    Queued {
+        id: u64,
+        position: usize,
+        reason: String,
+    },
+    Waiting {
+        id: u64,
+        position: usize,
+        reason: String,
+    },
+    Granted {
+        id: u64,
+    },
+    Cancelled {
+        id: u64,
+    },
+    Snapshot {
+        jobs: Vec<JobView>,
+    },
     Ok,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -195,6 +212,36 @@ impl State {
         running.sort_by_key(|job| job.id);
         jobs.extend(running);
         jobs
+    }
+
+    fn wait_status(&self, id: u64) -> Option<(usize, String)> {
+        let position = self.waiting.iter().position(|job| job.id == id)? + 1;
+        let used_cpu: u32 = self.running.values().map(|job| job.cpu).sum();
+        let used_memory: u64 = self.running.values().map(|job| job.memory_mib).sum();
+        let job = self.waiting.front()?;
+        let pressure_reason = self.pressure.as_ref().and_then(|pressure| {
+            pressure.wait_reason(
+                job.cpu,
+                job.memory_mib,
+                used_cpu,
+                used_memory,
+                std::time::Instant::now(),
+            )
+        });
+        let reason = if position > 1 {
+            "waiting for earlier requests"
+        } else if let Some(reason) = pressure_reason {
+            reason
+        } else if self.running.len() >= self.max_running as usize {
+            "running limit reached"
+        } else if job.cpu > self.cpu - used_cpu {
+            "CPU budget in use"
+        } else if job.memory_mib > self.memory_mib - used_memory {
+            "memory budget in use"
+        } else {
+            "awaiting admission"
+        };
+        Some((position, reason.into()))
     }
 }
 
@@ -420,11 +467,24 @@ fn handle(mut stream: UnixStream, shared: &Arc<Mutex<State>>) -> io::Result<()> 
             memory_mib,
             identity,
         } => {
-            let id = match shared.lock().unwrap().add(cpu, memory_mib, identity) {
-                Ok(id) => id,
-                Err(message) => return send(&mut stream, &Reply::Error { message }),
+            let (id, position, reason) = {
+                let mut state = shared.lock().unwrap();
+                match state.add(cpu, memory_mib, identity) {
+                    Ok(id) => {
+                        let (position, reason) = state.wait_status(id).expect("new request queued");
+                        (id, position, reason)
+                    }
+                    Err(message) => return send(&mut stream, &Reply::Error { message }),
+                }
             };
-            if let Err(error) = send(&mut stream, &Reply::Queued { id }) {
+            if let Err(error) = send(
+                &mut stream,
+                &Reply::Queued {
+                    id,
+                    position,
+                    reason,
+                },
+            ) {
                 shared.lock().unwrap().remove(id);
                 return Err(error);
             }
@@ -447,6 +507,7 @@ fn handle(mut stream: UnixStream, shared: &Arc<Mutex<State>>) -> io::Result<()> 
 
 fn hold_job(stream: &mut UnixStream, shared: &Arc<Mutex<State>>, id: u64) -> io::Result<()> {
     stream.set_read_timeout(Some(POLL))?;
+    let mut last_wait = shared.lock().unwrap().wait_status(id);
     loop {
         let decision = {
             let mut state = shared.lock().unwrap();
@@ -468,6 +529,20 @@ fn hold_job(stream: &mut UnixStream, shared: &Arc<Mutex<State>>, id: u64) -> io:
         if matches!(decision, QueueDecision::Granted) {
             send(stream, &Reply::Granted { id })?;
             break;
+        }
+        let wait = shared.lock().unwrap().wait_status(id);
+        if wait != last_wait {
+            if let Some((position, reason)) = &wait {
+                send(
+                    stream,
+                    &Reply::Waiting {
+                        id,
+                        position: *position,
+                        reason: reason.clone(),
+                    },
+                )?;
+            }
+            last_wait = wait;
         }
         let mut byte = [0];
         match stream.read(&mut byte) {
@@ -751,7 +826,14 @@ pub fn schedule(options: RunOptions<'_>) -> io::Result<u8> {
         },
     )?;
     let id = match response {
-        Reply::Queued { id } => id,
+        Reply::Queued {
+            id,
+            position,
+            reason,
+        } => {
+            eprintln!("reef: queued request {id} (position {position}: {reason})");
+            id
+        }
         Reply::Error { message } => {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
         }
@@ -762,7 +844,6 @@ pub fn schedule(options: RunOptions<'_>) -> io::Result<u8> {
             ));
         }
     };
-    eprintln!("reef: queued request {id}");
     let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT])?;
     stream.set_read_timeout(Some(POLL))?;
     let mut response_buffer = Vec::new();
@@ -772,6 +853,13 @@ pub fn schedule(options: RunOptions<'_>) -> io::Result<u8> {
         }
         match poll_line(&mut stream, &mut response_buffer) {
             Ok(Some(line)) => match serde_json::from_slice::<Reply>(&line)? {
+                Reply::Waiting {
+                    id: waiting,
+                    position,
+                    reason,
+                } if waiting == id => {
+                    eprintln!("reef: request {id} is position {position}: {reason}");
+                }
                 Reply::Granted { id: granted } if granted == id => {
                     eprintln!("reef: admitted request {id}");
                     let mut lease = Lease {
@@ -802,7 +890,8 @@ pub fn schedule(options: RunOptions<'_>) -> io::Result<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::State;
+    use super::{MIB, State};
+    use crate::pressure::{self, Monitor};
 
     #[test]
     fn fifo_admission_holds_small_job_behind_large_one() {
@@ -838,5 +927,57 @@ mod tests {
         state.remove(first);
         let third = state.add(1, 1024, "third".into()).unwrap();
         assert!(state.admit(third));
+    }
+
+    #[test]
+    fn queue_status_explains_position_and_capacity() {
+        let mut state = State::new(1, 1024, 1, None);
+        let first = state.add(1, 1024, "first".into()).unwrap();
+        assert!(state.admit(first));
+        let second = state.add(1, 1024, "second".into()).unwrap();
+        let third = state.add(1, 1024, "third".into()).unwrap();
+        assert_eq!(
+            state.wait_status(second),
+            Some((1, "running limit reached".into()))
+        );
+        assert_eq!(
+            state.wait_status(third),
+            Some((2, "waiting for earlier requests".into()))
+        );
+        state.remove(first);
+        assert_eq!(
+            state.wait_status(second),
+            Some((1, "awaiting admission".into()))
+        );
+        state.remove(second);
+        assert_eq!(
+            state.wait_status(third),
+            Some((1, "awaiting admission".into()))
+        );
+    }
+
+    #[test]
+    fn queue_status_explains_pressure_hold() {
+        let policy = pressure::Policy::new(
+            pressure::Options {
+                no_pressure: false,
+                cpu_reserve: Some(1),
+                memory_reserve_mib: Some(1024),
+                cpu_high_percent: 90,
+                cpu_recover_percent: 70,
+                memory_high_percent: 90,
+                memory_recover_percent: 80,
+                recovery_seconds: 5,
+            },
+            8,
+            16 * 1024 * MIB,
+        )
+        .unwrap();
+        let mut state = State::new(4, 4096, 2, Some(Monitor::new(policy)));
+        let id = state.add(1, 1024, "agent".into()).unwrap();
+        assert_eq!(
+            state.wait_status(id),
+            Some((1, "waiting for a live pressure sample".into()))
+        );
     }
 }
