@@ -111,6 +111,15 @@ reef report --from 2026-10-08T00:00:00Z --to 2026-10-09T00:00:00Z --records meas
 
 The default range is the last 24 hours. Its start is inclusive and its end is exclusive. Markdown is the default format. `--records` adds custom files to default history without double-counting a repeated path. If no history exists, command measurements are unavailable; if history exists but no command overlaps the range, the measured count is zero. Reef marks pressure samples with no overlapping managed command as unattributed host activity rather than assigning their cost to a measured command. Command totals include each whole command whose execution overlaps the range. The wall and CPU percentages are shares of measured commands, not shares of machine capacity. Concurrent command wall times can add up to more than the elapsed range. The pressure timeline lists categories active during a pressured sample; overlap alone does not establish cause. `--state-dir` selects the observation directory, not the default command history directory. Thresholds default to 90% CPU, 90% memory, and 1% swap and can be changed with `--cpu-threshold`, `--memory-threshold`, and `--swap-threshold`. Missing metrics remain unavailable rather than becoming zero. Agent, container, and interactive categories require later instrumentation; `reef run` currently offers build, lint, test, and other.
 
+Compare a baseline with a later, non-overlapping period:
+
+```console
+reef compare --baseline-from 2026-10-07T09:00:00Z --baseline-to 2026-10-07T17:00:00Z --comparison-from 2026-10-08T09:00:00Z --comparison-to 2026-10-08T17:00:00Z
+reef compare --baseline-from 2026-10-07T09:00:00Z --baseline-to 2026-10-07T17:00:00Z --comparison-from 2026-10-08T09:00:00Z --comparison-to 2026-10-08T17:00:00Z --format json
+```
+
+`reef compare` reads the same private observations and command history as `reef report`, including optional `--state-dir` and repeated `--records` files. It reports pressure milliseconds per observed working hour so gaps and sleeping time do not dilute a period. Commands count in the period where they finish, including failed and cancelled commands; their whole wall and CPU durations appear by category. Swap growth is the difference between the first and last available swap samples within a period. The no-overlap share measures pressured time without a concurrent recorded command, not unobserved or uninstrumented work. Missing observations or history remain unavailable, and zero-pressure periods have no defined no-overlap percentage. The comparison is observational; it does not show that Reef caused a change.
+
 ## Planned capabilities
 
 - Attribute resource cost to agents and containers

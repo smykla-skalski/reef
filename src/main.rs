@@ -123,6 +123,8 @@ enum Command {
     },
     /// Summarize workstation observations and command measurements.
     Report(report::Options),
+    /// Compare two observed workstation periods without causal claims.
+    Compare(report::CompareOptions),
 }
 
 #[cfg(unix)]
@@ -380,13 +382,18 @@ fn main() -> std::process::ExitCode {
                 }
             }
         }
-        Command::Report(options) => match report::run(&options) {
-            Ok(()) => std::process::ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("reef: {error}");
-                std::process::ExitCode::FAILURE
-            }
-        },
+        Command::Report(options) => report_result(report::run(&options)),
+        Command::Compare(options) => report_result(report::run_compare(&options)),
+    }
+}
+
+fn report_result(result: std::io::Result<()>) -> std::process::ExitCode {
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("reef: {error}");
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
