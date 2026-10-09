@@ -238,7 +238,16 @@ pub fn report(cache_dir: Option<&Path>, from_ms: u128, to_ms: u128) -> io::Resul
     if !private_dir(&dir, false)? {
         return Ok(Impact::default());
     }
-    let lock = events_lock(&dir, false)?;
+    let lock = match events_lock(&dir, false) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if event_files(&dir)?.is_empty() {
+                return Ok(Impact::default());
+            }
+            events_lock(&dir, true)?
+        }
+        Err(error) => return Err(error),
+    };
     fs2::FileExt::lock_shared(&lock)?;
     let mut events = Vec::new();
     for (_, path, _) in event_files(&dir)? {
@@ -341,6 +350,19 @@ mod tests {
         drop(lock);
         fs::set_permissions(dir.join("events.lock"), fs::Permissions::from_mode(0o400)).unwrap();
         assert!(report(Some(&root), 0, u128::MAX).unwrap().available);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_first_write_does_not_break_report() {
+        let root = std::env::temp_dir().join(format!(
+            "reef-cache-impact-empty-lock-{}-{}",
+            std::process::id(),
+            now_ms().unwrap()
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        private_dir(&root.join("impact"), true).unwrap();
+        assert!(!report(Some(&root), 0, u128::MAX).unwrap().available);
         fs::remove_dir_all(root).unwrap();
     }
 }
