@@ -54,7 +54,15 @@ impl Fixture {
                 .stderr(Stdio::inherit())
                 .spawn()
                 .unwrap();
-            wait_until(|| path.join("reef.sock").exists());
+            wait_until(|| {
+                reef()
+                    .args(["queue", "--state-dir"])
+                    .arg(&path)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
+            });
             Some(child)
         } else {
             None
