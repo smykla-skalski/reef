@@ -1,3 +1,4 @@
+mod observe;
 #[cfg(unix)]
 mod run;
 mod status;
@@ -5,7 +6,6 @@ mod status;
 #[cfg(unix)]
 use clap::ValueEnum;
 use clap::{Parser, Subcommand};
-#[cfg(unix)]
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -34,6 +34,40 @@ enum Command {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
+    /// Record resource usage over time.
+    Observe {
+        #[command(subcommand)]
+        command: ObserveCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ObserveCommand {
+    /// Start a recorder that survives terminal sessions.
+    Start(ObserveOptions),
+    /// Run the recorder in the foreground.
+    Run(ObserveOptions),
+    /// Stop the running recorder.
+    Stop {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, clap::Args, Clone)]
+struct ObserveOptions {
+    /// Seconds between samples.
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+    interval_seconds: u64,
+    /// Number of days to retain samples.
+    #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u64).range(1..))]
+    retention_days: u64,
+    /// Maximum storage in MiB.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u64).range(1..))]
+    max_storage_mib: u64,
+    /// Private directory for observations.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
 }
 
 #[cfg(unix)]
@@ -93,5 +127,19 @@ fn main() -> std::process::ExitCode {
                 std::process::ExitCode::FAILURE
             }
         },
+        Command::Observe { command } => {
+            let result = match command {
+                ObserveCommand::Start(options) => observe::start(&options),
+                ObserveCommand::Run(options) => observe::run(&options),
+                ObserveCommand::Stop { state_dir } => observe::stop(state_dir.as_deref()),
+            };
+            match result {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("reef: {error}");
+                    std::process::ExitCode::FAILURE
+                }
+            }
+        }
     }
 }
