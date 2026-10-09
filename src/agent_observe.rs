@@ -206,11 +206,12 @@ mod tests {
 
     #[test]
     fn explicit_process_registration_is_private_and_idempotent() {
-        let dir = std::env::temp_dir().join(format!(
-            "reef-agent-observe-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("reef-agent-observe-{}-{nonce}", std::process::id()));
         mark(AgentKind::Codex, Some(std::process::id()), Some(&dir)).unwrap();
         mark(AgentKind::Codex, Some(std::process::id()), Some(&dir)).unwrap();
         let mut system = System::new();
@@ -236,10 +237,13 @@ mod tests {
 
     #[test]
     fn stale_process_identity_is_not_attributed() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "reef-agent-identity-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            "reef-agent-identity-{}-{nonce}",
+            std::process::id()
         ));
         mark(AgentKind::Codex, Some(std::process::id()), Some(&dir)).unwrap();
         let path = fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
