@@ -103,14 +103,13 @@ fn private_dir(path: &Path, create: bool) -> io::Result<bool> {
     Ok(true)
 }
 
-fn events_lock(dir: &Path) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(dir.join("events.lock"))?;
+fn events_lock(dir: &Path, write: bool) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(nix::libc::O_NOFOLLOW);
+    if write {
+        options.write(true).create(true).mode(0o600);
+    }
+    let file = options.open(dir.join("events.lock"))?;
     let metadata = file.metadata()?;
     if !metadata.is_file()
         || metadata.uid() != nix::unistd::Uid::current().as_raw()
@@ -180,7 +179,7 @@ fn prune(dir: &Path, now: u64) -> io::Result<()> {
 fn save(root: &Path, event: &Event) -> io::Result<()> {
     let dir = root.join("impact");
     private_dir(&dir, true)?;
-    let lock = events_lock(&dir)?;
+    let lock = events_lock(&dir, true)?;
     fs2::FileExt::lock_exclusive(&lock)?;
     let suffix = format!(
         "{}-{}-{}",
@@ -239,7 +238,7 @@ pub fn report(cache_dir: Option<&Path>, from_ms: u128, to_ms: u128) -> io::Resul
     if !private_dir(&dir, false)? {
         return Ok(Impact::default());
     }
-    let lock = events_lock(&dir)?;
+    let lock = events_lock(&dir, false)?;
     fs2::FileExt::lock_shared(&lock)?;
     let mut events = Vec::new();
     for (_, path, _) in event_files(&dir)? {
@@ -288,6 +287,7 @@ pub fn report(cache_dir: Option<&Path>, from_ms: u128, to_ms: u128) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -301,7 +301,7 @@ mod tests {
         fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
         let dir = root.join("impact");
         private_dir(&dir, true).unwrap();
-        let lock = events_lock(&dir).unwrap();
+        let lock = events_lock(&dir, true).unwrap();
         fs2::FileExt::lock_exclusive(&lock).unwrap();
         let (ready_tx, ready_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
@@ -324,6 +324,23 @@ mod tests {
                 .available
         );
         reader.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn report_reads_private_history_with_read_only_lock() {
+        let root = std::env::temp_dir().join(format!(
+            "reef-cache-impact-read-lock-{}-{}",
+            std::process::id(),
+            now_ms().unwrap()
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let dir = root.join("impact");
+        private_dir(&dir, true).unwrap();
+        let lock = events_lock(&dir, true).unwrap();
+        drop(lock);
+        fs::set_permissions(dir.join("events.lock"), fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(report(Some(&root), 0, u128::MAX).unwrap().available);
         fs::remove_dir_all(root).unwrap();
     }
 }
