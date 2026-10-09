@@ -1,10 +1,10 @@
 use crate::ObserveOptions;
 use crate::agent_observe;
 use fs2::FileExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -39,15 +39,37 @@ struct ProcessObservation {
     written_bytes: Option<u64>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct AgentObservation {
-    kind: &'static str,
+    kind: String,
     root_pid: u32,
     process_count: usize,
     cpu_percent: Option<f32>,
     memory_bytes: u64,
     read_bytes: Option<u64>,
     written_bytes: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct AgentTick {
+    at_unix_ms: u64,
+    working_ms: u64,
+    agents: Vec<AgentObservation>,
+}
+
+#[derive(Default, Serialize)]
+struct AgentRollup {
+    minute_unix_ms: u64,
+    kind: String,
+    active_samples: u64,
+    observed_working_ms: u64,
+    cpu_core_ms_estimate: f64,
+    peak_cpu_percent: f32,
+    peak_memory_bytes: u64,
+    read_bytes: u64,
+    written_bytes: u64,
+    peak_processes: usize,
+    peak_roots: usize,
 }
 
 pub(crate) fn state_dir(override_dir: Option<&Path>) -> io::Result<PathBuf> {
@@ -130,25 +152,7 @@ fn sample(
         .list()
         .iter()
         .find(|disk| disk.mount_point() == Path::new("/"));
-    let mut processes: Vec<_> = system
-        .processes()
-        .iter()
-        .map(|(pid, process)| {
-            let usage = process.disk_usage();
-            ProcessObservation {
-                pid: pid.as_u32(),
-                parent_pid: process.parent().map(sysinfo::Pid::as_u32),
-                cpu_percent: process
-                    .cpu_usage()
-                    .is_finite()
-                    .then_some(process.cpu_usage()),
-                memory_bytes: Some(process.memory()),
-                read_bytes: (usage.read_bytes > 0).then_some(usage.read_bytes),
-                written_bytes: (usage.written_bytes > 0).then_some(usage.written_bytes),
-            }
-        })
-        .collect();
-    processes.sort_by_key(|process| process.pid);
+    let processes = process_observations(system);
     let roots = agent_observe::registrations(dir, system)?;
     let agents = agent_observations(&processes, &roots);
     let memory_total = system.total_memory();
@@ -169,6 +173,66 @@ fn sample(
         processes,
         agents,
     })
+}
+
+fn process_observations(system: &System) -> Vec<ProcessObservation> {
+    let mut processes: Vec<_> = system
+        .processes()
+        .iter()
+        .map(|(pid, process)| {
+            let usage = process.disk_usage();
+            ProcessObservation {
+                pid: pid.as_u32(),
+                parent_pid: process.parent().map(sysinfo::Pid::as_u32),
+                cpu_percent: process
+                    .cpu_usage()
+                    .is_finite()
+                    .then_some(process.cpu_usage()),
+                memory_bytes: Some(process.memory()),
+                read_bytes: (usage.read_bytes > 0).then_some(usage.read_bytes),
+                written_bytes: (usage.written_bytes > 0).then_some(usage.written_bytes),
+            }
+        })
+        .collect();
+    processes.sort_by_key(|process| process.pid);
+    processes
+}
+
+fn has_agent_registration(dir: &Path) -> io::Result<bool> {
+    Ok(fs::read_dir(dir)?.any(|entry| {
+        entry.is_ok_and(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                name.starts_with("agent-")
+                    && Path::new(name)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+            })
+        })
+    }))
+}
+
+fn agent_tick(system: &mut System, dir: &Path, working_ms: u64) -> io::Result<Option<AgentTick>> {
+    if !has_agent_registration(dir)? {
+        return Ok(None);
+    }
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cpu()
+            .with_memory()
+            .with_disk_usage()
+            .without_tasks(),
+    );
+    let roots = agent_observe::registrations(dir, system)?;
+    if roots.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(AgentTick {
+        at_unix_ms: now_ms()?,
+        working_ms,
+        agents: agent_observations(&process_observations(system), &roots),
+    }))
 }
 
 fn agent_observations(
@@ -196,7 +260,7 @@ fn agent_observations(
         }
         let Some(root) = owner else { continue };
         let group = groups.entry(root.pid).or_insert_with(|| AgentObservation {
-            kind: root.kind.as_str(),
+            kind: root.kind.as_str().to_owned(),
             root_pid: root.pid,
             process_count: 0,
             cpu_percent: None,
@@ -223,14 +287,14 @@ fn sum_metric<T: std::ops::Add<Output = T>>(left: Option<T>, right: Option<T>) -
     }
 }
 
-fn segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf, u64)>> {
+fn segments_with_prefix(dir: &Path, prefix: &str) -> io::Result<Vec<(u64, PathBuf, u64)>> {
     let mut files = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
         let Some(timestamp) = name
             .to_str()
-            .and_then(|name| name.strip_prefix("samples-"))
+            .and_then(|name| name.strip_prefix(prefix))
             .and_then(|name| name.strip_suffix(".jsonl"))
             .and_then(|name| name.split('-').next())
             .and_then(|timestamp| timestamp.parse::<u64>().ok())
@@ -245,9 +309,16 @@ fn segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf, u64)>> {
     Ok(files)
 }
 
+fn segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf, u64)>> {
+    segments_with_prefix(dir, "samples-")
+}
+
 fn prune(dir: &Path, now: u64, retention_days: u64, max_bytes: u64) -> io::Result<()> {
     let cutoff = now.saturating_sub(retention_days.saturating_mul(86_400_000));
-    let files = segments(dir)?;
+    let mut files = segments(dir)?;
+    files.extend(segments_with_prefix(dir, "agent-samples-")?);
+    files.extend(segments_with_prefix(dir, "agent-rollups-")?);
+    files.sort_by_key(|(timestamp, _, _)| *timestamp);
     let mut total: u64 = files.iter().map(|(_, _, size)| size).sum();
     for (timestamp, path, size) in files {
         if timestamp < cutoff || total > max_bytes {
@@ -258,35 +329,134 @@ fn prune(dir: &Path, now: u64, retention_days: u64, max_bytes: u64) -> io::Resul
     Ok(())
 }
 
-fn append(dir: &Path, observation: &Observation, options: &ObserveOptions) -> io::Result<()> {
+fn append_line(
+    dir: &Path,
+    prefix: &str,
+    at_unix_ms: u64,
+    line: &[u8],
+    options: &ObserveOptions,
+) -> io::Result<()> {
     let max_bytes = options.max_storage_mib.saturating_mul(SEGMENT_BYTES);
-    let line = serde_json::to_vec(observation).map_err(io::Error::other)?;
-    let files = segments(dir)?;
-    let cutoff = observation
-        .at_unix_ms
-        .saturating_sub(options.retention_days.saturating_mul(86_400_000));
+    let files = segments_with_prefix(dir, prefix)?;
+    let cutoff = at_unix_ms.saturating_sub(options.retention_days.saturating_mul(86_400_000));
     let latest = files.last().filter(|(timestamp, _, size)| {
-        *timestamp >= cutoff && *size + (line.len() as u64) < SEGMENT_BYTES.min(max_bytes / 2)
+        *timestamp >= cutoff
+            && *size + (line.len() as u64) < SEGMENT_BYTES.min(max_bytes / 2)
+            && (prefix != "agent-samples-" || timestamp / 3_600_000 == at_unix_ms / 3_600_000)
     });
     let path = latest.map_or_else(
         || {
             dir.join(format!(
-                "samples-{}-{}.jsonl",
-                observation.at_unix_ms,
+                "{}{}-{}.jsonl",
+                prefix,
+                at_unix_ms,
                 std::process::id()
             ))
         },
         |(_, path, _)| path.clone(),
     );
     let mut file = private_file(&path, false, true)?;
-    file.write_all(&line)?;
+    file.write_all(line)?;
     file.write_all(b"\n")?;
     file.sync_data()?;
+    prune(dir, at_unix_ms, options.retention_days, max_bytes)
+}
+
+fn append(dir: &Path, observation: &Observation, options: &ObserveOptions) -> io::Result<()> {
+    let line = serde_json::to_vec(observation).map_err(io::Error::other)?;
+    append_line(dir, "samples-", observation.at_unix_ms, &line, options)
+}
+
+fn append_agent_tick(dir: &Path, tick: &AgentTick, options: &ObserveOptions) -> io::Result<()> {
+    let line = serde_json::to_vec(tick).map_err(io::Error::other)?;
+    append_line(dir, "agent-samples-", tick.at_unix_ms, &line, options)
+}
+
+fn fold_tick(rollups: &mut BTreeMap<(u64, String), AgentRollup>, tick: &AgentTick) {
+    let minute = tick.at_unix_ms / 60_000 * 60_000;
+    let mut by_kind: BTreeMap<&str, Vec<&AgentObservation>> = BTreeMap::new();
+    for agent in &tick.agents {
+        by_kind.entry(&agent.kind).or_default().push(agent);
+    }
+    for (kind, agents) in by_kind {
+        let rollup = rollups
+            .entry((minute, kind.to_owned()))
+            .or_insert_with(|| AgentRollup {
+                minute_unix_ms: minute,
+                kind: kind.to_owned(),
+                ..AgentRollup::default()
+            });
+        let cpu: f32 = agents.iter().filter_map(|agent| agent.cpu_percent).sum();
+        let memory = agents
+            .iter()
+            .map(|agent| agent.memory_bytes)
+            .fold(0_u64, u64::saturating_add);
+        rollup.active_samples += 1;
+        rollup.observed_working_ms += tick.working_ms;
+        let duration = u32::try_from(tick.working_ms).unwrap_or(u32::MAX);
+        rollup.cpu_core_ms_estimate += f64::from(cpu.max(0.0)) * f64::from(duration) / 100.0;
+        rollup.peak_cpu_percent = rollup.peak_cpu_percent.max(cpu);
+        rollup.peak_memory_bytes = rollup.peak_memory_bytes.max(memory);
+        rollup.read_bytes += agents
+            .iter()
+            .filter_map(|agent| agent.read_bytes)
+            .sum::<u64>();
+        rollup.written_bytes += agents
+            .iter()
+            .filter_map(|agent| agent.written_bytes)
+            .sum::<u64>();
+        rollup.peak_processes = rollup
+            .peak_processes
+            .max(agents.iter().map(|agent| agent.process_count).sum());
+        rollup.peak_roots = rollup.peak_roots.max(agents.len());
+    }
+}
+
+fn fold_agent_segments(dir: &Path, now: u64, options: &ObserveOptions) -> io::Result<()> {
+    let current_hour = now / 3_600_000;
+    for (timestamp, path, _) in segments_with_prefix(dir, "agent-samples-")? {
+        if timestamp / 3_600_000 >= current_hour {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("agent-samples-"))
+            .ok_or_else(|| io::Error::other("invalid agent sample segment"))?;
+        let target = dir.join(format!("agent-rollups-{name}"));
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                fs::remove_file(path)?;
+                continue;
+            }
+            Ok(_) => return Err(io::Error::other("rollup target must be a regular file")),
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            Err(_) => {}
+        }
+        let mut rollups = BTreeMap::new();
+        for line in BufReader::new(File::open(&path)?).lines() {
+            let tick: AgentTick = serde_json::from_str(&line?).map_err(io::Error::other)?;
+            fold_tick(&mut rollups, &tick);
+        }
+        let temporary = dir.join(format!(
+            "agent-rollups-{timestamp}-{}-{}.tmp",
+            std::process::id(),
+            now_ms()?
+        ));
+        let mut file = private_file(&temporary, true, false)?;
+        for rollup in rollups.values() {
+            serde_json::to_writer(&mut file, rollup)?;
+            file.write_all(b"\n")?;
+        }
+        file.sync_data()?;
+        fs::rename(temporary, target)?;
+        fs::remove_file(path)?;
+    }
     prune(
         dir,
-        observation.at_unix_ms,
+        now,
         options.retention_days,
-        max_bytes,
+        options.max_storage_mib.saturating_mul(SEGMENT_BYTES),
     )
 }
 
@@ -355,6 +525,7 @@ pub fn run(options: &ObserveOptions) -> io::Result<()> {
 
 fn record_loop(dir: &Path, stop_path: &Path, options: &ObserveOptions) -> io::Result<()> {
     let interval = Duration::from_secs(options.interval_seconds);
+    let tick_interval = Duration::from_secs(1);
     let mut system = System::new();
     let mut disks = Disks::new_with_refreshed_list();
     system.refresh_cpu_usage();
@@ -366,20 +537,42 @@ fn record_loop(dir: &Path, stop_path: &Path, options: &ObserveOptions) -> io::Re
             .with_disk_usage()
             .without_tasks(),
     );
-    let mut previous = std::time::Instant::now();
+    let mut previous_host = std::time::Instant::now();
+    let mut previous_tick = std::time::Instant::now();
     loop {
-        thread::sleep(interval);
+        thread::sleep(tick_interval);
         if stop_path.exists() {
             fs::remove_file(stop_path)?;
             return Ok(());
         }
-        let elapsed = previous.elapsed();
-        previous = std::time::Instant::now();
-        append(
-            dir,
-            &sample(&mut system, &mut disks, dir, working_ms(elapsed, interval))?,
-            options,
-        )?;
+        let tick_elapsed = previous_tick.elapsed();
+        previous_tick = std::time::Instant::now();
+        let tick_working_ms = working_ms(tick_elapsed, tick_interval);
+        if previous_host.elapsed() >= interval {
+            let host_elapsed = previous_host.elapsed();
+            previous_host = std::time::Instant::now();
+            let observation = sample(
+                &mut system,
+                &mut disks,
+                dir,
+                working_ms(host_elapsed, interval),
+            )?;
+            fold_agent_segments(dir, observation.at_unix_ms, options)?;
+            if !observation.agents.is_empty() {
+                append_agent_tick(
+                    dir,
+                    &AgentTick {
+                        at_unix_ms: observation.at_unix_ms,
+                        working_ms: tick_working_ms,
+                        agents: observation.agents.clone(),
+                    },
+                    options,
+                )?;
+            }
+            append(dir, &observation, options)?;
+        } else if let Some(tick) = agent_tick(&mut system, dir, tick_working_ms)? {
+            append_agent_tick(dir, &tick, options)?;
+        }
     }
 }
 
@@ -618,5 +811,85 @@ mod tests {
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].process_count, 71);
         assert_eq!(agents[0].memory_bytes, 71);
+    }
+
+    #[test]
+    fn older_agent_samples_fold_into_minute_load_without_raw_history() {
+        let dir = std::env::temp_dir().join(format!("reef-agent-fold-test-{}", std::process::id()));
+        private_dir(&dir).unwrap();
+        let make_tick = |at_unix_ms| AgentTick {
+            at_unix_ms,
+            working_ms: 1_000,
+            agents: vec![AgentObservation {
+                kind: "claude".to_owned(),
+                root_pid: 42,
+                process_count: 2,
+                cpu_percent: Some(50.0),
+                memory_bytes: 400,
+                read_bytes: Some(10),
+                written_bytes: Some(20),
+            }],
+        };
+        append_agent_tick(&dir, &make_tick(3_600_100), &options(&dir)).unwrap();
+        append_agent_tick(&dir, &make_tick(3_601_100), &options(&dir)).unwrap();
+
+        fold_agent_segments(&dir, 7_200_000, &options(&dir)).unwrap();
+
+        assert_eq!(
+            segments_with_prefix(&dir, "agent-samples-").unwrap(),
+            Vec::new()
+        );
+        let rollups = segments_with_prefix(&dir, "agent-rollups-").unwrap();
+        assert_eq!(rollups.len(), 1);
+        let content = fs::read_to_string(&rollups[0].1).unwrap();
+        let rollup: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(rollup["kind"], "claude");
+        assert_eq!(rollup["active_samples"], 2);
+        assert_eq!(rollup["observed_working_ms"], 2_000);
+        assert_eq!(rollup["cpu_core_ms_estimate"], 1_000.0);
+        assert_eq!(rollup["peak_memory_bytes"], 400);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn retry_after_rollup_publish_does_not_duplicate_load() {
+        let dir =
+            std::env::temp_dir().join(format!("reef-agent-fold-retry-test-{}", std::process::id()));
+        private_dir(&dir).unwrap();
+        let tick = AgentTick {
+            at_unix_ms: 3_600_100,
+            working_ms: 1_000,
+            agents: vec![AgentObservation {
+                kind: "codex".to_owned(),
+                root_pid: 42,
+                process_count: 1,
+                cpu_percent: Some(50.0),
+                memory_bytes: 400,
+                read_bytes: None,
+                written_bytes: None,
+            }],
+        };
+        append_agent_tick(&dir, &tick, &options(&dir)).unwrap();
+        let raw = segments_with_prefix(&dir, "agent-samples-").unwrap()[0]
+            .1
+            .clone();
+        fold_agent_segments(&dir, 7_200_000, &options(&dir)).unwrap();
+        append_agent_tick(&dir, &tick, &options(&dir)).unwrap();
+        assert_eq!(
+            segments_with_prefix(&dir, "agent-samples-").unwrap()[0].1,
+            raw
+        );
+
+        fold_agent_segments(&dir, 7_200_000, &options(&dir)).unwrap();
+
+        assert_eq!(
+            segments_with_prefix(&dir, "agent-samples-").unwrap(),
+            Vec::new()
+        );
+        assert_eq!(
+            segments_with_prefix(&dir, "agent-rollups-").unwrap().len(),
+            1
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 }

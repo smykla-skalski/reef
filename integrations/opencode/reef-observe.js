@@ -1,7 +1,6 @@
 import { existsSync } from "node:fs"
-import { Plugin } from "@opencode/plugin"
 
-export default Plugin.define({
+export default {
   id: "reef.observe",
   setup() {
     const paths = [process.env.REEF_BIN]
@@ -20,4 +19,4 @@ export default Plugin.define({
       // Missing Reef must not change an OpenCode session outcome.
     }
   },
-})
+}

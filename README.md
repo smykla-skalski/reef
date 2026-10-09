@@ -121,7 +121,7 @@ Start a background recorder with no project configuration:
 reef observe start
 ```
 
-It samples every 30 seconds, keeps up to seven days of observations, and limits storage to 100 MiB. High process counts can reach the storage limit sooner. Samples are JSON Lines files in `~/.local/state/reef/observe`. The directory is private to your user account on Unix. Each sample includes system CPU, memory, swap, root disk capacity, numeric process usage with parent PIDs for tree analysis, and load attributed to registered agent processes. Metrics that are unavailable are `null`; zero process I/O deltas are also `null` because a failed system query is indistinguishable from no I/O. Samples include `working_ms`, capped at the configured interval so time spent asleep does not accumulate as working time. Reef stores no process names, command lines, environment variables, file contents, credentials, or tokens.
+It samples the host every 30 seconds by default, keeps up to seven days of observations, and limits storage to 100 MiB. Registered agents also get compact one-second process-tree samples, so brief sessions can appear before the first host sample. At each hour boundary, Reef folds older agent samples into per-minute CPU, memory, I/O, and active-time aggregates and removes their raw one-second history. Queries crossing a folded minute include that whole minute. The storage limit and retention policy cover host samples, recent agent samples, and rollups together; high process counts can reach the limit sooner. Samples are JSON Lines files in `~/.local/state/reef/observe`. The directory is private to your user account on Unix. Each host sample includes system CPU, memory, swap, root disk capacity, numeric process usage with parent PIDs for tree analysis, and load attributed to registered agent processes. Metrics that are unavailable are `null`; zero process I/O deltas are also `null` because a failed system query is indistinguishable from no I/O. Samples include `working_ms`, capped at the configured interval so time spent asleep does not accumulate as working time. Reef stores no process names, command lines, environment variables, file contents, credentials, or tokens.
 
 Change collection limits when starting the recorder:
 
@@ -130,7 +130,7 @@ reef observe start --interval-seconds 60 --retention-days 14 --max-storage-mib 2
 reef observe stop
 ```
 
-Use `reef observe run` to keep the recorder in the foreground. All three commands accept `--state-dir` for an alternate location; pass it to `stop` as well when using a custom directory. Stopping takes effect at the next interval. A crashed recorder releases its lock, so the next run reuses its state files without manual cleanup. Do not delete `recorder.pid` or `recorder.lock` while a recorder is running.
+Use `reef observe run` to keep the recorder in the foreground. All three commands accept `--state-dir` for an alternate location; pass it to `stop` as well when using a custom directory. Stopping takes effect within one second. A crashed recorder releases its lock, so the next run reuses its state files without manual cleanup. Do not delete `recorder.pid` or `recorder.lock` while a recorder is running.
 
 Generate a workload report from observations and default command history; add custom record files with `--records`:
 
