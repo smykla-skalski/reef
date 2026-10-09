@@ -170,8 +170,6 @@ fn registered_agent_is_reported_without_scheduling_its_process() {
 #[cfg(unix)]
 #[test]
 fn agent_hook_finds_its_cli_ancestor_without_a_pid_argument() {
-    use std::os::unix::fs::PermissionsExt;
-
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -179,15 +177,11 @@ fn agent_hook_finds_its_cli_ancestor_without_a_pid_argument() {
     let dir = std::env::temp_dir().join(format!("reef-agent-hook-{}-{nonce}", std::process::id()));
     fs::create_dir(&dir).unwrap();
     let script = dir.join("codex");
-    let staged_script = dir.join("codex.tmp");
-    fs::write(
-        &staged_script,
-        b"#!/bin/sh\nset -e\n\"$1\" agents observe codex --state-dir \"$2\"\nsleep 1\n",
-    )
-    .unwrap();
-    fs::set_permissions(&staged_script, fs::Permissions::from_mode(0o700)).unwrap();
-    fs::rename(&staged_script, &script).unwrap();
+    std::os::unix::fs::symlink("/bin/sh", &script).unwrap();
     let output = Command::new(&script)
+        .arg("-c")
+        .arg("\"$1\" agents observe codex --state-dir \"$2\"; sleep 1")
+        .arg("codex")
         .arg(env!("CARGO_BIN_EXE_reef"))
         .arg(&dir)
         .output()
