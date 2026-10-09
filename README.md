@@ -45,6 +45,15 @@ reef observe stop
 
 Use `reef observe run` to keep the recorder in the foreground. All three commands accept `--state-dir` for an alternate location; pass it to `stop` as well when using a custom directory. Stopping takes effect at the next interval. If the recorder exits unexpectedly and leaves `recorder.pid`, remove that stale file before restarting.
 
+Generate a workload report from observations and one or more command record files:
+
+```console
+reef report --records measurements.jsonl
+reef report --from 2026-10-08T00:00:00Z --to 2026-10-09T00:00:00Z --records measurements.jsonl --format json
+```
+
+The default range is the last 24 hours. Its start is inclusive and its end is exclusive. Markdown is the default format. Without `--records`, command measurements are shown as unavailable; Reef does not infer command categories from anonymous system samples. Command totals include each whole command whose execution overlaps the range. The wall and CPU percentages are shares of measured commands, not shares of machine capacity. Concurrent command wall times can add up to more than the elapsed range. The pressure timeline lists categories active during a pressured sample; overlap alone does not establish cause. Thresholds default to 90% CPU, 90% memory, and 1% swap and can be changed with `--cpu-threshold`, `--memory-threshold`, and `--swap-threshold`. Missing metrics remain unavailable rather than becoming zero. Agent, container, and interactive categories require later instrumentation; `reef run` currently offers build, lint, test, and other.
+
 ## Planned capabilities
 
 - Attribute resource cost to agents and containers
@@ -52,7 +61,6 @@ Use `reef observe run` to keep the recorder in the foreground. All three command
 - Reserve CPU and memory for the developer's interactive applications
 - Reuse compatible results and persistent build caches
 - Offload work when local capacity is insufficient
-- Produce reports for workstation sizing and workflow tuning
 
 ## Design principles
 
