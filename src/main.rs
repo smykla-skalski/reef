@@ -1,4 +1,5 @@
 mod observe;
+mod report;
 #[cfg(unix)]
 mod run;
 mod status;
@@ -39,6 +40,8 @@ enum Command {
         #[command(subcommand)]
         command: ObserveCommand,
     },
+    /// Summarize workstation observations and command measurements.
+    Report(report::Options),
 }
 
 #[derive(Debug, Subcommand)]
@@ -141,5 +144,12 @@ fn main() -> std::process::ExitCode {
                 }
             }
         }
+        Command::Report(options) => match report::run(&options) {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("reef: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        },
     }
 }
