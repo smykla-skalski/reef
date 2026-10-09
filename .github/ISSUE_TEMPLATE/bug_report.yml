@@ -1,36 +1,47 @@
-name: Bug report
-description: Report incorrect or unexpected behavior
+name: Bug Report
+description: Report a bug or unexpected behavior
 labels: [kind/bug]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a bug! Please fill out the information below to help us fix the issue.
+
   - type: textarea
     id: description
     attributes:
       label: Description
-      description: What went wrong?
+      description: A clear and concise description of the bug
+      placeholder: What went wrong?
     validations:
       required: true
+
   - type: textarea
     id: steps
     attributes:
-      label: Steps to reproduce
-      description: Start from a clean, named state and list each command.
+      label: Steps to Reproduce
+      description: Steps to reproduce the behavior
       placeholder: |
-        1. Run `...`
-        2. Observe `...`
+        1. Run command `...`
+        2. See error `...`
     validations:
       required: true
 
   - type: textarea
     id: expected
     attributes:
-      label: Expected behavior
+      label: Expected Behavior
+      description: What did you expect to happen?
+      placeholder: Describe the expected behavior
     validations:
       required: true
 
   - type: textarea
     id: actual
     attributes:
-      label: Actual behavior
+      label: Actual Behavior
+      description: What actually happened?
+      placeholder: Describe the actual behavior
     validations:
       required: true
 
@@ -38,9 +49,17 @@ body:
     id: environment
     attributes:
       label: Environment
+      description: Please provide information about your environment
       placeholder: |
-        - OS:
-        - Reef version:
+        - OS: [e.g., macOS 14.0, Ubuntu 22.04]
+        - Version: [e.g., v1.0.0 or commit hash]
       render: markdown
     validations:
       required: true
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Any other context or information that might be helpful
+      placeholder: Add any other context about the problem here
