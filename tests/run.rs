@@ -443,6 +443,14 @@ fn forwards_interrupt_and_saves_cancelled_measurement() {
         Signal::SIGTERM,
     )
     .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while fs::read_to_string(&record).unwrap().trim().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "cancelled measurement was not saved"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let status = child.wait().unwrap();
     assert!(!status.success());
     let result: Value = serde_json::from_str(fs::read_to_string(record).unwrap().trim()).unwrap();
