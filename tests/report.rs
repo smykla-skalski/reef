@@ -57,6 +57,71 @@ fn reports_empty_range_with_unavailable_command_measurements() {
     assert!(report["pressure"]["any_above_ms"].is_null());
 }
 
+#[test]
+fn timeline_requires_explicit_flag_in_both_formats() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.join("samples-test.jsonl"),
+        "{\"at_unix_ms\":1767225601000,\"working_ms\":1000,\"cpu_percent\":95.0,\"memory_used_bytes\":900,\"memory_total_bytes\":1000,\"swap_used_bytes\":10,\"swap_total_bytes\":1000}\n",
+    )
+    .unwrap();
+    let args = [
+        "report",
+        "--from",
+        "2026-01-01T00:00:00Z",
+        "--to",
+        "2026-01-01T00:00:02Z",
+        "--state-dir",
+    ];
+    let overview = reef()
+        .args(args)
+        .arg(&fixture.0)
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+    assert!(overview.status.success(), "{overview:?}");
+    let overview = String::from_utf8(overview.stdout).unwrap();
+    assert!(overview.contains("## Pressure"));
+    assert!(!overview.contains("## Pressure timeline"));
+    assert!(!overview.contains("1767225600000..1767225601000"));
+
+    let detailed = reef()
+        .args(args)
+        .arg(&fixture.0)
+        .arg("--timeline")
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+    assert!(detailed.status.success(), "{detailed:?}");
+    assert!(String::from_utf8_lossy(&detailed.stdout).contains("## Pressure timeline"));
+
+    let json = reef()
+        .args(args)
+        .arg(&fixture.0)
+        .args(["--format", "json"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+    assert!(json.status.success(), "{json:?}");
+    let json: Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert!(json.get("timeline").is_none());
+    assert_eq!(
+        json["pressure_overlap"]["no_measured_command_ms"],
+        Value::Null
+    );
+
+    let detailed_json = reef()
+        .args(args)
+        .arg(&fixture.0)
+        .args(["--format", "json", "--timeline"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+    assert!(detailed_json.status.success(), "{detailed_json:?}");
+    let detailed_json: Value = serde_json::from_slice(&detailed_json.stdout).unwrap();
+    assert_eq!(detailed_json["timeline"].as_array().unwrap().len(), 1);
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_reports_missing_scheduler_history_as_unavailable() {
@@ -221,6 +286,7 @@ fn report_reads_default_history_without_records_flag() {
             "exit 7",
         ])
         .env("HOME", &fixture.0)
+        .env("REEF_AGENT_KIND", "codex")
         .output()
         .unwrap();
     assert_eq!(run.status.code(), Some(7));
@@ -245,6 +311,8 @@ fn report_reads_default_history_without_records_flag() {
     assert_eq!(report["command_measurements_available"], true);
     assert_eq!(report["command_count"], 1);
     assert_eq!(report["categories"][0]["category"], "build");
+    assert_eq!(report["agent_commands"][0]["agent"], "codex");
+    assert_eq!(report["agent_commands"][0]["category"], "build");
     assert_eq!(report["categories"][0]["failed_or_cancelled"], 1);
     assert!(!String::from_utf8_lossy(&output.stdout).contains("private-project"));
 }

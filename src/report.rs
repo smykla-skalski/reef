@@ -38,6 +38,9 @@ pub struct Options {
     /// Report format.
     #[arg(long, value_enum, default_value_t = Format::Markdown)]
     format: Format,
+    /// Include individual pressure samples in the report.
+    #[arg(long)]
+    timeline: bool,
     /// CPU usage threshold, as a percentage.
     #[arg(long, default_value_t = 90)]
     cpu_threshold: u8,
@@ -115,6 +118,7 @@ struct AgentData {
 #[derive(Debug, Deserialize)]
 struct Measurement {
     category: String,
+    agent_kind: Option<String>,
     status: String,
     started_at_unix_ms: u128,
     ended_at_unix_ms: u128,
@@ -135,10 +139,13 @@ struct Report {
     command_measurements_available: bool,
     command_count: Option<usize>,
     categories: Option<Vec<CategoryReport>>,
+    agent_commands: Option<Vec<AgentCategoryReport>>,
     peak_host_memory_bytes: Option<u64>,
     swap_growth_bytes: Option<i128>,
     peak_command_concurrency: Option<usize>,
     pressure: PressureReport,
+    pressure_overlap: PressureOverlap,
+    #[serde(skip_serializing)]
     timeline: Vec<PressureEvent>,
     agents: Option<Vec<AgentLoad>>,
     scheduler: Option<schedule_events::Summary>,
@@ -155,6 +162,16 @@ struct CategoryReport {
     wall_percent_of_measured: f64,
     cpu_ms: u128,
     cpu_percent_of_measured: f64,
+    peak_memory_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct AgentCategoryReport {
+    agent: &'static str,
+    category: &'static str,
+    count: usize,
+    wall_ms: u128,
+    cpu_ms: u128,
     peak_memory_bytes: u64,
 }
 
@@ -183,6 +200,28 @@ struct PressureReport {
     any_above_ms: Option<u128>,
 }
 
+#[derive(Default, Serialize)]
+struct PressureOverlap {
+    measured_command_ms: Option<u128>,
+    no_measured_command_ms: Option<u128>,
+    by_category: Option<Vec<OverlapDuration>>,
+    sampled_agent_coverage_ms: Option<u128>,
+    by_agent: Option<Vec<OverlapDuration>>,
+}
+
+#[derive(Serialize)]
+struct OverlapDuration {
+    name: &'static str,
+    overlap_ms: u128,
+}
+
+#[derive(Serialize)]
+struct ReportWithTimeline<'a> {
+    #[serde(flatten)]
+    report: &'a Report,
+    timeline: &'a [PressureEvent],
+}
+
 #[derive(Serialize)]
 struct PressureEvent {
     from_unix_ms: u128,
@@ -199,6 +238,15 @@ fn agent_kind(value: &str) -> &'static str {
         "claude" => "claude",
         "opencode" => "opencode",
         _ => "other",
+    }
+}
+
+fn measured_agent_kind(value: Option<&str>) -> Option<&'static str> {
+    match value? {
+        "codex" => Some("codex"),
+        "claude" => Some("claude"),
+        "opencode" => Some("opencode"),
+        _ => None,
     }
 }
 
@@ -406,6 +454,31 @@ fn pressure_triggers([cpu, memory, swap]: [Option<bool>; 3]) -> Vec<&'static str
     triggers
 }
 
+fn add_pressure_sample(
+    pressure: &mut PressureReport,
+    missing: &mut [bool; 4],
+    sample: &Observation,
+    thresholds: (u8, u8, u8),
+    duration: u128,
+) -> Vec<&'static str> {
+    let [cpu, memory, swap] = pressure_flags(sample, thresholds);
+    add_duration(&mut pressure.cpu_above_ms, &mut missing[0], cpu, duration);
+    add_duration(
+        &mut pressure.memory_above_ms,
+        &mut missing[1],
+        memory,
+        duration,
+    );
+    add_duration(&mut pressure.swap_above_ms, &mut missing[2], swap, duration);
+    add_duration(
+        &mut pressure.any_above_ms,
+        &mut missing[3],
+        any_pressure([cpu, memory, swap]),
+        duration,
+    );
+    pressure_triggers([cpu, memory, swap])
+}
+
 fn peak_concurrency(records: &[Measurement], from: u128, to: u128) -> usize {
     let mut events = Vec::new();
     for record in records {
@@ -458,6 +531,39 @@ fn category_reports(records: &[Measurement]) -> Vec<CategoryReport> {
         .collect()
 }
 
+fn agent_command_reports(records: &[Measurement]) -> Vec<AgentCategoryReport> {
+    let mut groups: BTreeMap<(&'static str, &'static str), AgentCategoryReport> = BTreeMap::new();
+    for record in records {
+        let Some(agent) = measured_agent_kind(record.agent_kind.as_deref()) else {
+            continue;
+        };
+        let category = category(&record.category);
+        let group = groups
+            .entry((agent, category))
+            .or_insert(AgentCategoryReport {
+                agent,
+                category,
+                count: 0,
+                wall_ms: 0,
+                cpu_ms: 0,
+                peak_memory_bytes: 0,
+            });
+        group.count += 1;
+        group.wall_ms += record.wall_ms;
+        group.cpu_ms += record.tree_cpu_ms;
+        group.peak_memory_bytes = group.peak_memory_bytes.max(record.tree_peak_memory_bytes);
+    }
+    let mut groups: Vec<_> = groups.into_values().collect();
+    groups.sort_by(|left, right| {
+        right
+            .cpu_ms
+            .cmp(&left.cpu_ms)
+            .then_with(|| left.agent.cmp(right.agent))
+            .then_with(|| left.category.cmp(right.category))
+    });
+    groups
+}
+
 fn pressure_event(
     start: u128,
     end: u128,
@@ -495,6 +601,124 @@ fn pressure_event(
         overlapping_categories,
         overlapping_agents,
         attribution,
+    }
+}
+
+fn covered_ms(intervals: &mut [(u128, u128)]) -> u128 {
+    intervals.sort_unstable();
+    let mut covered = 0_u128;
+    let mut end = 0_u128;
+    for &(start, next_end) in intervals.iter() {
+        covered += next_end.saturating_sub(start.max(end));
+        end = end.max(next_end);
+    }
+    covered
+}
+
+fn measured_pressure_overlap(
+    records: &[Measurement],
+    start: u128,
+    end: u128,
+) -> (u128, BTreeMap<&'static str, u128>) {
+    let mut all = Vec::new();
+    let mut by_category: BTreeMap<&'static str, Vec<(u128, u128)>> = BTreeMap::new();
+    for record in records {
+        let overlap_start = record.started_at_unix_ms.max(start);
+        let overlap_end = record.ended_at_unix_ms.min(end);
+        if overlap_start < overlap_end {
+            let interval = (overlap_start, overlap_end);
+            all.push(interval);
+            by_category
+                .entry(category(&record.category))
+                .or_default()
+                .push(interval);
+        }
+    }
+    (
+        covered_ms(&mut all),
+        by_category
+            .into_iter()
+            .map(|(name, mut intervals)| (name, covered_ms(&mut intervals)))
+            .collect(),
+    )
+}
+
+fn overlap_durations(groups: BTreeMap<&'static str, u128>) -> Vec<OverlapDuration> {
+    let mut durations: Vec<_> = groups
+        .into_iter()
+        .map(|(name, overlap_ms)| OverlapDuration { name, overlap_ms })
+        .collect();
+    durations.sort_by(|left, right| {
+        right
+            .overlap_ms
+            .cmp(&left.overlap_ms)
+            .then_with(|| left.name.cmp(right.name))
+    });
+    durations
+}
+
+struct PressureOverlapAccumulator {
+    report: PressureOverlap,
+    categories: BTreeMap<&'static str, u128>,
+    agents: BTreeMap<&'static str, u128>,
+}
+
+impl PressureOverlapAccumulator {
+    fn new(records_available: bool, agent_samples_available: bool) -> Self {
+        Self {
+            report: PressureOverlap {
+                measured_command_ms: records_available.then_some(0),
+                no_measured_command_ms: records_available.then_some(0),
+                sampled_agent_coverage_ms: agent_samples_available.then_some(0),
+                ..PressureOverlap::default()
+            },
+            categories: BTreeMap::new(),
+            agents: BTreeMap::new(),
+        }
+    }
+
+    fn add(
+        &mut self,
+        records: Option<&[Measurement]>,
+        agents: Option<&[AgentSample]>,
+        start: u128,
+        end: u128,
+    ) {
+        let duration = end - start;
+        if let Some(records) = records {
+            let (measured, categories) = measured_pressure_overlap(records, start, end);
+            if let Some(total) = &mut self.report.measured_command_ms {
+                *total += measured;
+            }
+            if let Some(total) = &mut self.report.no_measured_command_ms {
+                *total += duration - measured;
+            }
+            for (name, overlap_ms) in categories {
+                *self.categories.entry(name).or_insert(0) += overlap_ms;
+            }
+        }
+        if let Some(agents) = agents {
+            if let Some(coverage) = &mut self.report.sampled_agent_coverage_ms {
+                *coverage += duration;
+            }
+            for name in agents
+                .iter()
+                .map(|agent| agent_kind(&agent.kind))
+                .collect::<BTreeSet<_>>()
+            {
+                *self.agents.entry(name).or_insert(0) += duration;
+            }
+        }
+    }
+
+    fn finish(mut self) -> PressureOverlap {
+        if self.report.measured_command_ms.is_some() {
+            self.report.by_category = Some(overlap_durations(self.categories));
+        }
+        if self.report.sampled_agent_coverage_ms.is_some() {
+            self.report.by_agent = Some(overlap_durations(self.agents));
+        }
+        self.report
     }
 }
 
@@ -683,6 +907,9 @@ fn build_report_with_ticks(
         swap_threshold_percent: thresholds.2,
         ..PressureReport::default()
     };
+    let agent_sample_coverage = samples.iter().any(|sample| sample.agents.is_some());
+    let mut pressure_overlap =
+        PressureOverlapAccumulator::new(records.is_some(), agent_sample_coverage);
     let mut timeline = Vec::new();
     let mut observed_working_ms = 0_u128;
     let mut covered_until = from_ms;
@@ -706,19 +933,10 @@ fn build_report_with_ticks(
         {
             accumulate_agents(&mut agent_load, agent_samples, duration);
         }
-        let [cpu, memory, swap] = pressure_flags(sample, thresholds);
-        add_duration(&mut pressure.cpu_above_ms, &mut missing[0], cpu, duration);
-        add_duration(
-            &mut pressure.memory_above_ms,
-            &mut missing[1],
-            memory,
-            duration,
-        );
-        add_duration(&mut pressure.swap_above_ms, &mut missing[2], swap, duration);
-        let any = any_pressure([cpu, memory, swap]);
-        add_duration(&mut pressure.any_above_ms, &mut missing[3], any, duration);
-        let triggers = pressure_triggers([cpu, memory, swap]);
+        let triggers =
+            add_pressure_sample(&mut pressure, &mut missing, sample, thresholds, duration);
         if !triggers.is_empty() && duration > 0 {
+            pressure_overlap.add(records.as_deref(), sample.agents.as_deref(), start, end);
             timeline.push(pressure_event(
                 start,
                 end,
@@ -728,6 +946,7 @@ fn build_report_with_ticks(
             ));
         }
     }
+    let pressure_overlap = pressure_overlap.finish();
     accumulate_agent_ticks(&mut agent_load, &agent_ticks, from_ms, to_ms);
     accumulate_agent_rollups(&mut agent_load, &agent_rollups);
     let peak_host_memory_bytes = samples.iter().filter_map(|s| s.memory_used_bytes).max();
@@ -739,6 +958,9 @@ fn build_report_with_ticks(
         .map(|records| peak_concurrency(records, from_ms, to_ms));
     let command_count = records.as_ref().map(Vec::len);
     let categories = records.as_ref().map(|records| category_reports(records));
+    let agent_commands = records
+        .as_ref()
+        .map(|records| agent_command_reports(records));
     Report {
         from: from.to_rfc3339(),
         to: to.to_rfc3339(),
@@ -756,10 +978,12 @@ fn build_report_with_ticks(
         command_measurements_available: records.is_some(),
         command_count,
         categories,
+        agent_commands,
         peak_host_memory_bytes,
         swap_growth_bytes,
         peak_command_concurrency,
         pressure,
+        pressure_overlap,
         timeline,
         agents: agents_available.then(|| agent_load.into_values().collect()),
         scheduler,
@@ -770,6 +994,27 @@ fn build_report_with_ticks(
 
 fn printable<T: std::fmt::Display>(value: Option<T>) -> String {
     value.map_or_else(|| "unavailable".to_owned(), |value| value.to_string())
+}
+
+fn readable_duration(value: Option<u128>) -> String {
+    let Some(ms) = value else {
+        return "unavailable".to_owned();
+    };
+    if ms < 1_000 {
+        return format!("{ms} ms");
+    }
+    let seconds = ms / 1_000;
+    let hours = seconds / 3_600;
+    let minutes = seconds % 3_600 / 60;
+    let seconds = seconds % 60;
+    let label = if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    };
+    format!("{label} ({ms} ms)")
 }
 
 fn scheduler_markdown(scheduler: Option<&schedule_events::Summary>) -> String {
@@ -829,16 +1074,124 @@ fn agents_markdown(agents: Option<&[AgentLoad]>) -> String {
     out
 }
 
+fn agent_commands_markdown(commands: Option<&[AgentCategoryReport]>) -> String {
+    let mut out = String::from("\n## Measured commands by agent\n\n");
+    match commands {
+        Some(commands) if !commands.is_empty() => {
+            out.push_str("Only commands launched through a Reef agent session carry this agent label. Passive hooks do not identify builds or linters.\n\n");
+            out.push_str("| Agent | Category | Count | Wall ms | CPU ms | Peak memory bytes |\n| --- | --- | ---: | ---: | ---: | ---: |\n");
+            for group in commands {
+                let _ = writeln!(
+                    out,
+                    "| {} | {} | {} | {} | {} | {} |",
+                    group.agent,
+                    group.category,
+                    group.count,
+                    group.wall_ms,
+                    group.cpu_ms,
+                    group.peak_memory_bytes
+                );
+            }
+        }
+        Some(_) => out.push_str("No agent-tagged command measurements in this range. Passive hooks alone do not identify builds or linters.\n"),
+        None => out.push_str("Unavailable: no command history.\n"),
+    }
+    out
+}
+
+#[cfg(test)]
 fn markdown(report: &Report) -> String {
+    markdown_with_timeline(report, false)
+}
+
+fn pressure_markdown(report: &Report) -> String {
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        "\n## Pressure\n\n- CPU >= {}%: {}\n- Memory >= {}%: {}\n- Swap >= {}%: {}\n- Any threshold: {}\n- With a measured command: {}\n- Without a measured command: {}\n- With agent sample data: {}\n",
+        report.pressure.cpu_threshold_percent,
+        readable_duration(report.pressure.cpu_above_ms),
+        report.pressure.memory_threshold_percent,
+        readable_duration(report.pressure.memory_above_ms),
+        report.pressure.swap_threshold_percent,
+        readable_duration(report.pressure.swap_above_ms),
+        readable_duration(report.pressure.any_above_ms),
+        readable_duration(report.pressure_overlap.measured_command_ms),
+        readable_duration(report.pressure_overlap.no_measured_command_ms),
+        readable_duration(report.pressure_overlap.sampled_agent_coverage_ms),
+    );
+    out.push_str("\nOverlap is concurrent activity, not proof of cause. Category times use measured command intervals; agent times are process-sample estimates. Concurrent groups can exceed total pressure time.\n");
+    if let Some(categories) = &report.pressure_overlap.by_category
+        && !categories.is_empty()
+    {
+        out.push_str("\nMeasured command categories during pressure:\n\n| Category | Overlap ms |\n| --- | ---: |\n");
+        for category in categories {
+            let _ = writeln!(out, "| {} | {} |", category.name, category.overlap_ms);
+        }
+    }
+    if let Some(agents) = &report.pressure_overlap.by_agent
+        && !agents.is_empty()
+    {
+        out.push_str(
+            "\nSampled agents during pressure:\n\n| Agent | Overlap ms |\n| --- | ---: |\n",
+        );
+        for agent in agents {
+            let _ = writeln!(out, "| {} | {} |", agent.name, agent.overlap_ms);
+        }
+    }
+    out
+}
+
+fn timeline_markdown(events: &[PressureEvent]) -> String {
+    let mut out = String::from("\n## Pressure timeline\n\n");
+    if events.is_empty() {
+        out.push_str("No recorded pressure events.\n");
+    } else {
+        out.push_str("Sample overlap does not establish cause.\n\n");
+        for event in events {
+            let categories = event.overlapping_categories.as_ref().map_or_else(
+                || "unavailable".to_owned(),
+                |categories| {
+                    if categories.is_empty() {
+                        "none measured (host activity unattributed)".to_owned()
+                    } else {
+                        categories.join(", ")
+                    }
+                },
+            );
+            let _ = writeln!(
+                out,
+                "- {}..{} ms: {}; overlapping categories: {}; overlapping agents: {}",
+                event.from_unix_ms,
+                event.to_unix_ms,
+                event.triggers.join(", "),
+                categories,
+                event.overlapping_agents.as_ref().map_or_else(
+                    || "unavailable".to_owned(),
+                    |agents| {
+                        if agents.is_empty() {
+                            "none".to_owned()
+                        } else {
+                            agents.join(", ")
+                        }
+                    }
+                )
+            );
+        }
+    }
+    out
+}
+
+fn markdown_with_timeline(report: &Report, include_timeline: bool) -> String {
     let mut out = format!(
-        "# Reef workload report\n\n- Range: {} to {} (end exclusive)\n- Empty: {}\n- Host observations: {}\n- Agent observations: {}\n- Agent rollups: {}\n- Observed working time: {} ms\n- Peak host memory: {} bytes\n- Swap growth: {} bytes\n- Peak command concurrency: {}\n\n",
+        "# Reef workload report\n\n- Range: {} to {} (end exclusive)\n- Empty: {}\n- Host observations: {}\n- Agent observations: {}\n- Agent rollups: {}\n- Observed working time: {}\n- Peak host memory: {} bytes\n- Swap growth: {} bytes\n- Peak command concurrency: {}\n\n",
         report.from,
         report.to,
         report.empty,
         report.observation_count,
         report.agent_observation_count,
         report.agent_rollup_count,
-        report.observed_working_ms,
+        readable_duration(Some(report.observed_working_ms)),
         printable(report.peak_host_memory_bytes),
         printable(report.swap_growth_bytes),
         printable(report.peak_command_concurrency),
@@ -869,54 +1222,11 @@ fn markdown(report: &Report) -> String {
             "No command history is available. Host activity is uninstrumented or unknown.\n",
         );
     }
+    out.push_str(&agent_commands_markdown(report.agent_commands.as_deref()));
     out.push_str(&agents_markdown(report.agents.as_deref()));
-    let _ = write!(
-        out,
-        "\n## Pressure\n\n- CPU >= {}%: {} ms\n- Memory >= {}%: {} ms\n- Swap >= {}%: {} ms\n- Any threshold: {} ms\n\n## Pressure timeline\n\n",
-        report.pressure.cpu_threshold_percent,
-        printable(report.pressure.cpu_above_ms),
-        report.pressure.memory_threshold_percent,
-        printable(report.pressure.memory_above_ms),
-        report.pressure.swap_threshold_percent,
-        printable(report.pressure.swap_above_ms),
-        printable(report.pressure.any_above_ms)
-    );
-    if report.timeline.is_empty() {
-        out.push_str("No recorded pressure events.\n");
-    } else {
-        out.push_str(
-            "Categories overlapped these samples in time; overlap does not establish cause.\n\n",
-        );
-        for event in &report.timeline {
-            let categories = event.overlapping_categories.as_ref().map_or_else(
-                || "unavailable".to_owned(),
-                |categories| {
-                    if categories.is_empty() {
-                        "none measured (host activity unattributed)".to_owned()
-                    } else {
-                        categories.join(", ")
-                    }
-                },
-            );
-            let _ = writeln!(
-                out,
-                "- {}..{} ms: {}; overlapping categories: {}; overlapping agents: {}",
-                event.from_unix_ms,
-                event.to_unix_ms,
-                event.triggers.join(", "),
-                categories,
-                event.overlapping_agents.as_ref().map_or_else(
-                    || "unavailable".to_owned(),
-                    |agents| {
-                        if agents.is_empty() {
-                            "none".to_owned()
-                        } else {
-                            agents.join(", ")
-                        }
-                    }
-                )
-            );
-        }
+    out.push_str(&pressure_markdown(report));
+    if include_timeline {
+        out.push_str(&timeline_markdown(&report.timeline));
     }
     out.push_str(&scheduler_markdown(report.scheduler.as_ref()));
     #[cfg(unix)]
@@ -1008,7 +1318,14 @@ pub fn run(options: &Options) -> io::Result<()> {
         report
     };
     match options.format {
-        Format::Markdown => print!("{}", markdown(&report)),
+        Format::Markdown => print!("{}", markdown_with_timeline(&report, options.timeline)),
+        Format::Json if options.timeline => println!(
+            "{}",
+            serde_json::to_string_pretty(&ReportWithTimeline {
+                report: &report,
+                timeline: &report.timeline,
+            })?
+        ),
         Format::Json => println!("{}", serde_json::to_string_pretty(&report)?),
     }
     Ok(())
@@ -1033,6 +1350,16 @@ mod tests {
             swap_total_bytes: Some(1000),
             agents: None,
         }
+    }
+
+    #[test]
+    fn overview_uses_readable_durations_without_losing_precision() {
+        assert_eq!(readable_duration(Some(100)), "100 ms");
+        assert_eq!(
+            readable_duration(Some(52_530_000)),
+            "14h 35m 30s (52530000 ms)"
+        );
+        assert_eq!(readable_duration(None), "unavailable");
     }
 
     #[test]
@@ -1068,6 +1395,7 @@ mod tests {
     fn command(category: &str, start: u128, end: u128, cpu: u128) -> Measurement {
         Measurement {
             category: category.to_owned(),
+            agent_kind: None,
             status: "success".to_owned(),
             started_at_unix_ms: start,
             ended_at_unix_ms: end,
@@ -1109,6 +1437,112 @@ mod tests {
         assert_eq!(categories.len(), 2);
         assert_eq!(categories[0].wall_percent_of_measured, 50.0);
         assert_eq!(categories[0].cpu_percent_of_measured, 80.0);
+    }
+
+    #[test]
+    fn overview_uses_exact_command_overlap_and_hides_timestamps() {
+        let mut observation = sample(1_000, Some(95.0), Some(10));
+        observation.working_ms = 1_000;
+        observation.agents = Some(vec![AgentSample {
+            kind: "codex".to_owned(),
+            root_pid: 42,
+            process_count: 1,
+            cpu_percent: Some(50.0),
+            memory_bytes: 100,
+            read_bytes: None,
+            written_bytes: None,
+        }]);
+        let report = build_report(
+            date(0),
+            date(1_000),
+            vec![observation],
+            Some(vec![
+                command("build", 100, 500, 10),
+                command("lint", 300, 700, 10),
+            ]),
+            (90, 90, 1),
+            None,
+        );
+        assert_eq!(report.pressure.any_above_ms, Some(1_000));
+        assert_eq!(report.pressure_overlap.measured_command_ms, Some(600));
+        assert_eq!(report.pressure_overlap.no_measured_command_ms, Some(400));
+        assert_eq!(
+            report.pressure_overlap.by_category.as_ref().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            report.pressure_overlap.by_category.as_ref().unwrap()[0].overlap_ms,
+            400
+        );
+        assert_eq!(
+            report.pressure_overlap.sampled_agent_coverage_ms,
+            Some(1_000)
+        );
+        assert_eq!(
+            report.pressure_overlap.by_agent.as_ref().unwrap()[0].name,
+            "codex"
+        );
+        assert_eq!(
+            report.pressure_overlap.by_agent.as_ref().unwrap()[0].overlap_ms,
+            1_000
+        );
+        assert!(!markdown(&report).contains("Pressure timeline"));
+        assert!(markdown_with_timeline(&report, true).contains("Pressure timeline"));
+        assert!(
+            serde_json::to_value(&report)
+                .unwrap()
+                .get("timeline")
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::to_value(ReportWithTimeline {
+                report: &report,
+                timeline: &report.timeline,
+            })
+            .unwrap()["timeline"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_commands_in_one_category_count_once() {
+        let (measured, categories) = measured_pressure_overlap(
+            &[
+                command("build", 100, 500, 10),
+                command("build", 300, 700, 10),
+            ],
+            0,
+            1_000,
+        );
+        assert_eq!(measured, 600);
+        assert_eq!(categories["build"], 600);
+    }
+
+    #[test]
+    fn measured_commands_are_grouped_by_valid_agent_and_category() {
+        let mut build = command("build", 100, 200, 80);
+        build.agent_kind = Some("codex".to_owned());
+        let mut lint = command("lint", 200, 300, 20);
+        lint.agent_kind = Some("codex".to_owned());
+        let mut unknown = command("build", 300, 400, 10);
+        unknown.agent_kind = Some("private-agent-name".to_owned());
+        let report = build_report(
+            date(0),
+            date(500),
+            vec![],
+            Some(vec![build, lint, unknown]),
+            (90, 90, 1),
+            None,
+        );
+        let groups = report.agent_commands.as_ref().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!((groups[0].agent, groups[0].category), ("codex", "build"));
+        assert_eq!(groups[0].cpu_ms, 80);
+        assert_eq!((groups[1].agent, groups[1].category), ("codex", "lint"));
+        assert!(!markdown(&report).contains("private-agent-name"));
     }
 
     #[test]
@@ -1156,7 +1590,8 @@ mod tests {
             "no_measured_command_overlap"
         );
         assert_eq!(report.timeline[0].overlapping_categories, Some(vec![]));
-        assert!(markdown(&report).contains("host activity unattributed"));
+        assert_eq!(report.pressure_overlap.no_measured_command_ms, Some(100));
+        assert!(markdown(&report).contains("Without a measured command: 100 ms"));
     }
 
     #[test]
