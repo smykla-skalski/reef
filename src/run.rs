@@ -45,6 +45,8 @@ pub enum AdmissionStatus {
 struct Measurement<'a> {
     category: &'a str,
     identity: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_kind: Option<&'static str>,
     status: &'a str,
     exit_code: Option<i32>,
     signal: Option<i32>,
@@ -197,6 +199,7 @@ pub fn run_with_limits(
     let measurement = Measurement {
         category,
         identity,
+        agent_kind: measured_agent_kind(),
         status,
         exit_code,
         signal: signal.or(forwarded),
@@ -368,6 +371,7 @@ fn spawn_failed(
     let measurement = Measurement {
         category,
         identity,
+        agent_kind: measured_agent_kind(),
         status: "failed",
         exit_code: Some(code),
         signal: None,
@@ -391,6 +395,15 @@ fn unix_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+fn measured_agent_kind() -> Option<&'static str> {
+    match std::env::var("REEF_AGENT_KIND").ok()?.as_str() {
+        "codex" => Some("codex"),
+        "claude" => Some("claude"),
+        "opencode" => Some("opencode"),
+        _ => None,
+    }
 }
 
 fn command_process(
