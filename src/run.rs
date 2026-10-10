@@ -157,6 +157,7 @@ pub fn run_with_limits(
         admission.is_some(),
         containment.as_ref(),
         supervisor.group(),
+        supervisor.owner(),
     )?;
     let mut child = match process.spawn() {
         Ok(child) => child,
@@ -189,12 +190,8 @@ pub fn run_with_limits(
     let cpu_ms = (result.rusage.utime + result.rusage.stime).as_millis();
     let signal = exit_signal;
     let exit_code = result.status.code();
-    let status = run_status(
-        scheduler_cancelled,
-        forwarded,
-        signal,
-        result.status.success(),
-    );
+    let success = result.status.success();
+    let status = run_status(scheduler_cancelled, forwarded, signal, success);
     let measurement = Measurement {
         category,
         identity,
@@ -236,7 +233,7 @@ pub fn run_with_limits(
     if let Some(lease) = admission.as_mut() {
         lease.finished(status)?;
     }
-    supervisor.disarm()?;
+    finish_supervisor(&mut supervisor, scheduler_cancelled || forwarded.is_some())?;
     if scheduler_cancelled {
         return Ok(130);
     }
@@ -244,6 +241,14 @@ pub fn run_with_limits(
         || 128_u8.saturating_add(u8::try_from(signal.or(forwarded).unwrap_or(1)).unwrap_or(1)),
         |code| u8::try_from(code).unwrap_or(1),
     ))
+}
+
+fn finish_supervisor(supervisor: &mut platform::Supervisor, stop: bool) -> io::Result<()> {
+    if stop {
+        supervisor.stop()
+    } else {
+        supervisor.disarm()
+    }
 }
 
 fn run_status(
@@ -437,6 +442,7 @@ fn command_process(
     scheduled: bool,
     containment: Option<&Containment>,
     group: u32,
+    owner: &str,
 ) -> io::Result<Command> {
     let command = if let Some(scope) = containment {
         let process = scope.command(command)?;
@@ -464,6 +470,7 @@ fn command_process(
     if scheduled {
         process.env("REEF_ADMITTED", "1");
     }
+    process.env("REEF_RUN_OWNER", owner);
     platform::isolate(&mut process, group)?;
     Ok(process)
 }

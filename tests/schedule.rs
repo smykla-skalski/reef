@@ -563,6 +563,59 @@ fn interrupt_does_not_remove_launcher_death_supervision() {
 }
 
 #[test]
+fn detached_command_helper() {
+    if std::env::var_os("REEF_DETACHED_CHILD_MARKER").is_none() {
+        return;
+    }
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "detached_child_helper", "--nocapture"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn detached_child_helper() {
+    let Some(marker) = std::env::var_os("REEF_DETACHED_CHILD_MARKER") else {
+        return;
+    };
+    nix::unistd::setsid().unwrap();
+    fs::write(marker, std::process::id().to_string()).unwrap();
+    std::thread::sleep(Duration::from_secs(30));
+}
+
+#[test]
+fn launcher_death_stops_detached_descendant_and_releases_lease() {
+    let fixture = Fixture::new();
+    let marker = fixture.path.join("detached-child");
+    let test_binary = std::env::current_exe().unwrap();
+    let mut launcher = fixture
+        .schedule(&[
+            test_binary.to_str().unwrap(),
+            "--exact",
+            "detached_command_helper",
+            "--nocapture",
+        ])
+        .env("REEF_DETACHED_CHILD_MARKER", &marker)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    Fixture::wait_until(|| marker.exists());
+    let child_pid: i32 = fs::read_to_string(&marker).unwrap().parse().unwrap();
+    assert!(process_running(child_pid));
+    assert!(has_job(&fixture.jobs(), "running"));
+
+    kill(
+        Pid::from_raw(i32::try_from(launcher.id()).unwrap()),
+        Signal::SIGKILL,
+    )
+    .unwrap();
+    launcher.wait().unwrap();
+    Fixture::wait_until(|| !process_running(child_pid) && fixture.jobs().is_empty());
+}
+
+#[test]
 fn cancelling_a_running_request_stops_its_process_group() {
     let fixture = Fixture::new();
     let ready = fixture.path.join("started");

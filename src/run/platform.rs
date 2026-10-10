@@ -9,11 +9,17 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use sysinfo::{ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
+
+const OWNER_ENV: &str = "REEF_RUN_OWNER";
+const OWNER_BYTES: usize = 40;
 
 pub struct Supervisor {
     process: Child,
     control: Option<ChildStdin>,
     group: u32,
+    owner: String,
 }
 
 impl Supervisor {
@@ -27,11 +33,11 @@ impl Supervisor {
             .spawn()?;
         let control = process.stdin.take();
         let mut group = [0; 4];
-        if let Err(error) = process
-            .stdout
-            .take()
-            .expect("piped stdout")
+        let mut owner = [0; OWNER_BYTES];
+        let mut output = process.stdout.take().expect("piped stdout");
+        if let Err(error) = output
             .read_exact(&mut group)
+            .and_then(|()| output.read_exact(&mut owner))
         {
             drop(control);
             let _ = process.wait();
@@ -41,11 +47,28 @@ impl Supervisor {
             process,
             control,
             group: u32::from_ne_bytes(group),
+            owner: String::from_utf8(owner.to_vec()).map_err(std::io::Error::other)?,
         })
     }
 
     pub fn group(&self) -> u32 {
         self.group
+    }
+
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    pub fn stop(&mut self) -> std::io::Result<()> {
+        self.control.take();
+        let status = self.process.wait()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                "command supervisor failed to stop descendants",
+            ))
+        }
     }
 
     pub fn disarm(&mut self) -> std::io::Result<()> {
@@ -80,8 +103,17 @@ pub fn supervise() -> std::io::Result<()> {
         .stderr(Stdio::null())
         .spawn()?;
     let mut stdout = std::io::stdout();
+    let owner = format!(
+        "{:08x}{:032x}",
+        leader.id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
     if let Err(error) = stdout
         .write_all(&leader.id().to_ne_bytes())
+        .and_then(|()| stdout.write_all(owner.as_bytes()))
         .and_then(|()| stdout.flush())
     {
         let _ = force_stop(leader.id());
@@ -99,9 +131,47 @@ pub fn supervise() -> std::io::Result<()> {
     if !disarmed {
         let _ = force_stop(leader.id());
     }
+    let cleanup = if disarmed { Ok(()) } else { stop_owned(&owner) };
     let _ = leader.kill();
     let _ = leader.wait();
-    Ok(())
+    cleanup
+}
+
+fn stop_owned(owner: &str) -> std::io::Result<()> {
+    let mut system = System::new();
+    let refresh = ProcessRefreshKind::nothing()
+        .with_environ(UpdateKind::Always)
+        .without_tasks();
+    let marker = std::ffi::OsString::from(format!("{OWNER_ENV}={owner}"));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        system.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
+        let mut live = false;
+        for (&pid, process) in system.processes() {
+            if process.status() == ProcessStatus::Zombie
+                || !process.environ().iter().any(|entry| entry == &marker)
+            {
+                continue;
+            }
+            live = true;
+            match kill(
+                Pid::from_raw(i32::try_from(pid.as_u32()).map_err(std::io::Error::other)?),
+                Signal::SIGKILL,
+            ) {
+                Ok(()) | Err(Errno::ESRCH) => {}
+                Err(error) => return Err(std::io::Error::other(error)),
+            }
+        }
+        if !live {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::other(
+                "owned descendants survived supervisor cleanup",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 pub fn hold_group() -> ! {
