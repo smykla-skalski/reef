@@ -7,7 +7,11 @@ pub fn spawn_detached(options: &ObserveOptions, dir: &Path) -> io::Result<Child>
     #[cfg(unix)]
     let mut command = {
         let mut command = Command::new("nohup");
-        command.arg(std::env::current_exe()?);
+        let executable = match super::reload::stable_invocation() {
+            Some((path, _)) => path,
+            None => std::env::current_exe()?,
+        };
+        command.arg(executable);
         command
     };
     #[cfg(not(unix))]
