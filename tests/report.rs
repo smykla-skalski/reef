@@ -159,7 +159,10 @@ fn overview_shows_agent_host_samples_and_readable_memory() {
     assert!(markdown.contains("Peak host memory: 4.0 GiB"));
     assert!(markdown.contains("Swap growth: -1.0 GiB"));
     assert!(markdown.contains("| build | 1 | 0 | 1000 | 100.0 | 500 | 100.0 | 3.0 MiB |"));
-    assert!(markdown.contains("| codex | 1 | 0 | 0.0 | 1.0 GiB | 2.0 GiB | 2.0 KiB | 1 | 1 |"));
+    assert!(
+        markdown.contains("| codex | 1 | 0 | 0.0 | 1.0 GiB | 2.0 GiB | 2.0 KiB | 1 | 1 |"),
+        "{markdown}"
+    );
 
     let json = reef()
         .args(args)
