@@ -274,9 +274,9 @@ fn markdown(comparison: &ComparisonReport) -> String {
             printable(later.pressure_ms_per_observed_hour.any),
         ),
         (
-            "Swap growth bytes",
-            printable(baseline.swap_growth_bytes),
-            printable(later.swap_growth_bytes),
+            "Swap growth",
+            readable_optional_bytes(baseline.swap_growth_bytes),
+            readable_optional_bytes(later.swap_growth_bytes),
         ),
         (
             "Completed commands",

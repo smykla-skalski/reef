@@ -122,6 +122,64 @@ fn timeline_requires_explicit_flag_in_both_formats() {
     assert_eq!(detailed_json["timeline"].as_array().unwrap().len(), 1);
 }
 
+#[test]
+fn overview_shows_agent_host_samples_and_readable_memory() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.join("samples-test.jsonl"),
+        concat!(
+            "{\"at_unix_ms\":1767225601000,\"working_ms\":1000,\"memory_used_bytes\":3221225472,\"swap_used_bytes\":2147483648,\"agents\":[{\"kind\":\"codex\",\"root_pid\":42,\"process_count\":1,\"memory_bytes\":1073741824,\"read_bytes\":2147483648,\"written_bytes\":2048}]}\n",
+            "{\"at_unix_ms\":1767225602000,\"working_ms\":1000,\"memory_used_bytes\":4294967296,\"swap_used_bytes\":1073741824,\"agents\":[]}\n",
+        ),
+    )
+    .unwrap();
+    let records = fixture.0.join("measurements.jsonl");
+    fs::write(&records, "{\"category\":\"build\",\"status\":\"success\",\"started_at_unix_ms\":1767225600000,\"ended_at_unix_ms\":1767225601000,\"wall_ms\":1000,\"tree_cpu_ms\":500,\"tree_peak_memory_bytes\":3145728}\n").unwrap();
+    let args = [
+        "report",
+        "--from",
+        "2026-01-01T00:00:00Z",
+        "--to",
+        "2026-01-01T00:00:03Z",
+        "--state-dir",
+    ];
+    let markdown = reef()
+        .args(args)
+        .arg(&fixture.0)
+        .arg("--records")
+        .arg(&records)
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+    assert!(markdown.status.success(), "{markdown:?}");
+    let markdown = String::from_utf8(markdown.stdout).unwrap();
+    assert!(markdown.contains("Host observations with agents: 1"));
+    assert!(!markdown.contains("Agent observations:"));
+    assert!(!markdown.contains("Agent rollups:"));
+    assert!(markdown.contains("Peak host memory: 4.0 GiB"));
+    assert!(markdown.contains("Swap growth: -1.0 GiB"));
+    assert!(markdown.contains("| build | 1 | 0 | 1000 | 100.0 | 500 | 100.0 | 3.0 MiB |"));
+    assert!(markdown.contains("| codex | 1 | 0 | 0.0 | 1.0 GiB | 2.0 GiB | 2.0 KiB | 1 | 1 |"));
+
+    let json = reef()
+        .args(args)
+        .arg(&fixture.0)
+        .arg("--records")
+        .arg(&records)
+        .args(["--format", "json"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+    assert!(json.status.success(), "{json:?}");
+    let json: Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(json["host_observations_with_agents"], 1);
+    assert_eq!(json["agent_observation_count"], 0);
+    assert_eq!(json["agent_rollup_count"], 0);
+    assert_eq!(json["peak_host_memory_bytes"], 4_294_967_296_u64);
+    assert_eq!(json["swap_growth_bytes"], -1_073_741_824_i64);
+    assert_eq!(json["categories"][0]["peak_memory_bytes"], 3_145_728);
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_reports_missing_scheduler_history_as_unavailable() {

@@ -133,6 +133,7 @@ struct Report {
     to: String,
     empty: bool,
     observation_count: usize,
+    host_observations_with_agents: usize,
     agent_observation_count: usize,
     agent_rollup_count: usize,
     observed_working_ms: u128,
@@ -908,6 +909,7 @@ fn build_report_with_ticks(
         ..PressureReport::default()
     };
     let agent_sample_coverage = samples.iter().any(|sample| sample.agents.is_some());
+    let host_observations_with_agents = count_host_observations_with_agents(&samples);
     let mut pressure_overlap =
         PressureOverlapAccumulator::new(records.is_some(), agent_sample_coverage);
     let mut timeline = Vec::new();
@@ -972,6 +974,7 @@ fn build_report_with_ticks(
                 .as_ref()
                 .is_none_or(|summary| summary.submitted == 0 && summary.rejected == 0),
         observation_count: samples.len(),
+        host_observations_with_agents,
         agent_observation_count: agent_ticks.len(),
         agent_rollup_count: agent_rollups.len(),
         observed_working_ms,
@@ -994,6 +997,45 @@ fn build_report_with_ticks(
 
 fn printable<T: std::fmt::Display>(value: Option<T>) -> String {
     value.map_or_else(|| "unavailable".to_owned(), |value| value.to_string())
+}
+
+fn count_host_observations_with_agents(samples: &[Observation]) -> usize {
+    samples
+        .iter()
+        .filter(|sample| {
+            sample
+                .agents
+                .as_ref()
+                .is_some_and(|agents| !agents.is_empty())
+        })
+        .count()
+}
+
+fn readable_bytes(value: i128) -> String {
+    let amount = value.unsigned_abs();
+    let sign = if value < 0 { "-" } else { "" };
+    if amount < 1_024 {
+        return format!("{sign}{amount} B");
+    }
+    let units = ["KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB"];
+    let mut divisor = 1_024_u128;
+    let mut unit_index = 0;
+    while amount / divisor >= 1_024 && unit_index + 1 < units.len() {
+        divisor *= 1_024;
+        unit_index += 1;
+    }
+    let whole = amount / divisor;
+    let fraction = (amount % divisor * 10 + divisor / 2) / divisor;
+    format!(
+        "{sign}{}.{:01} {}",
+        whole + fraction / 10,
+        fraction % 10,
+        units[unit_index]
+    )
+}
+
+fn readable_optional_bytes(value: Option<i128>) -> String {
+    value.map_or_else(|| "unavailable".to_owned(), readable_bytes)
 }
 
 fn readable_duration(value: Option<u128>) -> String {
@@ -1049,7 +1091,7 @@ fn agents_markdown(agents: Option<&[AgentLoad]>) -> String {
     let mut out = String::from("\n## Passive agent load\n\n");
     if let Some(agents) = agents {
         out.push_str("Sampled process-tree usage. CPU core-ms and RSS are estimates; overlap with command measurements is expected.\n\n");
-        out.push_str("| Agent | Active samples | CPU core-ms | Peak CPU % | Peak RSS bytes | Read bytes | Written bytes | Peak processes | Peak roots |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+        out.push_str("| Agent | Active samples | CPU core-ms | Peak CPU % | Peak RSS | Read | Written | Peak processes | Peak roots |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
         for agent in agents {
             let _ = writeln!(
                 out,
@@ -1058,9 +1100,9 @@ fn agents_markdown(agents: Option<&[AgentLoad]>) -> String {
                 agent.active_samples,
                 agent.cpu_core_ms_estimate,
                 agent.peak_cpu_percent,
-                agent.peak_memory_bytes,
-                agent.read_bytes,
-                agent.written_bytes,
+                readable_bytes(i128::from(agent.peak_memory_bytes)),
+                readable_bytes(i128::from(agent.read_bytes)),
+                readable_bytes(i128::from(agent.written_bytes)),
                 agent.peak_processes,
                 agent.peak_roots
             );
@@ -1079,7 +1121,7 @@ fn agent_commands_markdown(commands: Option<&[AgentCategoryReport]>) -> String {
     match commands {
         Some(commands) if !commands.is_empty() => {
             out.push_str("Only commands launched through a Reef agent session carry this agent label. Passive hooks do not identify builds or linters.\n\n");
-            out.push_str("| Agent | Category | Count | Wall ms | CPU ms | Peak memory bytes |\n| --- | --- | ---: | ---: | ---: | ---: |\n");
+            out.push_str("| Agent | Category | Count | Wall ms | CPU ms | Peak memory |\n| --- | --- | ---: | ---: | ---: | ---: |\n");
             for group in commands {
                 let _ = writeln!(
                     out,
@@ -1089,7 +1131,7 @@ fn agent_commands_markdown(commands: Option<&[AgentCategoryReport]>) -> String {
                     group.count,
                     group.wall_ms,
                     group.cpu_ms,
-                    group.peak_memory_bytes
+                    readable_bytes(i128::from(group.peak_memory_bytes))
                 );
             }
         }
@@ -1184,22 +1226,21 @@ fn timeline_markdown(events: &[PressureEvent]) -> String {
 
 fn markdown_with_timeline(report: &Report, include_timeline: bool) -> String {
     let mut out = format!(
-        "# Reef workload report\n\n- Range: {} to {} (end exclusive)\n- Empty: {}\n- Host observations: {}\n- Agent observations: {}\n- Agent rollups: {}\n- Observed working time: {}\n- Peak host memory: {} bytes\n- Swap growth: {} bytes\n- Peak command concurrency: {}\n\n",
+        "# Reef workload report\n\n- Range: {} to {} (end exclusive)\n- Empty: {}\n- Host observations: {}\n- Host observations with agents: {}\n- Observed working time: {}\n- Peak host memory: {}\n- Swap growth: {}\n- Peak command concurrency: {}\n\n",
         report.from,
         report.to,
         report.empty,
         report.observation_count,
-        report.agent_observation_count,
-        report.agent_rollup_count,
+        report.host_observations_with_agents,
         readable_duration(Some(report.observed_working_ms)),
-        printable(report.peak_host_memory_bytes),
-        printable(report.swap_growth_bytes),
+        readable_optional_bytes(report.peak_host_memory_bytes.map(i128::from)),
+        readable_optional_bytes(report.swap_growth_bytes),
         printable(report.peak_command_concurrency),
     );
     out.push_str("## Commands\n\n");
     if let Some(categories) = &report.categories {
         out.push_str("Whole commands overlapping the range; percentages are shares of measured commands. Concurrent wall times can exceed elapsed time.\n\n");
-        out.push_str("| Category | Count | Failed/cancelled | Wall ms | Wall % | CPU ms | CPU % | Peak memory bytes |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+        out.push_str("| Category | Count | Failed/cancelled | Wall ms | Wall % | CPU ms | CPU % | Peak memory |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
         for group in categories {
             let _ = writeln!(
                 out,
@@ -1211,7 +1252,7 @@ fn markdown_with_timeline(report: &Report, include_timeline: bool) -> String {
                 group.wall_percent_of_measured,
                 group.cpu_ms,
                 group.cpu_percent_of_measured,
-                group.peak_memory_bytes
+                readable_bytes(i128::from(group.peak_memory_bytes))
             );
         }
         if categories.is_empty() {
@@ -1360,6 +1401,17 @@ mod tests {
             "14h 35m 30s (52530000 ms)"
         );
         assert_eq!(readable_duration(None), "unavailable");
+    }
+
+    #[test]
+    fn overview_uses_binary_units_for_byte_values() {
+        assert_eq!(readable_bytes(0), "0 B");
+        assert_eq!(readable_bytes(1_023), "1023 B");
+        assert_eq!(readable_bytes(1_024), "1.0 KiB");
+        assert_eq!(readable_bytes(1_048_576), "1.0 MiB");
+        assert_eq!(readable_bytes(3_221_225_472), "3.0 GiB");
+        assert_eq!(readable_bytes(-1_073_741_824), "-1.0 GiB");
+        assert_eq!(readable_optional_bytes(None), "unavailable");
     }
 
     #[test]
