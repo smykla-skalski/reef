@@ -142,7 +142,7 @@ pub fn shim(tool: &str) -> io::Result<u8> {
     Err(process.exec())
 }
 
-fn classify(tool: &str, args: &[OsString]) -> Option<&'static str> {
+pub(crate) fn classify(tool: &str, args: &[OsString]) -> Option<&'static str> {
     match tool {
         "go" => match go_verb(args)? {
             "build" | "install" | "run" => Some("build"),
