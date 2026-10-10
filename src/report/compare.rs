@@ -23,8 +23,8 @@ pub struct CompareOptions {
     #[arg(long = "records")]
     records: Vec<PathBuf>,
     /// Report format.
-    #[arg(long, value_enum, default_value_t = Format::Markdown)]
-    format: Format,
+    #[arg(long, value_enum, default_value_t = CompareFormat::Markdown)]
+    format: CompareFormat,
     /// CPU usage threshold, as a percentage.
     #[arg(long, default_value_t = 90)]
     cpu_threshold: u8,
@@ -34,6 +34,12 @@ pub struct CompareOptions {
     /// Swap usage threshold, as a percentage.
     #[arg(long, default_value_t = 1)]
     swap_threshold: u8,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CompareFormat {
+    Markdown,
+    Json,
 }
 
 #[derive(Serialize)]
@@ -415,8 +421,8 @@ pub fn run_compare(options: &CompareOptions) -> io::Result<()> {
         ),
     };
     match options.format {
-        Format::Markdown => print!("{}", markdown(&comparison)),
-        Format::Json => println!("{}", serde_json::to_string_pretty(&comparison)?),
+        CompareFormat::Markdown => print!("{}", markdown(&comparison)),
+        CompareFormat::Json => println!("{}", serde_json::to_string_pretty(&comparison)?),
     }
     Ok(())
 }

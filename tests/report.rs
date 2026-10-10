@@ -58,6 +58,105 @@ fn reports_empty_range_with_unavailable_command_measurements() {
 }
 
 #[test]
+fn html_report_contains_host_charts_and_sanitized_agent_cost() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.join("samples-test.jsonl"),
+        concat!(
+            "{\"at_unix_ms\":1767225601000,\"working_ms\":1000,\"cpu_percent\":95.0,\"memory_used_bytes\":900,\"memory_total_bytes\":1000,\"swap_used_bytes\":1073741824,\"swap_total_bytes\":2147483648}\n",
+            "{\"at_unix_ms\":1767225602000,\"working_ms\":1000,\"cpu_percent\":50.0,\"memory_used_bytes\":500,\"memory_total_bytes\":1000,\"swap_used_bytes\":536870912,\"swap_total_bytes\":2147483648}\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        fixture.0.join("agent-samples-test.jsonl"),
+        "{\"at_unix_ms\":1767225601000,\"working_ms\":1000,\"agents\":[],\"commands\":[{\"kind\":\"codex\",\"family\":\"<script>alert(1)</script>\",\"category\":\"other\",\"process_count\":1,\"cpu_percent\":50.0,\"memory_bytes\":1024,\"read_bytes\":10,\"written_bytes\":20}]}\n",
+    )
+    .unwrap();
+    let output = reef()
+        .args([
+            "report",
+            "--from",
+            "2026-01-01T00:00:00Z",
+            "--to",
+            "2026-01-01T00:00:03Z",
+            "--state-dir",
+        ])
+        .arg(&fixture.0)
+        .args(["--format", "html"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let page = String::from_utf8(output.stdout).unwrap();
+    assert!(page.starts_with("<!doctype html>"));
+    assert!(page.contains("<svg"));
+    assert!(page.contains("CPU usage"));
+    assert!(page.contains("Memory usage"));
+    assert!(page.contains("Swap used"));
+    assert!(page.contains("Agent command cost"));
+    assert!(page.contains("codex"));
+    assert!(!page.contains("<script>alert(1)</script>"));
+    assert!(!page.contains("alert(1)"));
+    assert!(!page.contains("https://"));
+}
+
+#[test]
+fn html_output_is_private_and_never_overwrites_an_existing_file() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("report.html");
+    let mut command = reef();
+    command.args(["report", "--state-dir"]).arg(&fixture.0);
+    command.args(["--format", "html", "--output"]).arg(&path);
+    command.env("HOME", &fixture.0);
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        path.to_str().unwrap()
+    );
+    let original = fs::read(&path).unwrap();
+    assert!(original.starts_with(b"<!doctype html>"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    let second = reef()
+        .args(["report", "--state-dir"])
+        .arg(&fixture.0)
+        .args(["--format", "html", "--output"])
+        .arg(&path)
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+    assert!(!second.status.success());
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+#[test]
+fn browser_opening_requires_an_html_output_file() {
+    let fixture = Fixture::new();
+    let without_output = reef()
+        .args(["report", "--format", "html", "--open"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+    assert!(!without_output.status.success());
+    let wrong_format = reef()
+        .args(["report", "--output"])
+        .arg(fixture.0.join("report.html"))
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+    assert!(!wrong_format.status.success());
+    assert!(!fixture.0.join("report.html").exists());
+}
+
+#[test]
 fn timeline_requires_explicit_flag_in_both_formats() {
     let fixture = Fixture::new();
     fs::write(
