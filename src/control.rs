@@ -215,20 +215,8 @@ fn read_telemetry(dir: &Path) -> io::Result<(Vec<Event>, BTreeSet<String>)> {
     FileExt::lock_shared(&measurements)?;
     let mut ids = BTreeSet::new();
     for line in BufReader::new(&measurements).lines() {
-        let record: serde_json::Value = serde_json::from_str(&line?)?;
-        let id = record
-            .get("identity")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "control measurement has no identity",
-                )
-            })?;
-        if id.len() != 32
-            || !id.bytes().all(|byte| byte.is_ascii_hexdigit())
-            || !ids.insert(id.to_owned())
-        {
+        let id = run::control_record_id(&line?)?;
+        if !ids.insert(id) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "control measurement identity is invalid",
@@ -280,6 +268,9 @@ pub fn summary(dir: Option<&Path>, from_ms: u128, to_ms: u128) -> Summary {
             }
             _ => return Summary::unavailable(),
         }
+    }
+    if !measurements.iter().all(|id| attempts.contains_key(id)) {
+        return Summary::unavailable();
     }
     let selected: Vec<_> = attempts
         .values()

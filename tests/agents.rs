@@ -404,6 +404,64 @@ fn lost_control_measurement_is_unavailable_and_blocks_new_enrollment() {
 }
 
 #[test]
+fn malformed_control_measurement_blocks_enrollment_before_execution() {
+    let fixture = Fixture::new(false);
+    assert_eq!(
+        fixture
+            .launch_mode("codex", &["go", "env"], true)
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(7)
+    );
+    fs::write(
+        fixture.path.join("control/measurements.jsonl"),
+        b"{\"identity\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}\n",
+    )
+    .unwrap();
+    assert_eq!(fixture.control_report()["control"]["available"], false);
+    let before = fs::read_to_string(fixture.path.join("output")).unwrap();
+    let output = fixture
+        .launch_mode("codex", &["go", "test"], true)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("control enrollment refused"));
+    assert_eq!(
+        fs::read_to_string(fixture.path.join("output")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn orphan_control_measurement_blocks_enrollment() {
+    let fixture = Fixture::new(false);
+    assert_eq!(
+        fixture
+            .launch_mode("codex", &["go", "test"], true)
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(7)
+    );
+    fs::write(fixture.path.join("control/attempts.jsonl"), b"").unwrap();
+    assert_eq!(fixture.control_report()["control"]["available"], false);
+    let before = fs::read_to_string(fixture.path.join("output")).unwrap();
+    let output = fixture
+        .launch_mode("codex", &["go", "test"], true)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("control enrollment refused"));
+    assert_eq!(
+        fs::read_to_string(fixture.path.join("output")).unwrap(),
+        before
+    );
+}
+
+#[test]
 fn repeated_control_commands_receive_distinct_attempt_ids() {
     let fixture = Fixture::new(false);
     for _ in 0..2 {

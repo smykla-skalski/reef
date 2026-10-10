@@ -4,7 +4,7 @@ use crate::contain::{Boundary, Containment, Limits};
 use crate::control;
 use crate::history;
 use fs2::FileExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -44,12 +44,12 @@ pub enum AdmissionStatus {
     Disconnected,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct Measurement<'a> {
     category: &'a str,
     identity: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    agent_kind: Option<&'static str>,
+    agent_kind: Option<&'a str>,
     status: &'a str,
     exit_code: Option<i32>,
     signal: Option<i32>,
@@ -62,6 +62,27 @@ struct Measurement<'a> {
     tree_peak_memory_bytes: u64,
     tree_usage_complete: bool,
     limit_boundaries: Vec<Boundary>,
+}
+
+pub(crate) fn control_record_id(line: &str) -> io::Result<String> {
+    let measurement: Measurement<'_> = serde_json::from_str(line)?;
+    let id = measurement.identity;
+    if id.len() != 32
+        || !id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !matches!(
+            measurement.agent_kind,
+            Some("codex" | "claude" | "opencode")
+        )
+        || !matches!(measurement.category, "build" | "lint" | "test")
+        || !matches!(measurement.status, "success" | "failed" | "cancelled")
+        || measurement.ended_at_unix_ms < measurement.started_at_unix_ms
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "control measurement is invalid",
+        ));
+    }
+    Ok(id.to_owned())
 }
 
 #[derive(Default)]
