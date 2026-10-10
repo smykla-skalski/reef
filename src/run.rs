@@ -1,4 +1,4 @@
-mod platform;
+pub(crate) mod platform;
 
 use crate::contain::{Boundary, Containment, Limits};
 use crate::history;
@@ -150,11 +150,13 @@ pub fn run_with_limits(
     let started_at_unix_ms = unix_ms();
     let start = Instant::now();
     let interactive = io::stdin().is_terminal() && platform::has_foreground_stdin();
+    let mut supervisor = platform::Supervisor::start()?;
     let mut process = command_process(
         command,
         interactive,
         admission.is_some(),
         containment.as_ref(),
+        supervisor.group(),
     )?;
     let mut child = match process.spawn() {
         Ok(child) => child,
@@ -173,7 +175,7 @@ pub fn run_with_limits(
             return Ok(exit);
         }
     };
-    let foreground = prepare_child(&mut child, interactive, &mut admission)?;
+    let foreground = prepare_child(&mut child, supervisor.group(), interactive, &mut admission)?;
     let mut sampler = TreeSampler::default();
     let (result, forwarded, scheduler_lost, scheduler_cancelled) = wait_child(
         &mut child,
@@ -181,21 +183,18 @@ pub fn run_with_limits(
         &mut signals,
         &mut admission,
         &mut containment,
+        supervisor.group(),
     )?;
     let exit_signal = platform::exit_signal(result.status);
     let cpu_ms = (result.rusage.utime + result.rusage.stime).as_millis();
     let signal = exit_signal;
     let exit_code = result.status.code();
-    let status = if scheduler_cancelled
-        || forwarded.is_some()
-        || signal.is_some_and(platform::is_interrupt_signal)
-    {
-        "cancelled"
-    } else if result.status.success() {
-        "success"
-    } else {
-        "failed"
-    };
+    let status = run_status(
+        scheduler_cancelled,
+        forwarded,
+        signal,
+        result.status.success(),
+    );
     let measurement = Measurement {
         category,
         identity,
@@ -220,7 +219,7 @@ pub fn run_with_limits(
         || forwarded.is_some()
         || (exit_signal.is_some() && !scheduler_cancelled)
     {
-        cleanup_group(child.id())
+        cleanup_group(supervisor.group())
     } else {
         Ok(())
     };
@@ -237,6 +236,7 @@ pub fn run_with_limits(
     if let Some(lease) = admission.as_mut() {
         lease.finished(status)?;
     }
+    supervisor.disarm()?;
     if scheduler_cancelled {
         return Ok(130);
     }
@@ -246,30 +246,54 @@ pub fn run_with_limits(
     ))
 }
 
+fn run_status(
+    scheduler_cancelled: bool,
+    forwarded: Option<i32>,
+    signal: Option<i32>,
+    success: bool,
+) -> &'static str {
+    if scheduler_cancelled
+        || forwarded.is_some()
+        || signal.is_some_and(platform::is_interrupt_signal)
+    {
+        "cancelled"
+    } else if success {
+        "success"
+    } else {
+        "failed"
+    }
+}
+
 fn prepare_child(
     child: &mut std::process::Child,
+    group: u32,
     interactive: bool,
     admission: &mut Option<&mut dyn Admission>,
 ) -> io::Result<Option<platform::Foreground>> {
     if (interactive || admission.is_some())
         && let Err(error) = platform::wait_stopped(child.id())
     {
-        let _ = platform::force_stop(child.id());
+        let _ = platform::force_stop(group);
         let _ = child.wait();
         return Err(error);
     }
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("REEF_TEST_PAUSE_BEFORE_ACK") {
+        std::fs::write(path, child.id().to_string())?;
+        nix::sys::signal::raise(nix::sys::signal::Signal::SIGSTOP).map_err(io::Error::other)?;
+    }
     if let Some(lease) = admission.as_mut()
-        && let Err(error) = lease.started(child.id())
+        && let Err(error) = lease.started(group)
     {
-        platform::force_stop(child.id())?;
+        platform::force_stop(group)?;
         let _ = child.wait();
         return Err(error);
     }
     let foreground = if interactive {
-        match platform::Foreground::activate(child.id()) {
+        match platform::Foreground::activate(group) {
             Ok(guard) => Some(guard),
             Err(error) => {
-                let _ = platform::force_stop(child.id());
+                let _ = platform::force_stop(group);
                 let _ = child.wait();
                 return Err(error);
             }
@@ -280,7 +304,7 @@ fn prepare_child(
     if (interactive || admission.is_some())
         && let Err(error) = platform::resume(child.id())
     {
-        let _ = platform::force_stop(child.id());
+        let _ = platform::force_stop(group);
         let _ = child.wait();
         return Err(error);
     }
@@ -293,6 +317,7 @@ fn wait_child(
     signals: &mut signal_hook::iterator::Signals,
     admission: &mut Option<&mut dyn Admission>,
     containment: &mut Option<Containment>,
+    group: u32,
 ) -> io::Result<(wait4::ResUse, Option<i32>, bool, bool)> {
     let root = Pid::from_u32(child.id());
     let mut forwarded = None;
@@ -308,12 +333,12 @@ fn wait_child(
             match lease.status().unwrap_or(AdmissionStatus::Disconnected) {
                 AdmissionStatus::Cancelled if !scheduler_cancelled => {
                     stop_scope(containment.as_ref());
-                    let _ = platform::force_stop(child.id());
+                    let _ = platform::force_stop(group);
                     scheduler_cancelled = true;
                 }
                 AdmissionStatus::Disconnected if !scheduler_lost => {
                     stop_scope(containment.as_ref());
-                    platform::force_stop(child.id())?;
+                    platform::force_stop(group)?;
                     scheduler_lost = true;
                 }
                 _ => {}
@@ -321,7 +346,7 @@ fn wait_child(
         }
         for signal in signals.pending() {
             stop_scope(containment.as_ref());
-            platform::forward(child.id(), signal)?;
+            platform::forward(group, signal)?;
             if forwarded.is_none() {
                 interrupted_at = Some(Instant::now());
             }
@@ -341,7 +366,7 @@ fn wait_child(
             return Ok((result, forwarded, scheduler_lost, scheduler_cancelled));
         }
         if interrupted_at.is_some_and(|time| time.elapsed() >= Duration::from_secs(2)) {
-            platform::force_stop(child.id())?;
+            platform::force_stop(group)?;
         }
         std::thread::sleep(SAMPLE_INTERVAL);
     }
@@ -411,6 +436,7 @@ fn command_process(
     interactive: bool,
     scheduled: bool,
     containment: Option<&Containment>,
+    group: u32,
 ) -> io::Result<Command> {
     let command = if let Some(scope) = containment {
         let process = scope.command(command)?;
@@ -438,7 +464,7 @@ fn command_process(
     if scheduled {
         process.env("REEF_ADMITTED", "1");
     }
-    platform::isolate(&mut process);
+    platform::isolate(&mut process, group)?;
     Ok(process)
 }
 
@@ -450,13 +476,23 @@ fn scoped_command_args(process: &Command) -> Vec<OsString> {
 
 fn cleanup_group(pid: u32) -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(2);
-    while platform::group_exists(pid)? && Instant::now() < deadline {
+    let mut system = System::new();
+    while group_has_workload(&mut system, pid) && Instant::now() < deadline {
         std::thread::sleep(SAMPLE_INTERVAL);
     }
-    if platform::group_exists(pid)? {
+    if group_has_workload(&mut system, pid) {
         platform::force_stop(pid)?;
     }
     Ok(())
+}
+
+fn group_has_workload(system: &mut System, group: u32) -> bool {
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    system
+        .processes()
+        .keys()
+        .map(|pid| pid.as_u32())
+        .any(|pid| pid != group && platform::in_group(pid, group))
 }
 
 fn emit(measurement: &Measurement<'_>, writer: &mut RecordWriter) -> io::Result<()> {

@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 use serde_json::Value;
 use std::fs;
 use std::io::Read;
@@ -102,6 +104,17 @@ fn reef() -> Command {
 
 fn has_job(jobs: &[Value], state: &str) -> bool {
     jobs.iter().any(|job| job["state"] == state)
+}
+
+fn process_running(pid: i32) -> bool {
+    let output = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    output.status.success()
+        && !String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .starts_with('Z')
 }
 
 fn scheduler_report(fixture: &Fixture) -> Value {
@@ -450,7 +463,12 @@ fn nested_scheduled_command_reuses_parent_admission() {
         ])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(9));
+    assert_eq!(
+        output.status.code(),
+        Some(9),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(fixture.jobs().len(), 0);
 }
 
@@ -458,19 +476,58 @@ fn nested_scheduled_command_reuses_parent_admission() {
 fn client_termination_releases_capacity() {
     let fixture = Fixture::new();
     let ready = fixture.path.join("started");
+    let descendant = fixture.path.join("descendant-pid");
     let mut client = fixture
-        .schedule(&["sh", "-c", "touch \"$REEF_READY\"; sleep 30"])
+        .schedule(&[
+            "sh",
+            "-c",
+            "sleep 30 & echo $! > \"$REEF_DESCENDANT\"; touch \"$REEF_READY\"; wait",
+        ])
         .env("REEF_READY", &ready)
+        .env("REEF_DESCENDANT", &descendant)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
     Fixture::wait_until(|| ready.exists());
+    let descendant_pid: i32 = fs::read_to_string(descendant)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(process_running(descendant_pid));
     client.kill().unwrap();
     client.wait().unwrap();
-    Fixture::wait_until(|| fixture.jobs().is_empty());
+    Fixture::wait_until(|| fixture.jobs().is_empty() && !process_running(descendant_pid));
     let output = fixture.schedule(&["sh", "-c", "exit 0"]).output().unwrap();
     assert!(output.status.success());
+}
+
+#[test]
+fn launcher_death_before_pid_ack_stops_child_and_releases_lease() {
+    let fixture = Fixture::new();
+    let marker = fixture.path.join("spawned-child");
+    let mut launcher = fixture
+        .schedule(&["sh", "-c", "sleep 30"])
+        .env("REEF_TEST_PAUSE_BEFORE_ACK", &marker)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    Fixture::wait_until(|| marker.exists());
+    let child_pid: i32 = fs::read_to_string(&marker).unwrap().parse().unwrap();
+    assert!(process_running(child_pid));
+    assert!(has_job(&fixture.jobs(), "running"));
+
+    kill(
+        Pid::from_raw(i32::try_from(launcher.id()).unwrap()),
+        Signal::SIGKILL,
+    )
+    .unwrap();
+    launcher.wait().unwrap();
+    Fixture::wait_until(|| !process_running(child_pid) && fixture.jobs().is_empty());
+    assert!(!process_running(child_pid));
+    assert_eq!(fixture.jobs(), Vec::<Value>::new());
 }
 
 #[test]

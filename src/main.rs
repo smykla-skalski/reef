@@ -40,6 +40,12 @@ struct Cli {
 enum Command {
     /// Show current machine resource usage.
     Status,
+    #[cfg(unix)]
+    #[command(name = "__run-supervisor", hide = true)]
+    RunSupervisor,
+    #[cfg(unix)]
+    #[command(name = "__run-group-leader", hide = true)]
+    RunGroupLeader,
     /// Reuse successful output-only commands with explicit opt-in.
     #[cfg(unix)]
     Cache {
@@ -396,6 +402,10 @@ fn main() -> std::process::ExitCode {
             status::print();
             std::process::ExitCode::SUCCESS
         }
+        #[cfg(unix)]
+        Command::RunSupervisor => result(run::platform::supervise()),
+        #[cfg(unix)]
+        Command::RunGroupLeader => run::platform::hold_group(),
         #[cfg(target_os = "linux")]
         Command::ContainExec {
             snapshot,
