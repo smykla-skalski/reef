@@ -378,6 +378,31 @@ fn concurrent_first_run_control_launches_enroll_distinct_attempts() {
 }
 
 #[test]
+fn complete_control_store_in_read_only_directory_allows_enrollment() {
+    let fixture = Fixture::new(false);
+    let dir = fixture.path.join("control");
+    fs::create_dir(&dir).unwrap();
+    for name in ["attempts.jsonl", "measurements.jsonl"] {
+        let path = dir.join(name);
+        fs::write(&path, b"").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let output = fixture
+        .launch_mode("codex", &["go", "test"], true)
+        .output()
+        .unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    let report = fixture.control_report();
+    assert_eq!(report["control"]["available"], true);
+    assert_eq!(report["control"]["attempted"], 1);
+    assert_eq!(report["control"]["completed"], 1);
+}
+
+#[test]
 fn control_clock_rollback_keeps_report_and_enrollment_usable() {
     let fixture = Fixture::new(false);
     let first = fixture

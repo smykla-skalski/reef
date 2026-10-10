@@ -97,7 +97,11 @@ pub(crate) fn private_file(path: &Path, create: bool) -> io::Result<File> {
 
 fn prepare_inner(dir: &Path) -> io::Result<()> {
     private_dir(dir, true)?;
-    let lock = private_file(&dir.join(ENROLLMENT_LOCK), true)?;
+    let lock_path = dir.join(ENROLLMENT_LOCK);
+    if !lock_path.exists() && dir.join(EVENTS).exists() && dir.join(MEASUREMENTS).exists() {
+        return validate_existing(dir);
+    }
+    let lock = private_file(&lock_path, true)?;
     lock.lock_exclusive()?;
     if dir.join(EVENTS).exists() != dir.join(MEASUREMENTS).exists() {
         return Err(io::Error::new(
