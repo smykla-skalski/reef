@@ -1888,6 +1888,17 @@ fn markdown_with_timeline(report: &Report, include_timeline: bool) -> String {
     out
 }
 
+#[cfg(unix)]
+fn normalize_control_timestamps(measurements: &mut [Measurement]) {
+    for measurement in measurements {
+        if measurement.ended_at_unix_ms < measurement.started_at_unix_ms {
+            measurement.ended_at_unix_ms = measurement
+                .started_at_unix_ms
+                .saturating_add(measurement.wall_ms);
+        }
+    }
+}
+
 fn read_measurements(
     options: &Options,
     #[cfg(unix)] control: &mut control::Summary,
@@ -1901,6 +1912,10 @@ fn read_measurements(
     if control.available && control_path.is_none() {
         *control = control::Summary::unavailable();
     }
+    #[cfg(unix)]
+    let control_canonical = control_path
+        .as_ref()
+        .and_then(|path| fs::canonicalize(path).ok());
     let default_paths = history::paths()?;
     let mut paths = default_paths.clone().unwrap_or_default();
     paths.extend(options.records.iter().cloned());
@@ -1916,18 +1931,28 @@ fn read_measurements(
     for path in paths {
         let canonical = fs::canonicalize(path)?;
         if seen.insert(canonical.clone()) {
-            all.extend(read_jsonl(&canonical)?);
+            let mut measurements: Vec<Measurement> = read_jsonl(&canonical)?;
+            #[cfg(unix)]
+            if control_canonical.as_ref() == Some(&canonical) {
+                normalize_control_timestamps(&mut measurements);
+            }
+            all.extend(measurements);
         }
     }
     #[cfg(unix)]
-    if let Some(path) = control_path {
-        match fs::canonicalize(path) {
-            Ok(canonical) if seen.insert(canonical.clone()) => match read_jsonl(&canonical) {
-                Ok(measurements) => all.extend(measurements),
-                Err(_) => *control = control::Summary::unavailable(),
-            },
-            Ok(_) => {}
-            Err(_) => *control = control::Summary::unavailable(),
+    if control_path.is_some() {
+        match control_canonical {
+            Some(canonical) if seen.insert(canonical.clone()) => {
+                match read_jsonl::<Measurement>(&canonical) {
+                    Ok(mut measurements) => {
+                        normalize_control_timestamps(&mut measurements);
+                        all.extend(measurements);
+                    }
+                    Err(_) => *control = control::Summary::unavailable(),
+                }
+            }
+            Some(_) => {}
+            None => *control = control::Summary::unavailable(),
         }
     }
     Ok(Some(all))

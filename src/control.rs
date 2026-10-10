@@ -9,7 +9,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const EVENTS: &str = "attempts.jsonl";
 const MEASUREMENTS: &str = "measurements.jsonl";
@@ -174,6 +174,7 @@ pub fn run(original: Option<&Path>, args: &[OsString], category: &str) -> io::Re
         category: category.to_owned(),
         assignment: Some("control".to_owned()),
     };
+    let assigned_at = Instant::now();
     append(&dir, &event).map_err(|_| io::Error::other(TELEMETRY_WARNING))?;
     let result = match original {
         Some(original) => {
@@ -205,7 +206,9 @@ pub fn run(original: Option<&Path>, args: &[OsString], category: &str) -> io::Re
         "unavailable"
     }
     .clone_into(&mut event.kind);
-    event.at_unix_ms = now_ms();
+    event.at_unix_ms = event
+        .at_unix_ms
+        .saturating_add(assigned_at.elapsed().as_millis());
     event.assignment = None;
     append(&dir, &event).map_err(|_| io::Error::other(TELEMETRY_WARNING))?;
     result.map_err(|_| {
@@ -289,7 +292,6 @@ pub fn summary(dir: Option<&Path>, from_ms: u128, to_ms: u128) -> Summary {
                 };
                 if attempt.completed
                     || attempt.unavailable
-                    || event.at_unix_ms < attempt.at_unix_ms
                     || event.agent != attempt.agent
                     || event.category != attempt.category
                 {
