@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sysinfo::{Disks, ProcessRefreshKind, ProcessesToUpdate, System};
 
+mod commands;
 mod platform;
 #[cfg(unix)]
 mod reload;
@@ -29,6 +30,8 @@ struct Observation {
     root_disk_total_bytes: Option<u64>,
     processes: Vec<ProcessObservation>,
     agents: Vec<AgentObservation>,
+    #[serde(skip_serializing)]
+    commands: Vec<CommandObservation>,
 }
 
 #[derive(Serialize)]
@@ -57,6 +60,33 @@ struct AgentTick {
     at_unix_ms: u64,
     working_ms: u64,
     agents: Vec<AgentObservation>,
+    #[serde(default)]
+    commands: Vec<CommandObservation>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct CommandObservation {
+    kind: String,
+    family: String,
+    category: String,
+    process_count: usize,
+    cpu_percent: Option<f32>,
+    memory_bytes: u64,
+    read_bytes: Option<u64>,
+    written_bytes: Option<u64>,
+}
+
+#[derive(Default, Serialize)]
+struct CommandRollup {
+    category: String,
+    active_samples: u64,
+    observed_working_ms: u64,
+    cpu_core_ms_estimate: f64,
+    peak_cpu_percent: f32,
+    peak_memory_bytes: u64,
+    read_bytes: u64,
+    written_bytes: u64,
+    peak_processes: usize,
 }
 
 #[derive(Default, Serialize)]
@@ -72,6 +102,7 @@ struct AgentRollup {
     written_bytes: u64,
     peak_processes: usize,
     peak_roots: usize,
+    commands: BTreeMap<String, CommandRollup>,
 }
 
 pub(crate) fn state_dir(override_dir: Option<&Path>) -> io::Result<PathBuf> {
@@ -157,6 +188,7 @@ fn sample(
     let processes = process_observations(system);
     let roots = agent_observe::registrations(dir, system)?;
     let agents = agent_observations(&processes, &roots);
+    let commands = commands::sample(system, &roots);
     let memory_total = system.total_memory();
     let swap_total = system.total_swap();
     Ok(Observation {
@@ -174,6 +206,7 @@ fn sample(
         root_disk_total_bytes: root.map(sysinfo::Disk::total_space),
         processes,
         agents,
+        commands,
     })
 }
 
@@ -234,6 +267,7 @@ fn agent_tick(system: &mut System, dir: &Path, working_ms: u64) -> io::Result<Op
         at_unix_ms: now_ms()?,
         working_ms,
         agents: agent_observations(&process_observations(system), &roots),
+        commands: commands::sample(system, &roots),
     }))
 }
 
@@ -411,6 +445,27 @@ fn fold_tick(rollups: &mut BTreeMap<(u64, String), AgentRollup>, tick: &AgentTic
             .peak_processes
             .max(agents.iter().map(|agent| agent.process_count).sum());
         rollup.peak_roots = rollup.peak_roots.max(agents.len());
+        for command in tick.commands.iter().filter(|command| command.kind == kind) {
+            let group = rollup
+                .commands
+                .entry(command.family.clone())
+                .or_insert_with(|| CommandRollup {
+                    category: command.category.clone(),
+                    ..CommandRollup::default()
+                });
+            group.active_samples += 1;
+            group.observed_working_ms += tick.working_ms;
+            group.cpu_core_ms_estimate +=
+                f64::from(command.cpu_percent.unwrap_or_default().max(0.0)) * f64::from(duration)
+                    / 100.0;
+            group.peak_cpu_percent = group
+                .peak_cpu_percent
+                .max(command.cpu_percent.unwrap_or_default());
+            group.peak_memory_bytes = group.peak_memory_bytes.max(command.memory_bytes);
+            group.read_bytes += command.read_bytes.unwrap_or_default();
+            group.written_bytes += command.written_bytes.unwrap_or_default();
+            group.peak_processes = group.peak_processes.max(command.process_count);
+        }
     }
 }
 
@@ -577,6 +632,7 @@ fn record_loop(dir: &Path, stop_path: &Path, options: &ObserveOptions) -> io::Re
                         at_unix_ms: observation.at_unix_ms,
                         working_ms: tick_working_ms,
                         agents: observation.agents.clone(),
+                        commands: observation.commands.clone(),
                     },
                     options,
                 )?;
@@ -664,6 +720,7 @@ mod tests {
             root_disk_total_bytes: None,
             processes: vec![],
             agents: vec![],
+            commands: vec![],
         }
     }
 
@@ -872,6 +929,16 @@ mod tests {
                 read_bytes: Some(10),
                 written_bytes: Some(20),
             }],
+            commands: vec![CommandObservation {
+                kind: "claude".to_owned(),
+                family: "go test".to_owned(),
+                category: "test".to_owned(),
+                process_count: 2,
+                cpu_percent: Some(25.0),
+                memory_bytes: 300,
+                read_bytes: Some(5),
+                written_bytes: Some(7),
+            }],
         };
         append_agent_tick(&dir, &make_tick(3_600_100), &options(&dir)).unwrap();
         append_agent_tick(&dir, &make_tick(3_601_100), &options(&dir)).unwrap();
@@ -891,6 +958,10 @@ mod tests {
         assert_eq!(rollup["observed_working_ms"], 2_000);
         assert_eq!(rollup["cpu_core_ms_estimate"], 1_000.0);
         assert_eq!(rollup["peak_memory_bytes"], 400);
+        assert_eq!(rollup["commands"]["go test"]["active_samples"], 2);
+        assert_eq!(rollup["commands"]["go test"]["cpu_core_ms_estimate"], 500.0);
+        assert_eq!(rollup["commands"]["go test"]["peak_memory_bytes"], 300);
+        assert_eq!(rollup["commands"]["go test"]["read_bytes"], 10);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -911,6 +982,7 @@ mod tests {
                 read_bytes: None,
                 written_bytes: None,
             }],
+            commands: vec![],
         };
         append_agent_tick(&dir, &tick, &options(&dir)).unwrap();
         let raw = segments_with_prefix(&dir, "agent-samples-").unwrap()[0]

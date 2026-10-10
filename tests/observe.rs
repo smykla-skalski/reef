@@ -87,6 +87,61 @@ fn short_registered_session_is_visible_before_first_host_snapshot() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn registered_agent_descendant_command_appears_in_report() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir =
+        std::env::temp_dir().join(format!("reef-agent-command-{}-{nonce}", std::process::id()));
+    let marked = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args(["agents", "observe", "codex", "--pid"])
+        .arg(std::process::id().to_string())
+        .arg("--state-dir")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(marked.status.success(), "{marked:?}");
+    let mut running = recorder(&dir);
+    let mut git = Command::new("git")
+        .args(["hash-object", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let observed = wait_until(|| {
+        let report = Command::new(env!("CARGO_BIN_EXE_reef"))
+            .args(["report", "--state-dir"])
+            .arg(&dir)
+            .args(["--format", "json"])
+            .output()
+            .unwrap();
+        if !report.status.success() {
+            return false;
+        }
+        let json: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+        json["passive_commands"].as_array().is_some_and(|groups| {
+            groups
+                .iter()
+                .any(|group| group["agent"] == "codex" && group["family"] == "git")
+        })
+    });
+    drop(git.stdin.take());
+    assert!(git.wait().unwrap().success());
+    assert!(observed, "{}", child_failure(&mut running));
+    let stopped = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args(["observe", "stop", "--state-dir"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(stopped.status.success());
+    assert!(wait_until(|| running.0.try_wait().unwrap().is_some()));
+    fs::remove_dir_all(dir).unwrap();
+}
+
 fn child_failure(recorder: &mut Recorder) -> String {
     let status = recorder.0.try_wait().unwrap();
     let mut stderr = String::new();

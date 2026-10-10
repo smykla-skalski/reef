@@ -92,6 +92,32 @@ struct AgentTick {
     at_unix_ms: u64,
     working_ms: u64,
     agents: Vec<AgentSample>,
+    commands: Option<Vec<PassiveCommandSample>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PassiveCommandSample {
+    kind: String,
+    family: String,
+    category: String,
+    process_count: usize,
+    cpu_percent: Option<f64>,
+    memory_bytes: u64,
+    read_bytes: Option<u64>,
+    written_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PassiveCommandRollup {
+    category: String,
+    active_samples: usize,
+    observed_working_ms: u128,
+    cpu_core_ms_estimate: f64,
+    peak_cpu_percent: f64,
+    peak_memory_bytes: u64,
+    read_bytes: u64,
+    written_bytes: u64,
+    peak_processes: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,6 +133,7 @@ struct AgentRollup {
     written_bytes: u64,
     peak_processes: usize,
     peak_roots: usize,
+    commands: Option<BTreeMap<String, PassiveCommandRollup>>,
 }
 
 #[derive(Default)]
@@ -141,6 +168,7 @@ struct Report {
     command_count: Option<usize>,
     categories: Option<Vec<CategoryReport>>,
     agent_commands: Option<Vec<AgentCategoryReport>>,
+    passive_commands: Option<Vec<PassiveCommandLoad>>,
     peak_host_memory_bytes: Option<u64>,
     swap_growth_bytes: Option<i128>,
     peak_command_concurrency: Option<usize>,
@@ -188,6 +216,21 @@ struct AgentLoad {
     written_bytes: u64,
     peak_processes: usize,
     peak_roots: usize,
+}
+
+#[derive(Default, Serialize)]
+struct PassiveCommandLoad {
+    agent: String,
+    family: String,
+    category: String,
+    active_samples: usize,
+    observed_working_ms: u128,
+    cpu_core_ms_estimate: f64,
+    peak_cpu_percent: f64,
+    peak_memory_bytes: u64,
+    read_bytes: u64,
+    written_bytes: u64,
+    peak_processes: usize,
 }
 
 #[derive(Default, Serialize)]
@@ -375,6 +418,39 @@ fn category(value: &str) -> &'static str {
         "agent" => "agent",
         "container" => "container",
         "interactive" => "interactive",
+        _ => "other",
+    }
+}
+
+fn passive_family(value: &str) -> &'static str {
+    match value {
+        "go build" => "go build",
+        "go test" => "go test",
+        "go vet" => "go vet",
+        "go other" => "go other",
+        "cargo build" => "cargo build",
+        "cargo test" => "cargo test",
+        "cargo clippy" => "cargo clippy",
+        "cargo other" => "cargo other",
+        "mise build" => "mise build",
+        "mise test" => "mise test",
+        "mise lint/check" => "mise lint/check",
+        "mise other" => "mise other",
+        "make build" => "make build",
+        "make test" => "make test",
+        "make lint/check" => "make lint/check",
+        "make other" => "make other",
+        "package build" => "package build",
+        "package test" => "package test",
+        "package lint/check" => "package lint/check",
+        "package other" => "package other",
+        "golangci-lint" => "golangci-lint",
+        "compiler/linker" => "compiler/linker",
+        "test runner" => "test runner",
+        "Go test binary" => "Go test binary",
+        "linter" => "linter",
+        "git" => "git",
+        "container tool" => "container tool",
         _ => "other",
     }
 }
@@ -813,6 +889,119 @@ fn accumulate_agent_rollups(load: &mut BTreeMap<String, AgentLoad>, rollups: &[A
     }
 }
 
+fn passive_group<'a>(
+    load: &'a mut BTreeMap<(String, String), PassiveCommandLoad>,
+    kind: &str,
+    family: &str,
+    command_category: &str,
+) -> Option<&'a mut PassiveCommandLoad> {
+    let agent = measured_agent_kind(Some(kind))?;
+    let family = passive_family(family);
+    Some(
+        load.entry((agent.to_owned(), family.to_owned()))
+            .or_insert_with(|| PassiveCommandLoad {
+                agent: agent.to_owned(),
+                family: family.to_owned(),
+                category: category(command_category).to_owned(),
+                ..PassiveCommandLoad::default()
+            }),
+    )
+}
+
+fn accumulate_passive_ticks(
+    load: &mut BTreeMap<(String, String), PassiveCommandLoad>,
+    ticks: &[AgentTick],
+    from_ms: u128,
+    to_ms: u128,
+) {
+    let mut covered_until = from_ms;
+    for tick in ticks {
+        let at = u128::from(tick.at_unix_ms);
+        let end = at.min(to_ms);
+        let start = at
+            .saturating_sub(u128::from(tick.working_ms))
+            .max(covered_until)
+            .max(from_ms);
+        let duration = end.saturating_sub(start);
+        covered_until = covered_until.max(end);
+        if duration == 0 {
+            continue;
+        }
+        for command in tick.commands.as_deref().unwrap_or_default() {
+            let Some(group) =
+                passive_group(load, &command.kind, &command.family, &command.category)
+            else {
+                continue;
+            };
+            group.active_samples += 1;
+            group.observed_working_ms += duration;
+            let duration = u32::try_from(duration).unwrap_or(u32::MAX);
+            group.cpu_core_ms_estimate +=
+                command.cpu_percent.unwrap_or_default().max(0.0) * f64::from(duration) / 100.0;
+            group.peak_cpu_percent = group
+                .peak_cpu_percent
+                .max(command.cpu_percent.unwrap_or_default());
+            group.peak_memory_bytes = group.peak_memory_bytes.max(command.memory_bytes);
+            group.read_bytes += command.read_bytes.unwrap_or_default();
+            group.written_bytes += command.written_bytes.unwrap_or_default();
+            group.peak_processes = group.peak_processes.max(command.process_count);
+        }
+    }
+}
+
+fn accumulate_passive_rollups(
+    load: &mut BTreeMap<(String, String), PassiveCommandLoad>,
+    rollups: &[AgentRollup],
+) {
+    for rollup in rollups {
+        for (family, command) in rollup.commands.iter().flatten() {
+            let Some(group) = passive_group(load, &rollup.kind, family, &command.category) else {
+                continue;
+            };
+            group.active_samples += command.active_samples;
+            group.observed_working_ms += command.observed_working_ms;
+            group.cpu_core_ms_estimate += command.cpu_core_ms_estimate;
+            group.peak_cpu_percent = group.peak_cpu_percent.max(command.peak_cpu_percent);
+            group.peak_memory_bytes = group.peak_memory_bytes.max(command.peak_memory_bytes);
+            group.read_bytes += command.read_bytes;
+            group.written_bytes += command.written_bytes;
+            group.peak_processes = group.peak_processes.max(command.peak_processes);
+        }
+    }
+}
+
+fn passive_command_reports(
+    ticks: &[AgentTick],
+    rollups: &[AgentRollup],
+    from_ms: u128,
+    to_ms: u128,
+) -> Option<Vec<PassiveCommandLoad>> {
+    let available = ticks.iter().any(|tick| tick.commands.is_some())
+        || rollups.iter().any(|rollup| rollup.commands.is_some());
+    if !available {
+        return None;
+    }
+    let mut load = BTreeMap::new();
+    accumulate_passive_ticks(&mut load, ticks, from_ms, to_ms);
+    accumulate_passive_rollups(&mut load, rollups);
+    let mut reports: Vec<_> = load.into_values().collect();
+    reports.sort_by(|left, right| {
+        right
+            .cpu_core_ms_estimate
+            .total_cmp(&left.cpu_core_ms_estimate)
+            .then_with(|| left.agent.cmp(&right.agent))
+            .then_with(|| left.family.cmp(&right.family))
+    });
+    Some(reports)
+}
+
+fn swap_growth(samples: &[Observation]) -> Option<i128> {
+    let mut values = samples.iter().filter_map(|sample| sample.swap_used_bytes);
+    let first = values.next()?;
+    let last = values.next_back()?;
+    Some(i128::from(last) - i128::from(first))
+}
+
 fn rollups_in_range(rollups: Vec<AgentRollup>, from_ms: u128, to_ms: u128) -> Vec<AgentRollup> {
     rollups
         .into_iter()
@@ -951,10 +1140,9 @@ fn build_report_with_ticks(
     let pressure_overlap = pressure_overlap.finish();
     accumulate_agent_ticks(&mut agent_load, &agent_ticks, from_ms, to_ms);
     accumulate_agent_rollups(&mut agent_load, &agent_rollups);
+    let passive_commands = passive_command_reports(&agent_ticks, &agent_rollups, from_ms, to_ms);
     let peak_host_memory_bytes = samples.iter().filter_map(|s| s.memory_used_bytes).max();
-    let swap_values: Vec<_> = samples.iter().filter_map(|s| s.swap_used_bytes).collect();
-    let swap_growth_bytes = (swap_values.len() >= 2)
-        .then(|| i128::from(*swap_values.last().unwrap()) - i128::from(swap_values[0]));
+    let swap_growth_bytes = swap_growth(&samples);
     let peak_command_concurrency = records
         .as_ref()
         .map(|records| peak_concurrency(records, from_ms, to_ms));
@@ -982,6 +1170,7 @@ fn build_report_with_ticks(
         command_count,
         categories,
         agent_commands,
+        passive_commands,
         peak_host_memory_bytes,
         swap_growth_bytes,
         peak_command_concurrency,
@@ -1124,7 +1313,7 @@ fn agent_commands_markdown(commands: Option<&[AgentCategoryReport]>) -> String {
     let mut out = String::from("\n## Measured commands by agent\n\n");
     match commands {
         Some(commands) if !commands.is_empty() => {
-            out.push_str("Only commands launched through a Reef agent session carry this agent label. Passive hooks do not identify builds or linters.\n\n");
+            out.push_str("Exact measurements require a Reef-managed command. Passive process estimates appear below.\n\n");
             out.push_str("| Agent | Category | Count | Wall ms | CPU ms | Peak memory |\n| --- | --- | ---: | ---: | ---: | ---: |\n");
             for group in commands {
                 let _ = writeln!(
@@ -1139,8 +1328,38 @@ fn agent_commands_markdown(commands: Option<&[AgentCategoryReport]>) -> String {
                 );
             }
         }
-        Some(_) => out.push_str("No agent-tagged command measurements in this range. Passive hooks alone do not identify builds or linters.\n"),
+        Some(_) => {
+            out.push_str("No agent-tagged Reef-managed command measurements in this range.\n");
+        }
         None => out.push_str("Unavailable: no command history.\n"),
+    }
+    out
+}
+
+fn passive_commands_markdown(commands: Option<&[PassiveCommandLoad]>) -> String {
+    let mut out = String::from("\n## Passive agent command activity\n\n");
+    match commands {
+        Some(commands) if !commands.is_empty() => {
+            out.push_str("Sanitized process families observed beneath registered agents. CPU, RSS, and I/O are sampled estimates, not exact command totals. Sub-second and detached processes can be missed; no arguments are stored. Showing the 12 highest-CPU groups.\n\n");
+            out.push_str("| Agent | Family | Category | Active time | CPU core-ms | Peak RSS | Read | Written | Peak processes |\n| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+            for command in commands.iter().take(12) {
+                let _ = writeln!(
+                    out,
+                    "| {} | {} | {} | {} | {:.0} | {} | {} | {} | {} |",
+                    command.agent,
+                    command.family,
+                    command.category,
+                    readable_duration(Some(command.observed_working_ms)),
+                    command.cpu_core_ms_estimate,
+                    readable_bytes(i128::from(command.peak_memory_bytes)),
+                    readable_bytes(i128::from(command.read_bytes)),
+                    readable_bytes(i128::from(command.written_bytes)),
+                    command.peak_processes,
+                );
+            }
+        }
+        Some(_) => out.push_str("No agent descendant commands were sampled in this range.\n"),
+        None => out.push_str("Unavailable: observations predate passive command activity.\n"),
     }
     out
 }
@@ -1268,6 +1487,9 @@ fn markdown_with_timeline(report: &Report, include_timeline: bool) -> String {
         );
     }
     out.push_str(&agent_commands_markdown(report.agent_commands.as_deref()));
+    out.push_str(&passive_commands_markdown(
+        report.passive_commands.as_deref(),
+    ));
     out.push_str(&agents_markdown(report.agents.as_deref()));
     out.push_str(&pressure_markdown(report));
     if include_timeline {
@@ -1757,6 +1979,7 @@ mod tests {
                 ticks: vec![AgentTick {
                     at_unix_ms: 3_000,
                     working_ms: 1_000,
+                    commands: None,
                     agents: vec![AgentSample {
                         kind: "codex".to_owned(),
                         root_pid: 42,
@@ -1793,6 +2016,7 @@ mod tests {
                 ticks: vec![AgentTick {
                     at_unix_ms: 1_500,
                     working_ms: 1_000,
+                    commands: None,
                     agents: vec![AgentSample {
                         kind: "codex".to_owned(),
                         root_pid: 42,
@@ -1825,6 +2049,7 @@ mod tests {
                 ticks: vec![AgentTick {
                     at_unix_ms: 61_000,
                     working_ms: 1_000,
+                    commands: None,
                     agents: vec![AgentSample {
                         kind: "claude".to_owned(),
                         root_pid: 42,
@@ -1847,6 +2072,7 @@ mod tests {
                     written_bytes: 40,
                     peak_processes: 2,
                     peak_roots: 1,
+                    commands: None,
                 }],
             },
             None,
@@ -1860,5 +2086,70 @@ mod tests {
         assert_eq!(agent.active_samples, 2);
         assert_eq!(agent.cpu_core_ms_estimate, 1_000.0);
         assert_eq!(agent.peak_memory_bytes, 500);
+    }
+
+    #[test]
+    fn passive_command_report_uses_rollup_once_and_sanitizes_names() {
+        let ticks = vec![AgentTick {
+            at_unix_ms: 61_000,
+            working_ms: 1_000,
+            agents: vec![],
+            commands: Some(vec![PassiveCommandSample {
+                kind: "claude".to_owned(),
+                family: "secret-token".to_owned(),
+                category: "test".to_owned(),
+                process_count: 1,
+                cpu_percent: Some(50.0),
+                memory_bytes: 400,
+                read_bytes: Some(10),
+                written_bytes: Some(20),
+            }]),
+        }];
+        let rollups = vec![AgentRollup {
+            minute_unix_ms: 60_000,
+            kind: "claude".to_owned(),
+            active_samples: 2,
+            observed_working_ms: 2_000,
+            cpu_core_ms_estimate: 1_000.0,
+            peak_cpu_percent: 50.0,
+            peak_memory_bytes: 500,
+            read_bytes: 30,
+            written_bytes: 40,
+            peak_processes: 2,
+            peak_roots: 1,
+            commands: Some(BTreeMap::from([(
+                "go test".to_owned(),
+                PassiveCommandRollup {
+                    category: "test".to_owned(),
+                    active_samples: 2,
+                    observed_working_ms: 2_000,
+                    cpu_core_ms_estimate: 1_000.0,
+                    peak_cpu_percent: 50.0,
+                    peak_memory_bytes: 500,
+                    read_bytes: 30,
+                    written_bytes: 40,
+                    peak_processes: 2,
+                },
+            )])),
+        }];
+        let report = build_report_with_ticks(
+            date(60_000),
+            date(120_000),
+            vec![],
+            AgentData { ticks, rollups },
+            None,
+            (90, 90, 1),
+            None,
+        );
+        let groups = report.passive_commands.as_ref().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].family, "go test");
+        assert_eq!(groups[0].active_samples, 2);
+        assert_eq!(groups[0].cpu_core_ms_estimate, 1_000.0);
+        assert!(
+            !serde_json::to_string(&groups)
+                .unwrap()
+                .contains("secret-token")
+        );
     }
 }
