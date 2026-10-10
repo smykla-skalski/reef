@@ -358,14 +358,14 @@ fn control_clock_rollback_keeps_report_and_enrollment_usable() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     let assigned_at = events[0]["at_unix_ms"].as_u64().unwrap();
-    events[1]["at_unix_ms"] = (assigned_at - 1_000).into();
+    events[0]["at_unix_ms"] = (assigned_at + 300_000).into();
     fs::write(&events_path, format!("{}\n{}\n", events[0], events[1])).unwrap();
 
     let measurements_path = fixture.path.join("control/measurements.jsonl");
     let mut measurement: serde_json::Value =
         serde_json::from_slice(&fs::read(&measurements_path).unwrap()).unwrap();
     let started_at = measurement["started_at_unix_ms"].as_u64().unwrap();
-    measurement["ended_at_unix_ms"] = (started_at - 1_000).into();
+    measurement["started_at_unix_ms"] = (started_at + 300_000).into();
     fs::write(&measurements_path, format!("{measurement}\n")).unwrap();
 
     let report = fixture.control_report();

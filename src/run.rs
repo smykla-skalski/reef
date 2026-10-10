@@ -226,7 +226,7 @@ pub fn run_with_limits(
         signal,
         result.status.success(),
     );
-    let wall_ms = start.elapsed().as_millis();
+    let (started_at_unix_ms, ended_at_unix_ms, wall_ms) = finish_times(started_at_unix_ms, start);
     let measurement = Measurement {
         category,
         identity,
@@ -235,7 +235,7 @@ pub fn run_with_limits(
         exit_code,
         signal: signal.or(forwarded),
         started_at_unix_ms,
-        ended_at_unix_ms: started_at_unix_ms.saturating_add(wall_ms),
+        ended_at_unix_ms,
         wall_ms,
         cpu_ms,
         peak_memory_bytes: result.rusage.maxrss,
@@ -415,7 +415,7 @@ fn spawn_failed(
     } else {
         126
     };
-    let wall_ms = start.elapsed().as_millis();
+    let (started_at_unix_ms, ended_at_unix_ms, wall_ms) = finish_times(started_at_unix_ms, start);
     let measurement = Measurement {
         category,
         identity,
@@ -424,7 +424,7 @@ fn spawn_failed(
         exit_code: Some(code),
         signal: None,
         started_at_unix_ms,
-        ended_at_unix_ms: started_at_unix_ms.saturating_add(wall_ms),
+        ended_at_unix_ms,
         wall_ms,
         cpu_ms: 0,
         peak_memory_bytes: 0,
@@ -443,6 +443,13 @@ fn unix_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+fn finish_times(started_at_unix_ms: u128, start: Instant) -> (u128, u128, u128) {
+    let wall_ms = start.elapsed().as_millis();
+    let ended_at_unix_ms = unix_ms();
+    let started_at_unix_ms = started_at_unix_ms.min(ended_at_unix_ms.saturating_sub(wall_ms));
+    (started_at_unix_ms, ended_at_unix_ms, wall_ms)
 }
 
 fn measured_agent_kind() -> Option<&'static str> {

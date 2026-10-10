@@ -1889,14 +1889,15 @@ fn markdown_with_timeline(report: &Report, include_timeline: bool) -> String {
 }
 
 #[cfg(unix)]
-fn normalize_control_timestamps(measurements: &mut [Measurement]) {
-    for measurement in measurements {
+fn normalize_control_timestamps(mut measurements: Vec<Measurement>) -> Vec<Measurement> {
+    for measurement in &mut measurements {
         if measurement.ended_at_unix_ms < measurement.started_at_unix_ms {
-            measurement.ended_at_unix_ms = measurement
-                .started_at_unix_ms
-                .saturating_add(measurement.wall_ms);
+            measurement.started_at_unix_ms = measurement
+                .ended_at_unix_ms
+                .saturating_sub(measurement.wall_ms);
         }
     }
+    measurements
 }
 
 fn read_measurements(
@@ -1931,11 +1932,13 @@ fn read_measurements(
     for path in paths {
         let canonical = fs::canonicalize(path)?;
         if seen.insert(canonical.clone()) {
-            let mut measurements: Vec<Measurement> = read_jsonl(&canonical)?;
+            let measurements: Vec<Measurement> = read_jsonl(&canonical)?;
             #[cfg(unix)]
-            if control_canonical.as_ref() == Some(&canonical) {
-                normalize_control_timestamps(&mut measurements);
-            }
+            let measurements = if control_canonical.as_ref() == Some(&canonical) {
+                normalize_control_timestamps(measurements)
+            } else {
+                measurements
+            };
             all.extend(measurements);
         }
     }
@@ -1944,10 +1947,7 @@ fn read_measurements(
         match control_canonical {
             Some(canonical) if seen.insert(canonical.clone()) => {
                 match read_jsonl::<Measurement>(&canonical) {
-                    Ok(mut measurements) => {
-                        normalize_control_timestamps(&mut measurements);
-                        all.extend(measurements);
-                    }
+                    Ok(measurements) => all.extend(normalize_control_timestamps(measurements)),
                     Err(_) => *control = control::Summary::unavailable(),
                 }
             }
