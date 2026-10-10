@@ -1,4 +1,5 @@
 mod agent_observe;
+mod agent_setup;
 #[cfg(unix)]
 mod agents;
 #[cfg(unix)]
@@ -21,7 +22,6 @@ mod schedule;
 mod schedule_events;
 mod status;
 
-#[cfg(unix)]
 use clap::ValueEnum;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -180,6 +180,20 @@ enum CacheCommand {
 
 #[derive(Debug, Subcommand)]
 enum AgentCommand {
+    /// Detect installed agents and configure their bundled integrations.
+    Setup {
+        #[arg(value_enum)]
+        agent: Option<SetupAgent>,
+        /// Override the user home for agent configuration.
+        #[arg(long)]
+        home: Option<PathBuf>,
+        /// Override the `OpenCode` configuration directory.
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+        /// Check integrations without changing configuration.
+        #[arg(long)]
+        check: bool,
+    },
     /// Launch Codex or Claude Code with a process-scoped shim path.
     #[cfg(unix)]
     Launch {
@@ -201,6 +215,23 @@ enum AgentCommand {
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SetupAgent {
+    Codex,
+    Claude,
+    Opencode,
+}
+
+impl SetupAgent {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Opencode => "opencode",
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -322,6 +353,17 @@ fn record_mode(record: Option<&std::path::Path>, no_record: bool) -> run::Record
 
 fn agent_command(command: AgentCommand) -> std::process::ExitCode {
     match command {
+        AgentCommand::Setup {
+            agent,
+            home,
+            config_dir,
+            check,
+        } => result(agent_setup::run(
+            agent.map(SetupAgent::as_str),
+            home.as_deref(),
+            config_dir.as_deref(),
+            check,
+        )),
         #[cfg(unix)]
         AgentCommand::Launch {
             agent,

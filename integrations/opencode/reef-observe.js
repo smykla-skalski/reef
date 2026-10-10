@@ -1,3 +1,4 @@
+// Managed by Reef. Install with: reef agents setup opencode
 import { existsSync } from "node:fs"
 
 export default {
