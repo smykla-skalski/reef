@@ -20,6 +20,7 @@ impl Supervisor {
     pub fn start() -> std::io::Result<Self> {
         let mut process = Command::new(std::env::current_exe()?)
             .arg("__run-supervisor")
+            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

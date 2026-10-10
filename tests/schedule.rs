@@ -1,11 +1,12 @@
 #![cfg(unix)]
 
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
+use nix::sys::signal::{Signal, kill, killpg};
+use nix::unistd::{Pid, getpgid};
 use serde_json::Value;
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -528,6 +529,37 @@ fn launcher_death_before_pid_ack_stops_child_and_releases_lease() {
     Fixture::wait_until(|| !process_running(child_pid) && fixture.jobs().is_empty());
     assert!(!process_running(child_pid));
     assert_eq!(fixture.jobs(), Vec::<Value>::new());
+}
+
+#[test]
+fn interrupt_does_not_remove_launcher_death_supervision() {
+    let fixture = Fixture::new();
+    let marker = fixture.path.join("spawned-child-after-interrupt");
+    let mut launcher = fixture
+        .schedule(&["sh", "-c", "sleep 30"])
+        .env("REEF_TEST_PAUSE_BEFORE_ACK", &marker)
+        .process_group(0)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    Fixture::wait_until(|| marker.exists());
+    let child_pid: i32 = fs::read_to_string(&marker).unwrap().parse().unwrap();
+    let launcher_pid = Pid::from_raw(i32::try_from(launcher.id()).unwrap());
+    killpg(launcher_pid, Signal::SIGINT).unwrap();
+    kill(launcher_pid, Signal::SIGKILL).unwrap();
+    launcher.wait().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_running(child_pid) || !fixture.jobs().is_empty() {
+        if Instant::now() >= deadline {
+            if let Ok(group) = getpgid(Some(Pid::from_raw(child_pid))) {
+                let _ = killpg(group, Signal::SIGKILL);
+            }
+            panic!("command or scheduler lease survived launcher death after interrupt");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
