@@ -88,16 +88,24 @@ jobs:
             cat branch-error.txt >&2
             exit 1
           fi
+          if [[ "$branch_sha" != "$EXPECTED_SHA" ]]; then
+            status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$branch_sha...$EXPECTED_SHA" --jq '.status')
+            if [[ "$status" == ahead ]]; then
+              gh api "repos/$GITHUB_REPOSITORY/git/refs/heads/$branch" --method PATCH \
+                -f sha="$EXPECTED_SHA" -F force=false >/dev/null
+              branch_sha="$EXPECTED_SHA"
+            fi
+          fi
           if [[ "$branch_sha" == "$EXPECTED_SHA" ]]; then
             jq -n \
             --arg repo "$GITHUB_REPOSITORY" \
-            --arg branch "refs/heads/$branch" \
+            --arg branch "$branch" \
             --arg sha "$EXPECTED_SHA" \
             --arg version "$NEXT_VERSION" \
             --arg cargo "$(base64 -w0 Cargo.toml)" \
             --arg lock "$(base64 -w0 Cargo.lock)" \
             --arg marker "$(base64 -w0 .release-version)" \
-            '{query:"mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",variables:{input:{branch:{repositoryNameWithOwner:$repo,refName:$branch},expectedHeadOid:$sha,message:{headline:("chore(release): bump Reef to " + $version),body:"Signed-off-by: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"},fileChanges:{additions:[{path:"Cargo.toml",contents:$cargo},{path:"Cargo.lock",contents:$lock},{path:".release-version",contents:$marker}]}}}}' \
+            '{query:"mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",variables:{input:{branch:{repositoryNameWithOwner:$repo,branchName:$branch},expectedHeadOid:$sha,message:{headline:("chore(release): bump Reef to " + $version),body:"Signed-off-by: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"},fileChanges:{additions:[{path:"Cargo.toml",contents:$cargo},{path:"Cargo.lock",contents:$lock},{path:".release-version",contents:$marker}]}}}}' \
             | gh api graphql --input - --jq '.data.createCommitOnBranch.commit.oid' > commit-sha.txt
             commit_sha=$(<commit-sha.txt)
           else
