@@ -503,28 +503,31 @@ pub fn run(options: &ObserveOptions) -> io::Result<()> {
         .map_err(|error| io::Error::new(error.kind(), format!("open recorder PID: {error}")))?;
     let replacing_process =
         active_recorder_pid(&dir.join("recorder.pid"))? == Some(std::process::id());
-    pid_file
-        .set_len(0)
-        .map_err(|error| io::Error::new(error.kind(), format!("clear recorder PID: {error}")))?;
     let stop_path = dir.join(format!("stop-{}", std::process::id()));
     if stop_path.exists() {
         fs::remove_file(&stop_path)?;
         if replacing_process {
+            pid_file.set_len(0)?;
             return Ok(());
         }
     }
-    let pid = sysinfo::Pid::from_u32(std::process::id());
-    let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[pid]),
-        true,
-        ProcessRefreshKind::nothing(),
-    );
-    let started = system
-        .process(pid)
-        .ok_or_else(|| io::Error::other("cannot identify recorder process"))?
-        .start_time();
-    writeln!(pid_file, "{} {started}", std::process::id())?;
+    if !replacing_process {
+        pid_file.set_len(0).map_err(|error| {
+            io::Error::new(error.kind(), format!("clear recorder PID: {error}"))
+        })?;
+        let pid = sysinfo::Pid::from_u32(std::process::id());
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        let started = system
+            .process(pid)
+            .ok_or_else(|| io::Error::other("cannot identify recorder process"))?
+            .start_time();
+        writeln!(pid_file, "{} {started}", std::process::id())?;
+    }
     let result = record_loop(&dir, &stop_path, options);
     pid_file.set_len(0)?;
     result
