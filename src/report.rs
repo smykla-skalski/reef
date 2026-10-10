@@ -1,5 +1,7 @@
 #[cfg(unix)]
 use crate::cache_impact;
+#[cfg(unix)]
+use crate::control;
 use crate::history;
 use crate::schedule_events;
 use chrono::{DateTime, Duration, Utc};
@@ -33,6 +35,10 @@ pub struct Options {
     /// Scheduler state directory containing private intervention events.
     #[arg(long)]
     schedule_state_dir: Option<PathBuf>,
+    /// Private control experiment directory.
+    #[cfg(unix)]
+    #[arg(long)]
+    control_state_dir: Option<PathBuf>,
     /// Cache directory used by `reef cache run`.
     #[cfg(unix)]
     #[arg(long)]
@@ -215,6 +221,8 @@ struct Report {
     agent_comparison: Option<Vec<AgentComparison>>,
     agent_activity_comparison: Option<Vec<AgentActivityComparison>>,
     scheduler: Option<schedule_events::Summary>,
+    #[cfg(unix)]
+    control: control::Summary,
     #[cfg(unix)]
     cache: cache_impact::Impact,
 }
@@ -1153,8 +1161,7 @@ fn build_report_with_ticks(
     thresholds: (u8, u8, u8),
     scheduler: Option<schedule_events::Summary>,
 ) -> Report {
-    let from_ms = u128::try_from(from.timestamp_millis()).unwrap_or_default();
-    let to_ms = u128::try_from(to.timestamp_millis()).unwrap_or_default();
+    let (from_ms, to_ms) = range_millis(from, to);
     let samples = observations_in_range(samples, from_ms, to_ms);
     let mut agent_ticks = ticks_in_range(agent_data.ticks, from_ms, to_ms);
     let agent_rollups = rollups_in_range(agent_data.rollups, from_ms, to_ms);
@@ -1250,8 +1257,17 @@ fn build_report_with_ticks(
         agents: agents_available.then(|| agent_load.into_values().collect()),
         scheduler,
         #[cfg(unix)]
+        control: control::Summary::default(),
+        #[cfg(unix)]
         cache: cache_impact::Impact::default(),
     }
+}
+
+fn range_millis(from: DateTime<Utc>, to: DateTime<Utc>) -> (u128, u128) {
+    (
+        u128::try_from(from.timestamp_millis()).unwrap_or_default(),
+        u128::try_from(to.timestamp_millis()).unwrap_or_default(),
+    )
 }
 
 fn printable<T: std::fmt::Display>(value: Option<T>) -> String {
@@ -1801,6 +1817,25 @@ fn markdown_with_timeline(report: &Report, include_timeline: bool) -> String {
         readable_optional_bytes(report.swap_growth_bytes),
         printable(report.peak_command_concurrency),
     );
+    #[cfg(unix)]
+    {
+        out.push_str("## Opt-in control attempts\n\n");
+        if report.control.available {
+            let _ = write!(
+                out,
+                "- Attempted: {}\n- Completed: {}\n- Pending: {}\n- Unavailable: {}\n\n",
+                report.control.attempted.unwrap_or_default(),
+                report.control.completed.unwrap_or_default(),
+                report.control.pending.unwrap_or_default(),
+                report.control.unavailable.unwrap_or_default(),
+            );
+            if let Some(warning) = report.control.warning {
+                let _ = writeln!(out, "Warning: {warning}.\n");
+            }
+        } else {
+            out.push_str("Warning: private control telemetry is missing, unreadable, or invalid. Counts are unavailable.\n\n");
+        }
+    }
     out.push_str("## Commands\n\n");
     if let Some(categories) = &report.categories {
         out.push_str("Whole commands overlapping the range; percentages are shares of measured commands. Concurrent wall times can exceed elapsed time.\n\n");
@@ -1853,6 +1888,51 @@ fn markdown_with_timeline(report: &Report, include_timeline: bool) -> String {
     out
 }
 
+fn read_measurements(
+    options: &Options,
+    #[cfg(unix)] control: &mut control::Summary,
+) -> io::Result<Option<Vec<Measurement>>> {
+    #[cfg(unix)]
+    let control_path = control
+        .available
+        .then(|| control::measurements_path(options.control_state_dir.as_deref()).ok())
+        .flatten();
+    #[cfg(unix)]
+    if control.available && control_path.is_none() {
+        *control = control::Summary::unavailable();
+    }
+    let default_paths = history::paths()?;
+    let mut paths = default_paths.clone().unwrap_or_default();
+    paths.extend(options.records.iter().cloned());
+    #[cfg(unix)]
+    let available = default_paths.is_some() || !paths.is_empty() || control_path.is_some();
+    #[cfg(not(unix))]
+    let available = default_paths.is_some() || !paths.is_empty();
+    if !available {
+        return Ok(None);
+    }
+    let mut all = Vec::new();
+    let mut seen = BTreeSet::new();
+    for path in paths {
+        let canonical = fs::canonicalize(path)?;
+        if seen.insert(canonical.clone()) {
+            all.extend(read_jsonl(&canonical)?);
+        }
+    }
+    #[cfg(unix)]
+    if let Some(path) = control_path {
+        match fs::canonicalize(path) {
+            Ok(canonical) if seen.insert(canonical.clone()) => match read_jsonl(&canonical) {
+                Ok(measurements) => all.extend(measurements),
+                Err(_) => *control = control::Summary::unavailable(),
+            },
+            Ok(_) => {}
+            Err(_) => *control = control::Summary::unavailable(),
+        }
+    }
+    Ok(Some(all))
+}
+
 pub fn run(options: &Options) -> io::Result<()> {
     if (options.output.is_some() || options.open) && !matches!(options.format, Format::Html) {
         return Err(io::Error::new(
@@ -1885,20 +1965,16 @@ pub fn run(options: &Options) -> io::Result<()> {
     let host_series = html::HostSeries::from_samples(&samples, from, to);
     let agent_samples = agent_ticks(&dir)?;
     let agent_summaries = agent_rollups(&dir)?;
-    let default_paths = history::paths()?;
-    let records = if default_paths.is_none() && options.records.is_empty() {
-        None
-    } else {
-        let mut all = Vec::new();
-        let mut seen = BTreeSet::new();
-        for path in default_paths.iter().flatten().chain(options.records.iter()) {
-            let canonical = fs::canonicalize(path)?;
-            if seen.insert(canonical.clone()) {
-                all.extend(read_jsonl(&canonical)?);
-            }
-        }
-        Some(all)
-    };
+    #[cfg(unix)]
+    let mut control = control::summary(
+        options.control_state_dir.as_deref(),
+        u128::try_from(from.timestamp_millis()).unwrap_or_default(),
+        u128::try_from(to.timestamp_millis()).unwrap_or_default(),
+    );
+    #[cfg(unix)]
+    let records = read_measurements(options, &mut control)?;
+    #[cfg(not(unix))]
+    let records = read_measurements(options)?;
     let report = build_report_with_ticks(
         from,
         to,
@@ -1933,6 +2009,8 @@ pub fn run(options: &Options) -> io::Result<()> {
     #[cfg(unix)]
     let report = {
         let mut report = report;
+        report.control = control;
+        report.empty = report.empty && report.control.attempted.unwrap_or_default() == 0;
         report.cache = cache_impact::report(
             options.cache_dir.as_deref(),
             u128::try_from(from.timestamp_millis()).unwrap_or_default(),

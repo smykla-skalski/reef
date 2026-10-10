@@ -1,3 +1,4 @@
+use crate::control;
 use crate::tool_classification::classify;
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -24,7 +25,12 @@ pub fn shim_name() -> Option<String> {
     }
 }
 
-pub fn launch(agent: &str, state_dir: Option<&Path>, args: &[String]) -> io::Result<u8> {
+pub fn launch(
+    agent: &str,
+    state_dir: Option<&Path>,
+    control_mode: bool,
+    args: &[String],
+) -> io::Result<u8> {
     let original_path = env::var_os("REEF_AGENT_ORIGINAL_PATH")
         .or_else(|| env::var_os("PATH"))
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "PATH is not set"))?;
@@ -87,7 +93,15 @@ pub fn launch(agent: &str, state_dir: Option<&Path>, args: &[String]) -> io::Res
         .env("PATH", path)
         .env("REEF_AGENT_ORIGINAL_PATH", original_path)
         .env("REEF_AGENT_KIND", agent)
-        .env("REEF_AGENT_SESSION", session);
+        .env("REEF_AGENT_SESSION", session)
+        .env_remove("REEF_CONTROL_ATTEMPT")
+        .env_remove("REEF_ADMITTED");
+    if control_mode {
+        let control_dir = control::prepare(state_dir)?;
+        process.env("REEF_AGENT_CONTROL_DIR", control_dir);
+    } else {
+        process.env_remove("REEF_AGENT_CONTROL_DIR");
+    }
     if let Some(path) = state_dir {
         process.env("REEF_AGENT_STATE_DIR", path);
     }
@@ -102,8 +116,13 @@ pub fn shim(tool: &str) -> io::Result<u8> {
     let Some(category) = classify(tool, &args) else {
         return Err(Command::new(original).args(&args).exec());
     };
-    if env::var_os("REEF_ADMITTED").as_deref() == Some(OsStr::new("1")) {
+    if env::var_os("REEF_ADMITTED").as_deref() == Some(OsStr::new("1"))
+        || env::var_os("REEF_CONTROL_ATTEMPT").is_some()
+    {
         return Err(Command::new(original).args(&args).exec());
+    }
+    if env::var_os("REEF_AGENT_CONTROL_DIR").is_some() {
+        return control::run(&original, &args, category);
     }
     if args.iter().any(|arg| arg.to_str().is_none()) {
         return Err(io::Error::new(

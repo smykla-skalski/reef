@@ -572,6 +572,26 @@ pub(super) fn render(report: &Report, series: &HostSeries, include_timeline: boo
         );
     }
     out.push_str("</div>");
+    #[cfg(unix)]
+    {
+        out.push_str("<section><h2>Opt-in control attempts</h2>");
+        if report.control.available {
+            let _ = write!(
+                out,
+                "<p>Attempted: {} · Completed: {} · Pending: {} · Unavailable: {}</p>",
+                report.control.attempted.unwrap_or_default(),
+                report.control.completed.unwrap_or_default(),
+                report.control.pending.unwrap_or_default(),
+                report.control.unavailable.unwrap_or_default(),
+            );
+            if let Some(warning) = report.control.warning {
+                let _ = write!(out, "<p class=\"note\">Warning: {}.</p>", escape(warning));
+            }
+        } else {
+            out.push_str("<p class=\"note\">Warning: private control telemetry is missing, unreadable, or invalid. Counts are unavailable.</p>");
+        }
+        out.push_str("</section>");
+    }
     out.push_str(&host_charts(report, series));
     out.push_str(&memory_consumers(report, series));
     out.push_str(&agent_comparison(report));

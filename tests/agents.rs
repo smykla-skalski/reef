@@ -28,9 +28,10 @@ impl Fixture {
         fs::create_dir(&bin).unwrap();
         write_script(&bin.join("codex"), "#!/bin/sh\nexec \"$@\"\n");
         write_script(&bin.join("claude"), "#!/bin/sh\nexec \"$@\"\n");
+        write_script(&bin.join("opencode"), "#!/bin/sh\nexec \"$@\"\n");
         write_script(
             &bin.join("go"),
-            "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$REEF_ADMITTED\" \"$REEF_AGENT_KIND\" \"$*\" >> \"$REEF_TEST_OUTPUT\"\nif [ \"$REEF_TEST_NESTED_ENABLED\" = 1 ] && [ -z \"$REEF_TEST_NESTED\" ]; then REEF_TEST_NESTED=1 go test nested; fi\nexit 7\n",
+            "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$REEF_ADMITTED\" \"$REEF_AGENT_KIND\" \"$*\" >> \"$REEF_TEST_OUTPUT\"\nif [ \"$REEF_TEST_PAUSE\" = 1 ]; then touch \"$REEF_TEST_MARKER\"; sleep 2; fi\nif [ \"$REEF_TEST_NESTED_ENABLED\" = 1 ] && [ -z \"$REEF_TEST_NESTED\" ]; then REEF_TEST_NESTED=1 go test nested; fi\nexit 7\n",
         );
         for tool in ["cargo", "make"] {
             write_script(
@@ -71,6 +72,10 @@ impl Fixture {
     }
 
     fn launch(&self, agent: &str, args: &[&str]) -> Command {
+        self.launch_mode(agent, args, false)
+    }
+
+    fn launch_mode(&self, agent: &str, args: &[&str], control: bool) -> Command {
         let mut command = reef();
         let path = std::env::join_paths(
             std::iter::once(self.path.join("bin"))
@@ -79,13 +84,30 @@ impl Fixture {
         .unwrap();
         command
             .args(["agents", "launch", agent, "--state-dir"])
-            .arg(&self.path)
+            .arg(&self.path);
+        if control {
+            command.arg("--control");
+        }
+        command
             .arg("--")
             .args(args)
             .env("PATH", path)
             .env("HOME", &self.path)
             .env("REEF_TEST_OUTPUT", self.path.join("output"));
         command
+    }
+
+    fn control_report(&self) -> serde_json::Value {
+        let output = reef()
+            .args(["report", "--format", "json", "--state-dir"])
+            .arg(&self.path)
+            .arg("--control-state-dir")
+            .arg(self.path.join("control"))
+            .env("HOME", &self.path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice(&output.stdout).unwrap()
     }
 }
 
@@ -232,4 +254,196 @@ fn simultaneous_agent_launches_share_private_shims() {
     for output in [first.join().unwrap(), second.join().unwrap()] {
         assert_eq!(output.status.code(), Some(7), "{output:?}");
     }
+}
+
+#[test]
+fn control_counts_one_attempt_per_top_level_command_without_scheduler() {
+    for agent in ["codex", "claude", "opencode"] {
+        let fixture = Fixture::new(false);
+        let ready = reef()
+            .args(["agents", "launch", agent, "--control", "--state-dir"])
+            .arg(&fixture.path)
+            .env(
+                "PATH",
+                std::env::join_paths(
+                    std::iter::once(fixture.path.join("bin"))
+                        .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+                )
+                .unwrap(),
+            )
+            .args(["--", "go", "env"])
+            .env("HOME", &fixture.path)
+            .env("REEF_TEST_OUTPUT", fixture.path.join("output"))
+            .output()
+            .unwrap();
+        assert_eq!(ready.status.code(), Some(7));
+        let empty = fixture.control_report();
+        assert_eq!(empty["control"]["available"], true);
+        assert_eq!(empty["control"]["attempted"], 0);
+        let output = fixture
+            .launch_mode(agent, &["go", "test", "private-argument"], true)
+            .env("REEF_TEST_NESTED_ENABLED", "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(7), "{output:?}");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("queued request"));
+        let report = fixture.control_report();
+        assert_eq!(report["control"]["attempted"], 1);
+        assert_eq!(report["control"]["completed"], 1);
+        assert_eq!(report["control"]["pending"], 0);
+        assert_eq!(report["control"]["unavailable"], 0);
+        assert_eq!(report["command_count"], 1);
+        assert_eq!(report["agent_commands"][0]["agent"], agent);
+        let events = fs::read_to_string(fixture.path.join("control/attempts.jsonl")).unwrap();
+        let measurements =
+            fs::read_to_string(fixture.path.join("control/measurements.jsonl")).unwrap();
+        assert_eq!(events.lines().count(), 2);
+        assert_eq!(measurements.lines().count(), 1);
+        assert!(events.contains("\"assignment\":\"control\""));
+        assert!(!events.contains("private-argument"));
+        assert!(!measurements.contains("private-argument"));
+        assert!(!events.contains(fixture.path.to_str().unwrap()));
+        assert!(!measurements.contains(fixture.path.to_str().unwrap()));
+        assert_eq!(
+            fs::metadata(fixture.path.join("control/attempts.jsonl"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+}
+
+#[test]
+fn control_refuses_unwritable_telemetry_and_report_warns_on_missing_telemetry() {
+    let fixture = Fixture::new(false);
+    let missing = fixture.control_report();
+    assert_eq!(missing["control"]["available"], false);
+    assert!(missing["control"]["attempted"].is_null());
+    assert!(
+        missing["control"]["warning"]
+            .as_str()
+            .unwrap()
+            .contains("missing")
+    );
+    let dir = fixture.path.join("control");
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = fixture
+        .launch_mode("codex", &["go", "test"], true)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!fixture.path.join("output").exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("control enrollment refused"));
+    assert_eq!(fixture.control_report()["control"]["available"], false);
+}
+
+#[test]
+fn missing_control_measurements_warn_after_enrollment() {
+    let fixture = Fixture::new(false);
+    let output = fixture
+        .launch_mode("codex", &["go", "test"], true)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7));
+    fs::remove_file(fixture.path.join("control/measurements.jsonl")).unwrap();
+    let report = fixture.control_report();
+    assert_eq!(report["control"]["available"], false);
+    assert!(report["control"]["attempted"].is_null());
+    let before = fs::read_to_string(fixture.path.join("output")).unwrap();
+    let output = fixture
+        .launch_mode("codex", &["go", "test"], true)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("control enrollment refused"));
+    assert_eq!(
+        fs::read_to_string(fixture.path.join("output")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn lost_control_measurement_is_unavailable_and_blocks_new_enrollment() {
+    let fixture = Fixture::new(false);
+    assert_eq!(
+        fixture
+            .launch_mode("codex", &["go", "test"], true)
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(7)
+    );
+    fs::write(fixture.path.join("control/measurements.jsonl"), b"").unwrap();
+    let report = fixture.control_report();
+    assert_eq!(report["control"]["available"], true);
+    assert_eq!(report["control"]["attempted"], 1);
+    assert_eq!(report["control"]["completed"], 0);
+    assert_eq!(report["control"]["pending"], 0);
+    assert_eq!(report["control"]["unavailable"], 1);
+    assert!(
+        report["control"]["warning"]
+            .as_str()
+            .unwrap()
+            .contains("missing")
+    );
+    let before = fs::read_to_string(fixture.path.join("output")).unwrap();
+    let output = fixture
+        .launch_mode("codex", &["go", "test"], true)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("control enrollment refused"));
+    assert_eq!(
+        fs::read_to_string(fixture.path.join("output")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn repeated_control_commands_receive_distinct_attempt_ids() {
+    let fixture = Fixture::new(false);
+    for _ in 0..2 {
+        let output = fixture
+            .launch_mode("codex", &["go", "test"], true)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(7));
+    }
+    let report = fixture.control_report();
+    assert_eq!(report["control"]["attempted"], 2);
+    assert_eq!(report["control"]["completed"], 2);
+    let events = fs::read_to_string(fixture.path.join("control/attempts.jsonl")).unwrap();
+    let identities: std::collections::BTreeSet<_> = events
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|record| record["event"] == "assigned")
+        .map(|record| record["attempt_id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(identities.len(), 2);
+    assert!(identities.iter().all(|id| id.len() == 32));
+}
+
+#[test]
+fn running_control_attempt_is_pending_until_its_measurement_finishes() {
+    let fixture = Fixture::new(false);
+    let marker = fixture.path.join("started");
+    let child = fixture
+        .launch_mode("codex", &["go", "test"], true)
+        .env("REEF_TEST_PAUSE", "1")
+        .env("REEF_TEST_MARKER", &marker)
+        .spawn()
+        .unwrap();
+    wait_until(|| marker.exists());
+    let pending = fixture.control_report();
+    assert_eq!(pending["control"]["attempted"], 1);
+    assert_eq!(pending["control"]["pending"], 1);
+    assert_eq!(pending["control"]["completed"], 0);
+    assert_eq!(child.wait_with_output().unwrap().status.code(), Some(7));
+    let completed = fixture.control_report();
+    assert_eq!(completed["control"]["pending"], 0);
+    assert_eq!(completed["control"]["completed"], 1);
 }

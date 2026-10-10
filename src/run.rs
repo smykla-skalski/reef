@@ -1,6 +1,7 @@
 mod platform;
 
 use crate::contain::{Boundary, Containment, Limits};
+use crate::control;
 use crate::history;
 use fs2::FileExt;
 use serde::Serialize;
@@ -20,12 +21,14 @@ const SAMPLE_INTERVAL: Duration = Duration::from_millis(20);
 pub enum RecordMode<'a> {
     Default,
     Custom(&'a Path),
+    Control(&'a Path),
     Disabled,
 }
 
 enum RecordWriter {
     History,
     Custom(File),
+    Control(File),
     Disabled,
 }
 
@@ -144,7 +147,7 @@ pub fn run_with_limits(
     limits: &Limits,
 ) -> io::Result<u8> {
     let mut containment = Containment::prepare(limits)?;
-    let mut record_writer = open_record_writer(record);
+    let mut record_writer = open_record_writer(record)?;
 
     let mut signals = platform::signals()?;
     let started_at_unix_ms = unix_ms();
@@ -155,6 +158,7 @@ pub fn run_with_limits(
         interactive,
         admission.is_some(),
         containment.as_ref(),
+        matches!(record, RecordMode::Control(_)).then_some(identity),
     )?;
     let mut child = match process.spawn() {
         Ok(child) => child,
@@ -166,7 +170,7 @@ pub fn run_with_limits(
                 started_at_unix_ms,
                 start,
                 &mut record_writer,
-            );
+            )?;
             if let Some(lease) = admission.as_mut() {
                 let _ = lease.finished("failed");
             }
@@ -186,16 +190,12 @@ pub fn run_with_limits(
     let cpu_ms = (result.rusage.utime + result.rusage.stime).as_millis();
     let signal = exit_signal;
     let exit_code = result.status.code();
-    let status = if scheduler_cancelled
-        || forwarded.is_some()
-        || signal.is_some_and(platform::is_interrupt_signal)
-    {
-        "cancelled"
-    } else if result.status.success() {
-        "success"
-    } else {
-        "failed"
-    };
+    let status = measured_status(
+        scheduler_cancelled,
+        forwarded,
+        signal,
+        result.status.success(),
+    );
     let measurement = Measurement {
         category,
         identity,
@@ -215,7 +215,7 @@ pub fn run_with_limits(
             .as_ref()
             .map_or_else(Vec::new, Containment::boundaries),
     };
-    report(&measurement, &mut record_writer);
+    let recording = report(&measurement, &mut record_writer);
     let group_cleanup = if (admission.is_some() && !scheduler_cancelled)
         || forwarded.is_some()
         || (exit_signal.is_some() && !scheduler_cancelled)
@@ -228,6 +228,7 @@ pub fn run_with_limits(
     let scope_cleanup = containment.as_ref().map_or(Ok(()), Containment::finish);
     group_cleanup?;
     scope_cleanup?;
+    recording?;
     if scheduler_lost {
         return Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
@@ -244,6 +245,21 @@ pub fn run_with_limits(
         || 128_u8.saturating_add(u8::try_from(signal.or(forwarded).unwrap_or(1)).unwrap_or(1)),
         |code| u8::try_from(code).unwrap_or(1),
     ))
+}
+
+fn measured_status(
+    cancelled: bool,
+    forwarded: Option<i32>,
+    signal: Option<i32>,
+    success: bool,
+) -> &'static str {
+    if cancelled || forwarded.is_some() || signal.is_some_and(platform::is_interrupt_signal) {
+        "cancelled"
+    } else if success {
+        "success"
+    } else {
+        "failed"
+    }
 }
 
 fn prepare_child(
@@ -362,7 +378,7 @@ fn spawn_failed(
     started_at_unix_ms: u128,
     start: Instant,
     record_writer: &mut RecordWriter,
-) -> u8 {
+) -> io::Result<u8> {
     let code = if error.kind() == io::ErrorKind::NotFound {
         127
     } else {
@@ -386,8 +402,8 @@ fn spawn_failed(
         limit_boundaries: Vec::new(),
     };
     eprintln!("reef: command could not start: {error}");
-    report(&measurement, record_writer);
-    u8::try_from(code).unwrap_or(1)
+    report(&measurement, record_writer)?;
+    Ok(u8::try_from(code).unwrap_or(1))
 }
 
 fn unix_ms() -> u128 {
@@ -411,6 +427,7 @@ fn command_process(
     interactive: bool,
     scheduled: bool,
     containment: Option<&Containment>,
+    control_attempt: Option<&str>,
 ) -> io::Result<Command> {
     let command = if let Some(scope) = containment {
         let process = scope.command(command)?;
@@ -437,6 +454,9 @@ fn command_process(
         .stderr(Stdio::inherit());
     if scheduled {
         process.env("REEF_ADMITTED", "1");
+    }
+    if let Some(attempt) = control_attempt {
+        process.env("REEF_CONTROL_ATTEMPT", attempt);
     }
     platform::isolate(&mut process);
     Ok(process)
@@ -470,19 +490,31 @@ fn emit(measurement: &Measurement<'_>, writer: &mut RecordWriter) -> io::Result<
             file.write_all(&line)?;
             FileExt::unlock(file)?;
         }
+        RecordWriter::Control(file) => {
+            file.lock_exclusive()?;
+            let mut line = serde_json::to_vec(measurement)?;
+            line.push(b'\n');
+            file.write_all(&line)?;
+            file.sync_data()?;
+            FileExt::unlock(file)?;
+        }
         RecordWriter::Disabled => {}
     }
     Ok(())
 }
 
-fn report(measurement: &Measurement<'_>, writer: &mut RecordWriter) {
+fn report(measurement: &Measurement<'_>, writer: &mut RecordWriter) -> io::Result<()> {
     if let Err(error) = emit(measurement, writer) {
         eprintln!("reef: cannot save measurement: {error}");
+        if matches!(writer, RecordWriter::Control(_)) {
+            return Err(error);
+        }
     }
+    Ok(())
 }
 
-fn open_record_writer(record: RecordMode<'_>) -> RecordWriter {
-    match record {
+fn open_record_writer(record: RecordMode<'_>) -> io::Result<RecordWriter> {
+    Ok(match record {
         RecordMode::Default => RecordWriter::History,
         RecordMode::Disabled => RecordWriter::Disabled,
         RecordMode::Custom(path) => match open_record(path) {
@@ -492,7 +524,8 @@ fn open_record_writer(record: RecordMode<'_>) -> RecordWriter {
                 RecordWriter::Disabled
             }
         },
-    }
+        RecordMode::Control(path) => RecordWriter::Control(control::private_file(path, false)?),
+    })
 }
 
 fn open_record(path: &Path) -> io::Result<File> {
