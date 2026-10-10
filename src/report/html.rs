@@ -136,6 +136,25 @@ fn compact_points(points: &[Point]) -> Vec<Point> {
     selected
 }
 
+fn gap_boundaries(points: &[Point]) -> Vec<u64> {
+    let mut intervals: Vec<_> = points
+        .windows(2)
+        .map(|pair| pair[1].at_ms.saturating_sub(pair[0].at_ms))
+        .filter(|interval| *interval > 0)
+        .collect();
+    if intervals.is_empty() {
+        return Vec::new();
+    }
+    intervals.sort_unstable();
+    let cadence = intervals[intervals.len() / 2].min(300_000);
+    let limit = cadence.saturating_mul(3).max(60_000);
+    points
+        .windows(2)
+        .filter(|pair| pair[1].at_ms.saturating_sub(pair[0].at_ms) > limit)
+        .map(|pair| pair[1].at_ms)
+        .collect()
+}
+
 #[derive(Clone, Copy)]
 struct ChartSpec<'a> {
     id: &'a str,
@@ -170,14 +189,20 @@ fn chart(spec: ChartSpec<'_>) -> String {
     let visible = compact_points(points);
     let span = number(to_ms.saturating_sub(from_ms).max(1));
     let ceiling = max_value.max(1.0);
-    let gap_limit = 300_000_u64.max(to_ms.saturating_sub(from_ms) / 80);
+    let gaps = gap_boundaries(points);
+    let mut next_gap = 0;
     let mut path = String::new();
     let mut previous = None;
     for point in &visible {
         let x = PLOT_LEFT
             + (number(point.at_ms.saturating_sub(from_ms)) / span) * (PLOT_RIGHT - PLOT_LEFT);
         let y = PLOT_BOTTOM - point.value.min(ceiling) / ceiling * (PLOT_BOTTOM - PLOT_TOP);
-        let command = if previous.is_some_and(|at| point.at_ms.saturating_sub(at) <= gap_limit) {
+        let mut crossed_gap = false;
+        while next_gap < gaps.len() && gaps[next_gap] <= point.at_ms {
+            crossed_gap |= previous.is_some_and(|at| gaps[next_gap] > at);
+            next_gap += 1;
+        }
+        let command = if previous.is_some() && !crossed_gap {
             'L'
         } else {
             'M'
@@ -446,5 +471,33 @@ mod tests {
         );
         assert_eq!(reduced.first().unwrap().at_ms, 0);
         assert_eq!(reduced.last().unwrap().at_ms, 9_999);
+    }
+
+    #[test]
+    fn a_collection_gap_remains_disconnected_after_downsampling() {
+        let points: Vec<_> = (0..1_000)
+            .map(|index| Point {
+                at_ms: index * 1_000 + u64::from(index >= 500) * 120_000,
+                value: 50.0,
+            })
+            .collect();
+        let output = chart(ChartSpec {
+            id: "cpu",
+            title: "CPU",
+            points: &points,
+            from_ms: 0,
+            to_ms: 1_200_000,
+            max_value: 100.0,
+            unit: "%",
+            threshold: None,
+        });
+        let path = output
+            .split("class=\"series\" d=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        assert_eq!(path.matches('M').count(), 2);
     }
 }
