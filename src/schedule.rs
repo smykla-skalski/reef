@@ -22,6 +22,39 @@ use sysinfo::System;
 const POLL: Duration = Duration::from_millis(50);
 const MIB: u64 = 1_048_576;
 
+pub(crate) fn default_budget(cpu_cores: u32, memory_total: u64) -> (u32, u64) {
+    (
+        cpu_cores.saturating_sub(1).max(1),
+        (memory_total / MIB)
+            .saturating_mul(70)
+            .saturating_div(100)
+            .max(1),
+    )
+}
+
+pub(crate) fn admission_reason(
+    pressure: Option<&Monitor>,
+    estimate: (u32, u64),
+    running: (usize, u32, u64),
+    budget: (u32, u64, u32),
+    now: Instant,
+) -> Option<&'static str> {
+    if let Some(reason) = pressure
+        .and_then(|monitor| monitor.wait_reason(estimate.0, estimate.1, running.1, running.2, now))
+    {
+        return Some(reason);
+    }
+    if running.0 >= budget.2 as usize {
+        Some("running limit reached")
+    } else if estimate.0 > budget.0.saturating_sub(running.1) {
+        Some("CPU budget in use")
+    } else if estimate.1 > budget.1.saturating_sub(running.2) {
+        Some("memory budget in use")
+    } else {
+        None
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Request {
@@ -150,22 +183,14 @@ impl State {
         let used_cpu: u32 = self.running.values().map(|job| job.cpu).sum();
         let used_memory: u64 = self.running.values().map(|job| job.memory_mib).sum();
         let first = self.waiting.front().expect("checked front");
-        if self.pressure.as_ref().is_some_and(|pressure| {
-            pressure
-                .wait_reason(
-                    first.cpu,
-                    first.memory_mib,
-                    used_cpu,
-                    used_memory,
-                    std::time::Instant::now(),
-                )
-                .is_some()
-        }) {
-            return false;
-        }
-        if self.running.len() >= self.max_running as usize
-            || first.cpu > self.cpu - used_cpu
-            || first.memory_mib > self.memory_mib - used_memory
+        if admission_reason(
+            self.pressure.as_ref(),
+            (first.cpu, first.memory_mib),
+            (self.running.len(), used_cpu, used_memory),
+            (self.cpu, self.memory_mib, self.max_running),
+            Instant::now(),
+        )
+        .is_some()
         {
             return false;
         }
@@ -229,27 +254,17 @@ impl State {
         let used_cpu: u32 = self.running.values().map(|job| job.cpu).sum();
         let used_memory: u64 = self.running.values().map(|job| job.memory_mib).sum();
         let job = self.waiting.front()?;
-        let pressure_reason = self.pressure.as_ref().and_then(|pressure| {
-            pressure.wait_reason(
-                job.cpu,
-                job.memory_mib,
-                used_cpu,
-                used_memory,
-                std::time::Instant::now(),
-            )
-        });
         let reason = if position > 1 {
             "waiting for earlier requests"
-        } else if let Some(reason) = pressure_reason {
-            reason
-        } else if self.running.len() >= self.max_running as usize {
-            "running limit reached"
-        } else if job.cpu > self.cpu - used_cpu {
-            "CPU budget in use"
-        } else if job.memory_mib > self.memory_mib - used_memory {
-            "memory budget in use"
         } else {
-            "awaiting admission"
+            admission_reason(
+                self.pressure.as_ref(),
+                (job.cpu, job.memory_mib),
+                (self.running.len(), used_cpu, used_memory),
+                (self.cpu, self.memory_mib, self.max_running),
+                Instant::now(),
+            )
+            .unwrap_or("awaiting admission")
         };
         Some((position, reason.into()))
     }
@@ -317,18 +332,12 @@ pub fn serve(
 ) -> io::Result<()> {
     let mut system = System::new_all();
     system.refresh_memory();
-    let cpu = cpu.unwrap_or_else(|| {
-        u32::try_from(system.cpus().len())
-            .unwrap_or(u32::MAX)
-            .saturating_sub(1)
-            .max(1)
-    });
-    let memory_mib = memory_mib.unwrap_or_else(|| {
-        (system.total_memory() / MIB)
-            .saturating_mul(70)
-            .saturating_div(100)
-            .max(1)
-    });
+    let defaults = default_budget(
+        u32::try_from(system.cpus().len()).unwrap_or(u32::MAX),
+        system.total_memory(),
+    );
+    let cpu = cpu.unwrap_or(defaults.0);
+    let memory_mib = memory_mib.unwrap_or(defaults.1);
     let max_running = max_running.unwrap_or(cpu);
     let monitor = make_monitor(pressure_options, &system)?;
     let dir = state_path(state_dir)?;

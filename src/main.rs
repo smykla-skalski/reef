@@ -20,6 +20,8 @@ mod run;
 #[cfg(unix)]
 mod schedule;
 mod schedule_events;
+#[cfg(unix)]
+mod shadow;
 mod status;
 mod tool_classification;
 
@@ -143,6 +145,9 @@ enum Command {
     Report(report::Options),
     /// Compare two observed workstation periods without causal claims.
     Compare(report::CompareOptions),
+    /// Replay hypothetical admission decisions from passive host samples.
+    #[cfg(unix)]
+    Shadow(shadow::ShadowOptions),
 }
 
 #[cfg(unix)]
@@ -472,6 +477,8 @@ fn main() -> std::process::ExitCode {
         }
         Command::Report(options) => report_result(report::run(&options)),
         Command::Compare(options) => report_result(report::run_compare(&options)),
+        #[cfg(unix)]
+        Command::Shadow(options) => report_result(shadow::run(&options)),
     }
 }
 

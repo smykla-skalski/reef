@@ -100,6 +100,60 @@ impl Policy {
             recovery: Duration::from_secs(options.recovery_seconds),
         })
     }
+
+    /// Evaluate a single observation without inferring recovery state between samples.
+    pub(crate) fn snapshot_reason(
+        &self,
+        cpu_percent: Option<f64>,
+        memory_used: Option<u64>,
+        cpu: u32,
+        memory_mib: u64,
+    ) -> Option<&'static str> {
+        let Some(cpu_percent) =
+            cpu_percent.filter(|value| value.is_finite() && *value >= 0.0 && *value <= 100.0)
+        else {
+            return Some("CPU pressure is unavailable");
+        };
+        let Some(memory_used) = memory_used.filter(|&used| used <= self.memory_total) else {
+            return Some("memory pressure is unavailable");
+        };
+        if cpu_percent >= f64::from(self.cpu_high)
+            || u128::from(memory_used) * 100
+                >= u128::from(self.memory_total) * u128::from(self.memory_high)
+        {
+            return Some("machine pressure exceeds the high threshold");
+        }
+        self.reserve_reason(cpu_percent, memory_used, cpu, memory_mib, 0, 0)
+    }
+
+    fn reserve_reason(
+        &self,
+        cpu_percent: f64,
+        memory_used: u64,
+        cpu: u32,
+        memory_mib: u64,
+        running_cpu: u32,
+        running_memory_mib: u64,
+    ) -> Option<&'static str> {
+        let idle_cores = (1.0 - cpu_percent / 100.0) * f64::from(self.cpu_cores);
+        if idle_cores
+            < f64::from(
+                cpu.saturating_add(running_cpu)
+                    .saturating_add(self.cpu_reserve),
+            )
+        {
+            return Some("interactive CPU reserve would be consumed");
+        }
+        if u128::from(memory_used)
+            + u128::from(memory_mib) * u128::from(MIB)
+            + u128::from(running_memory_mib) * u128::from(MIB)
+            + u128::from(self.memory_reserve)
+            > u128::from(self.memory_total)
+        {
+            return Some("interactive memory reserve would be consumed");
+        }
+        None
+    }
 }
 
 impl Monitor {
@@ -183,24 +237,14 @@ impl Monitor {
         if self.held {
             return Some("machine pressure is above the recovery threshold");
         }
-        let idle_cores = (1.0 - f64::from(cpu_percent) / 100.0) * f64::from(self.policy.cpu_cores);
-        if idle_cores
-            < f64::from(
-                cpu.saturating_add(running_cpu)
-                    .saturating_add(self.policy.cpu_reserve),
-            )
-        {
-            return Some("interactive CPU reserve would be consumed");
-        }
-        if u128::from(memory_used)
-            + u128::from(memory_mib) * u128::from(MIB)
-            + u128::from(running_memory_mib) * u128::from(MIB)
-            + u128::from(self.policy.memory_reserve)
-            > u128::from(self.policy.memory_total)
-        {
-            return Some("interactive memory reserve would be consumed");
-        }
-        None
+        self.policy.reserve_reason(
+            f64::from(cpu_percent),
+            memory_used,
+            cpu,
+            memory_mib,
+            running_cpu,
+            running_memory_mib,
+        )
     }
 }
 

@@ -72,6 +72,18 @@ Estimate commands from `reef run` measurements and leave headroom for interactiv
 
 The server also samples live CPU and memory usage every second. New jobs wait during high pressure (90% CPU or memory), until both metrics stay below recovery thresholds (70% CPU and 80% memory) for five seconds. A stale or unavailable sample also holds admission. For each new job, Reef preserves one idle logical CPU on machines with more than two cores and 10% of physical memory by default; it never stops a running job because pressure rose. The admission check counts active reservations alongside sampled usage, which can hold more work than necessary when a running job already contributes to that sample. Use `--cpu-reserve`, `--memory-reserve-mib`, `--cpu-high-percent`, `--cpu-recover-percent`, `--memory-high-percent`, `--memory-recover-percent`, and `--recovery-seconds` on `reef serve` to tune the policy. Reserve values must be below machine capacity and each recovery threshold must be below its high threshold. `--no-pressure` disables live admission checks when needed for isolated testing. At critical pressure (98% CPU or 97% memory), the server logs a notice with the safe labels of tracked workloads and points to `reef queue`. Notices repeat at most once per minute.
 
+### Shadow admission replay
+
+Use `reef shadow` to inspect how one hypothetical job would fare at each recorded host sample, without starting the scheduler or delaying any agent:
+
+```console
+reef shadow --cpu 1 --memory-mib 1024
+reef shadow --cpu 2 --memory-mib 4096 --format json
+reef shadow --from 2026-10-09T09:00:00Z --to 2026-10-09T17:00:00Z --cpu-high-percent 85
+```
+
+The replay uses the scheduler's default static budget and pressure threshold/reserve settings unless you override them. It counts sampled points where a hypothetical new request would pass, fail, or lack enough data, plus overlap with registered agent kinds. It does **not** reconstruct real command arrivals, running reservations, FIFO, queue time, recovery dwell between samples, or workload savings. Host observations are often one minute apart; counts are not durations. An agent overlapping a blocked sample did not necessarily cause that pressure. Compare policy settings on the same range before enabling `reef serve`, then validate with real scheduler outcomes once traffic is routed through it.
+
 ## Coding-agent commands (Unix)
 
 Start the scheduler, then launch a local Codex or Claude Code CLI session through Reef:
@@ -150,7 +162,9 @@ The default range is the last 24 hours. Its start is inclusive and its end is ex
 
 Markdown shows memory and I/O in binary units (KiB, MiB, GiB) and counts host observations that contain active agents. JSON keeps exact byte values and separate counts for one-second agent ticks and compacted rollups; those counts can be zero while host observations still contain agent load.
 
-`--format html` prints a self-contained report to stdout. Add `--output path.html` to save it as a new file, then `--open` to launch that file in the default browser. Reef refuses to overwrite an existing file. On Unix, saved files have mode `0600`. A headless Linux host can generate the file, but `--open` requires a configured browser. The page works offline and includes sampled CPU, memory, and swap time series, a command-family cost breakdown, and report summary cards. Charts preserve sampled peaks while bounding the number of plotted points; gaps are not connected. They show observations, not causal attribution or continuous monitoring. Add `--timeline` only when you need a table of individual pressure intervals. HTML output does not load scripts, fonts, or chart assets from the network. Treat the saved page as private workstation data and remove it when no longer needed.
+The activity-adjusted agent comparison divides sampled CPU and I/O by each agent kind's observed active time. Its activity mix divides classified build, test, lint, and other descendant-command CPU by all classified descendant-command CPU for that agent. It is not a share of host CPU or a causal cost allocation. Peak RSS remains an absolute peak. The comparison is available in Markdown, JSON, and HTML.
+
+`--format html` prints a self-contained report to stdout. Add `--output path.html` to save it as a new file, then `--open` to launch that file in the default browser. Reef refuses to overwrite an existing file. On Unix, saved files have mode `0600`. A headless Linux host can generate the file, but `--open` requires a configured browser. The page works offline and includes sampled CPU, memory, swap, and root-disk usage time series, privacy-safe memory-consumer family charts, a command-family cost breakdown, and report summary cards. Family charts share a scale and show the five largest families by mean RSS; the table lists all families. RSS can count shared pages more than once and does not add up to host used memory. Charts preserve sampled peaks while bounding the number of plotted points; gaps are not connected. They show observations, not causal attribution or continuous monitoring. Add `--timeline` only when you need a table of individual pressure intervals. HTML output does not load scripts, fonts, or chart assets from the network. Treat the saved page as private workstation data and remove it when no longer needed.
 
 Compare a baseline with a later, non-overlapping period:
 

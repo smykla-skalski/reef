@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sysinfo::{Disks, ProcessRefreshKind, ProcessesToUpdate, System};
 
 mod commands;
+mod memory;
 mod platform;
 #[cfg(unix)]
 mod reload;
@@ -30,6 +31,7 @@ struct Observation {
     root_disk_total_bytes: Option<u64>,
     processes: Vec<ProcessObservation>,
     agents: Vec<AgentObservation>,
+    memory_consumers: Vec<MemoryConsumer>,
     #[serde(skip_serializing)]
     commands: Vec<CommandObservation>,
 }
@@ -42,6 +44,14 @@ struct ProcessObservation {
     memory_bytes: Option<u64>,
     read_bytes: Option<u64>,
     written_bytes: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct MemoryConsumer {
+    family: &'static str,
+    process_count: usize,
+    rss_bytes: u64,
+    largest_process_rss_bytes: u64,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -206,6 +216,7 @@ fn sample(
         root_disk_total_bytes: root.map(sysinfo::Disk::total_space),
         processes,
         agents,
+        memory_consumers: memory::sample(system),
         commands,
     })
 }
@@ -720,6 +731,7 @@ mod tests {
             root_disk_total_bytes: None,
             processes: vec![],
             agents: vec![],
+            memory_consumers: vec![],
             commands: vec![],
         }
     }
