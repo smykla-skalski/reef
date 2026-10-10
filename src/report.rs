@@ -10,6 +10,7 @@ use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 mod compare;
 mod html;
@@ -39,7 +40,7 @@ pub struct Options {
     /// Report format.
     #[arg(long, value_enum, default_value_t = Format::Markdown)]
     format: Format,
-    /// Write a self-contained HTML report to a new file.
+    /// Write a self-contained HTML report, replacing an existing regular file.
     #[arg(long)]
     output: Option<PathBuf>,
     /// Open an HTML report in the default browser; requires --output.
@@ -1979,6 +1980,17 @@ fn write_report(
 }
 
 fn write_html(path: &Path, page: &[u8]) -> io::Result<()> {
+    if path.file_name().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid HTML output path",
+        ));
+    }
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    let temporary = path.with_file_name(format!(".reef-report-{}-{nonce}.tmp", std::process::id()));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -1986,10 +1998,27 @@ fn write_html(path: &Path, page: &[u8]) -> io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path)?;
-    file.write_all(page)?;
-    file.flush()?;
-    Ok(())
+    let mut file = options.open(&temporary)?;
+    let result = (|| {
+        file.write_all(page)?;
+        file.sync_all()?;
+        drop(file);
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "HTML output path is not a regular file",
+                ));
+            }
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 #[cfg(test)]
