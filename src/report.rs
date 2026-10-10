@@ -73,20 +73,44 @@ fn parse_date(value: &str) -> Result<DateTime<Utc>, String> {
 }
 
 #[derive(Debug, Deserialize)]
-struct Observation {
-    at_unix_ms: u64,
-    working_ms: u64,
-    cpu_percent: Option<f64>,
-    memory_used_bytes: Option<u64>,
-    memory_total_bytes: Option<u64>,
+pub(crate) struct Observation {
+    pub(crate) at_unix_ms: u64,
+    pub(crate) working_ms: u64,
+    pub(crate) cpu_percent: Option<f64>,
+    pub(crate) memory_used_bytes: Option<u64>,
+    pub(crate) memory_total_bytes: Option<u64>,
     swap_used_bytes: Option<u64>,
     swap_total_bytes: Option<u64>,
-    agents: Option<Vec<AgentSample>>,
+    root_disk_available_bytes: Option<u64>,
+    root_disk_total_bytes: Option<u64>,
+    pub(crate) agents: Option<Vec<AgentSample>>,
+    memory_consumers: Option<Vec<MemoryConsumerSample>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct AgentSample {
-    kind: String,
+struct MemoryConsumerSample {
+    family: String,
+    process_count: usize,
+    rss_bytes: u64,
+    largest_process_rss_bytes: u64,
+}
+
+fn safe_memory_family(value: &str) -> &'static str {
+    match value {
+        "agent runtime" => "agent runtime",
+        "compiler/build" => "compiler/build",
+        "linter" => "linter",
+        "browser" => "browser",
+        "editor/IDE" => "editor/IDE",
+        "container/VM" => "container/VM",
+        "system UI" => "system UI",
+        _ => "other processes",
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct AgentSample {
+    pub(crate) kind: String,
     root_pid: u32,
     process_count: usize,
     cpu_percent: Option<f64>,
@@ -178,13 +202,17 @@ struct Report {
     agent_commands: Option<Vec<AgentCategoryReport>>,
     passive_commands: Option<Vec<PassiveCommandLoad>>,
     peak_host_memory_bytes: Option<u64>,
+    peak_root_disk_used_percent: Option<f64>,
     swap_growth_bytes: Option<i128>,
+    memory_consumers: Option<Vec<MemoryConsumerLoad>>,
     peak_command_concurrency: Option<usize>,
     pressure: PressureReport,
     pressure_overlap: PressureOverlap,
     #[serde(skip_serializing)]
     timeline: Vec<PressureEvent>,
     agents: Option<Vec<AgentLoad>>,
+    agent_comparison: Option<Vec<AgentComparison>>,
+    agent_activity_comparison: Option<Vec<AgentActivityComparison>>,
     scheduler: Option<schedule_events::Summary>,
     #[cfg(unix)]
     cache: cache_impact::Impact,
@@ -224,6 +252,40 @@ struct AgentLoad {
     written_bytes: u64,
     peak_processes: usize,
     peak_roots: usize,
+}
+
+#[derive(Serialize)]
+struct AgentComparison {
+    agent: String,
+    observed_active_hours: f64,
+    average_cpu_cores_while_active: Option<f64>,
+    peak_memory_bytes: u64,
+    read_mib_per_active_hour: Option<f64>,
+    written_mib_per_active_hour: Option<f64>,
+    top_command_family: Option<String>,
+    /// Shares of sampled descendant-command CPU, not shares of total agent CPU.
+    activity_cpu_percent: Option<BTreeMap<String, f64>>,
+}
+
+#[derive(Serialize)]
+struct AgentActivityComparison {
+    agent: String,
+    category: String,
+    sampled_family_active_hours: f64,
+    average_cpu_cores_per_family_active_hour: Option<f64>,
+    peak_memory_bytes: u64,
+    read_mib_per_family_active_hour: Option<f64>,
+    written_mib_per_family_active_hour: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct MemoryConsumerLoad {
+    family: String,
+    samples: usize,
+    mean_rss_bytes: u64,
+    peak_rss_bytes: u64,
+    peak_largest_process_rss_bytes: u64,
+    peak_process_count: usize,
 }
 
 #[derive(Default, Serialize)]
@@ -302,7 +364,7 @@ fn measured_agent_kind(value: Option<&str>) -> Option<&'static str> {
     }
 }
 
-fn state_dir(override_dir: Option<&Path>) -> io::Result<PathBuf> {
+pub(crate) fn state_dir(override_dir: Option<&Path>) -> io::Result<PathBuf> {
     if let Some(dir) = override_dir {
         return Ok(dir.to_path_buf());
     }
@@ -333,7 +395,7 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<Vec<T>> {
         .collect()
 }
 
-fn observations(dir: &Path) -> io::Result<Vec<Observation>> {
+pub(crate) fn observations(dir: &Path) -> io::Result<Vec<Observation>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -1145,20 +1207,10 @@ fn build_report_with_ticks(
             ));
         }
     }
-    let pressure_overlap = pressure_overlap.finish();
     accumulate_agent_ticks(&mut agent_load, &agent_ticks, from_ms, to_ms);
     accumulate_agent_rollups(&mut agent_load, &agent_rollups);
     let passive_commands = passive_command_reports(&agent_ticks, &agent_rollups, from_ms, to_ms);
-    let peak_host_memory_bytes = samples.iter().filter_map(|s| s.memory_used_bytes).max();
-    let swap_growth_bytes = swap_growth(&samples);
-    let peak_command_concurrency = records
-        .as_ref()
-        .map(|records| peak_concurrency(records, from_ms, to_ms));
     let command_count = records.as_ref().map(Vec::len);
-    let categories = records.as_ref().map(|records| category_reports(records));
-    let agent_commands = records
-        .as_ref()
-        .map(|records| agent_command_reports(records));
     Report {
         from: from.to_rfc3339(),
         to: to.to_rfc3339(),
@@ -1176,14 +1228,23 @@ fn build_report_with_ticks(
         observed_working_ms,
         command_measurements_available: records.is_some(),
         command_count,
-        categories,
-        agent_commands,
+        categories: records.as_ref().map(|records| category_reports(records)),
+        agent_commands: records
+            .as_ref()
+            .map(|records| agent_command_reports(records)),
+        agent_comparison: agents_available
+            .then(|| compare_agents(&agent_load, passive_commands.as_deref())),
+        agent_activity_comparison: passive_commands.as_deref().map(compare_agent_activities),
         passive_commands,
-        peak_host_memory_bytes,
-        swap_growth_bytes,
-        peak_command_concurrency,
+        peak_host_memory_bytes: samples.iter().filter_map(|s| s.memory_used_bytes).max(),
+        peak_root_disk_used_percent: peak_disk_used_percent(&samples),
+        swap_growth_bytes: swap_growth(&samples),
+        memory_consumers: memory_consumer_reports(&samples),
+        peak_command_concurrency: records
+            .as_ref()
+            .map(|records| peak_concurrency(records, from_ms, to_ms)),
         pressure,
-        pressure_overlap,
+        pressure_overlap: pressure_overlap.finish(),
         timeline,
         agents: agents_available.then(|| agent_load.into_values().collect()),
         scheduler,
@@ -1206,6 +1267,177 @@ fn count_host_observations_with_agents(samples: &[Observation]) -> usize {
                 .is_some_and(|agents| !agents.is_empty())
         })
         .count()
+}
+
+fn float_u64(value: u64) -> f64 {
+    let high = u32::try_from(value >> 32).unwrap_or(u32::MAX);
+    let low = u32::try_from(value & 0xffff_ffff).unwrap_or(u32::MAX);
+    f64::from(high) * 4_294_967_296.0 + f64::from(low)
+}
+
+fn float_u128(value: u128) -> f64 {
+    let high = u64::try_from(value >> 64).unwrap_or(u64::MAX);
+    let low = u64::try_from(value & u128::from(u64::MAX)).unwrap_or(u64::MAX);
+    float_u64(high) * 18_446_744_073_709_551_616.0 + float_u64(low)
+}
+
+fn compare_agents(
+    agents: &BTreeMap<String, AgentLoad>,
+    commands: Option<&[PassiveCommandLoad]>,
+) -> Vec<AgentComparison> {
+    let mut comparison = Vec::new();
+    for (kind, agent) in agents {
+        let active_ms = float_u128(agent.observed_working_ms);
+        let active_hours = active_ms / 3_600_000.0;
+        let related: Vec<_> = commands
+            .unwrap_or_default()
+            .iter()
+            .filter(|command| command.agent == *kind)
+            .collect();
+        let command_cpu: f64 = related
+            .iter()
+            .map(|command| command.cpu_core_ms_estimate.max(0.0))
+            .sum();
+        let mut by_category: BTreeMap<String, f64> = BTreeMap::new();
+        for command in &related {
+            *by_category.entry(command.category.clone()).or_default() +=
+                command.cpu_core_ms_estimate.max(0.0);
+        }
+        let activity_cpu_percent = (command_cpu > 0.0).then(|| {
+            by_category
+                .into_iter()
+                .map(|(category, cpu)| (category, cpu / command_cpu * 100.0))
+                .collect()
+        });
+        let top_command_family = related
+            .iter()
+            .max_by(|left, right| {
+                left.cpu_core_ms_estimate
+                    .total_cmp(&right.cpu_core_ms_estimate)
+                    .then_with(|| right.family.cmp(&left.family))
+            })
+            .map(|command| command.family.clone());
+        comparison.push(AgentComparison {
+            agent: kind.clone(),
+            observed_active_hours: active_hours,
+            average_cpu_cores_while_active: (active_ms > 0.0)
+                .then(|| agent.cpu_core_ms_estimate / active_ms),
+            peak_memory_bytes: agent.peak_memory_bytes,
+            read_mib_per_active_hour: (active_hours > 0.0)
+                .then(|| float_u64(agent.read_bytes) / 1_048_576.0 / active_hours),
+            written_mib_per_active_hour: (active_hours > 0.0)
+                .then(|| float_u64(agent.written_bytes) / 1_048_576.0 / active_hours),
+            top_command_family,
+            activity_cpu_percent,
+        });
+    }
+    comparison.sort_by(|left, right| {
+        right
+            .average_cpu_cores_while_active
+            .unwrap_or_default()
+            .total_cmp(&left.average_cpu_cores_while_active.unwrap_or_default())
+            .then_with(|| left.agent.cmp(&right.agent))
+    });
+    comparison
+}
+
+#[derive(Default)]
+struct ActivityTotals {
+    active_ms: u128,
+    cpu_core_ms_estimate: f64,
+    peak_memory_bytes: u64,
+    read_bytes: u64,
+    written_bytes: u64,
+}
+
+fn compare_agent_activities(commands: &[PassiveCommandLoad]) -> Vec<AgentActivityComparison> {
+    let mut groups: BTreeMap<(&str, &str), ActivityTotals> = BTreeMap::new();
+    for command in commands {
+        let group = groups
+            .entry((&command.agent, &command.category))
+            .or_default();
+        group.active_ms = group.active_ms.saturating_add(command.observed_working_ms);
+        group.cpu_core_ms_estimate += command.cpu_core_ms_estimate.max(0.0);
+        group.peak_memory_bytes = group.peak_memory_bytes.max(command.peak_memory_bytes);
+        group.read_bytes = group.read_bytes.saturating_add(command.read_bytes);
+        group.written_bytes = group.written_bytes.saturating_add(command.written_bytes);
+    }
+    groups
+        .into_iter()
+        .map(|((agent, category), totals)| {
+            let active_ms = float_u128(totals.active_ms);
+            let active_hours = active_ms / 3_600_000.0;
+            AgentActivityComparison {
+                agent: agent.to_owned(),
+                category: category.to_owned(),
+                sampled_family_active_hours: active_hours,
+                average_cpu_cores_per_family_active_hour: (active_ms > 0.0)
+                    .then(|| totals.cpu_core_ms_estimate / active_ms),
+                peak_memory_bytes: totals.peak_memory_bytes,
+                read_mib_per_family_active_hour: (active_hours > 0.0)
+                    .then(|| float_u64(totals.read_bytes) / 1_048_576.0 / active_hours),
+                written_mib_per_family_active_hour: (active_hours > 0.0)
+                    .then(|| float_u64(totals.written_bytes) / 1_048_576.0 / active_hours),
+            }
+        })
+        .collect()
+}
+
+fn memory_consumer_reports(samples: &[Observation]) -> Option<Vec<MemoryConsumerLoad>> {
+    let observed = samples
+        .iter()
+        .filter(|sample| sample.memory_consumers.is_some())
+        .count();
+    if observed == 0 {
+        return None;
+    }
+    let mut groups: BTreeMap<&str, (usize, u128, u64, u64, usize)> = BTreeMap::new();
+    for sample in samples {
+        for consumer in sample.memory_consumers.as_deref().unwrap_or_default() {
+            let group = groups
+                .entry(safe_memory_family(&consumer.family))
+                .or_default();
+            group.0 += 1;
+            group.1 = group.1.saturating_add(u128::from(consumer.rss_bytes));
+            group.2 = group.2.max(consumer.rss_bytes);
+            group.3 = group.3.max(consumer.largest_process_rss_bytes);
+            group.4 = group.4.max(consumer.process_count);
+        }
+    }
+    let mut result: Vec<_> = groups
+        .into_iter()
+        .map(
+            |(family, (samples, total_rss, peak_rss, largest, processes))| MemoryConsumerLoad {
+                family: family.to_owned(),
+                samples,
+                mean_rss_bytes: u64::try_from(total_rss / u128::try_from(observed).unwrap_or(1))
+                    .unwrap_or(u64::MAX),
+                peak_rss_bytes: peak_rss,
+                peak_largest_process_rss_bytes: largest,
+                peak_process_count: processes,
+            },
+        )
+        .collect();
+    result.sort_by(|left, right| {
+        right
+            .mean_rss_bytes
+            .cmp(&left.mean_rss_bytes)
+            .then_with(|| left.family.cmp(&right.family))
+    });
+    Some(result)
+}
+
+fn peak_disk_used_percent(samples: &[Observation]) -> Option<f64> {
+    samples
+        .iter()
+        .filter_map(|sample| {
+            sample
+                .root_disk_available_bytes
+                .zip(sample.root_disk_total_bytes)
+                .filter(|(available, total)| *total > 0 && available <= total)
+                .map(|(available, total)| (1.0 - float_u64(available) / float_u64(total)) * 100.0)
+        })
+        .max_by(f64::total_cmp)
 }
 
 fn readable_bytes(value: i128) -> String {
@@ -1313,6 +1545,103 @@ fn agents_markdown(agents: Option<&[AgentLoad]>) -> String {
         }
     } else {
         out.push_str("Unavailable: observations predate passive agent attribution.\n");
+    }
+    out
+}
+
+fn agent_comparison_markdown(comparison: Option<&[AgentComparison]>) -> String {
+    let mut out = String::from("\n## Agent activity-adjusted comparison\n\n");
+    let Some(comparison) = comparison else {
+        out.push_str("Unavailable: no passive agent observations.\n");
+        return out;
+    };
+    out.push_str("Average CPU cores and I/O rates are divided by each agent's observed active time. Activity mix is the share of *classified descendant-command CPU*, not all agent CPU. Peak RSS is a peak, not a rate. Concurrent agents can share a host sample; this is not causal attribution.\n\n");
+    out.push_str("| Agent | Active time | Avg CPU cores | Peak RSS | Read MiB/active h | Written MiB/active h | Top family | Activity mix |\n| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |\n");
+    for agent in comparison {
+        let mix = agent.activity_cpu_percent.as_ref().map_or_else(
+            || "unavailable".to_owned(),
+            |categories| {
+                categories
+                    .iter()
+                    .map(|(category, percent)| format!("{category} {percent:.0}%"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+        );
+        let _ = writeln!(
+            out,
+            "| {} | {:.2} h | {} | {} | {} | {} | {} | {} |",
+            agent.agent,
+            agent.observed_active_hours,
+            agent
+                .average_cpu_cores_while_active
+                .map_or_else(|| "unavailable".to_owned(), |value| format!("{value:.2}")),
+            readable_bytes(i128::from(agent.peak_memory_bytes)),
+            agent
+                .read_mib_per_active_hour
+                .map_or_else(|| "unavailable".to_owned(), |value| format!("{value:.1}")),
+            agent
+                .written_mib_per_active_hour
+                .map_or_else(|| "unavailable".to_owned(), |value| format!("{value:.1}")),
+            agent.top_command_family.as_deref().unwrap_or("unavailable"),
+            mix,
+        );
+    }
+    if comparison.is_empty() {
+        out.push_str("\nNo registered agent process was active in the range.\n");
+    }
+    out
+}
+
+fn agent_activity_comparison_markdown(activities: Option<&[AgentActivityComparison]>) -> String {
+    let mut out = String::from("\n## Resource use by agent activity\n\n");
+    let Some(activities) = activities else {
+        out.push_str("Unavailable: observations predate passive command activity.\n");
+        return out;
+    };
+    out.push_str("Rows group sanitized descendant-command families by agent and category. Rates divide sampled CPU and I/O by summed family-active time; concurrent families can make this time exceed wall time. Peak RSS is not additive.\n\n");
+    out.push_str("| Agent | Activity | Family-active time | Avg CPU cores | Peak RSS | Read MiB/active h | Written MiB/active h |\n| --- | --- | ---: | ---: | ---: | ---: | ---: |\n");
+    for activity in activities {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {:.2} h | {} | {} | {} | {} |",
+            activity.agent,
+            activity.category,
+            activity.sampled_family_active_hours,
+            activity
+                .average_cpu_cores_per_family_active_hour
+                .map_or_else(|| "unavailable".to_owned(), |value| format!("{value:.2}")),
+            readable_bytes(i128::from(activity.peak_memory_bytes)),
+            activity
+                .read_mib_per_family_active_hour
+                .map_or_else(|| "unavailable".to_owned(), |value| format!("{value:.1}")),
+            activity
+                .written_mib_per_family_active_hour
+                .map_or_else(|| "unavailable".to_owned(), |value| format!("{value:.1}")),
+        );
+    }
+    out
+}
+
+fn memory_consumers_markdown(consumers: Option<&[MemoryConsumerLoad]>) -> String {
+    let mut out = String::from("\n## Memory consumers\n\n");
+    let Some(consumers) = consumers else {
+        out.push_str("Unavailable: observations predate sanitized memory-family sampling.\n");
+        return out;
+    };
+    out.push_str("Sanitized process-family RSS at host sample times. Mean includes zero when a family was absent. RSS can count shared pages more than once and does not add up to host used memory. Unknown process names are grouped as `other processes`.\n\n");
+    out.push_str("| Family | Samples present | Mean RSS | Peak RSS | Largest process peak RSS | Peak processes |\n| --- | ---: | ---: | ---: | ---: | ---: |\n");
+    for consumer in consumers {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} | {} |",
+            consumer.family,
+            consumer.samples,
+            readable_bytes(i128::from(consumer.mean_rss_bytes)),
+            readable_bytes(i128::from(consumer.peak_rss_bytes)),
+            readable_bytes(i128::from(consumer.peak_largest_process_rss_bytes)),
+            consumer.peak_process_count,
+        );
     }
     out
 }
@@ -1457,7 +1786,7 @@ fn timeline_markdown(events: &[PressureEvent]) -> String {
 
 fn markdown_with_timeline(report: &Report, include_timeline: bool) -> String {
     let mut out = format!(
-        "# Reef workload report\n\n- Range: {} to {} (end exclusive)\n- Empty: {}\n- Host observations: {}\n- Host observations with agents: {}\n- Observed working time: {}\n- Peak host memory: {}\n- Swap growth: {}\n- Peak command concurrency: {}\n\n",
+        "# Reef workload report\n\n- Range: {} to {} (end exclusive)\n- Empty: {}\n- Host observations: {}\n- Host observations with agents: {}\n- Observed working time: {}\n- Peak host memory: {}\n- Peak root disk used: {}\n- Swap growth: {}\n- Peak command concurrency: {}\n\n",
         report.from,
         report.to,
         report.empty,
@@ -1465,6 +1794,9 @@ fn markdown_with_timeline(report: &Report, include_timeline: bool) -> String {
         report.host_observations_with_agents,
         readable_duration(Some(report.observed_working_ms)),
         readable_optional_bytes(report.peak_host_memory_bytes.map(i128::from)),
+        report
+            .peak_root_disk_used_percent
+            .map_or_else(|| "unavailable".to_owned(), |value| format!("{value:.1}%")),
         readable_optional_bytes(report.swap_growth_bytes),
         printable(report.peak_command_concurrency),
     );
@@ -1499,6 +1831,15 @@ fn markdown_with_timeline(report: &Report, include_timeline: bool) -> String {
         report.passive_commands.as_deref(),
     ));
     out.push_str(&agents_markdown(report.agents.as_deref()));
+    out.push_str(&agent_comparison_markdown(
+        report.agent_comparison.as_deref(),
+    ));
+    out.push_str(&agent_activity_comparison_markdown(
+        report.agent_activity_comparison.as_deref(),
+    ));
+    out.push_str(&memory_consumers_markdown(
+        report.memory_consumers.as_deref(),
+    ));
     out.push_str(&pressure_markdown(report));
     if include_timeline {
         out.push_str(&timeline_markdown(&report.timeline));
@@ -1655,6 +1996,59 @@ fn write_html(path: &Path, page: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn agent_comparison_normalizes_by_activity_and_uses_classified_cpu_mix() {
+        let agents = BTreeMap::from([
+            (
+                "claude".to_owned(),
+                AgentLoad {
+                    kind: "claude".into(),
+                    observed_working_ms: 3_600_000,
+                    cpu_core_ms_estimate: 1_800_000.0,
+                    read_bytes: 100 * 1_048_576,
+                    ..AgentLoad::default()
+                },
+            ),
+            (
+                "codex".to_owned(),
+                AgentLoad {
+                    kind: "codex".into(),
+                    observed_working_ms: 7_200_000,
+                    cpu_core_ms_estimate: 7_200_000.0,
+                    read_bytes: 100 * 1_048_576,
+                    ..AgentLoad::default()
+                },
+            ),
+        ]);
+        let commands = vec![
+            PassiveCommandLoad {
+                agent: "codex".into(),
+                family: "go build".into(),
+                category: "build".into(),
+                cpu_core_ms_estimate: 300.0,
+                ..PassiveCommandLoad::default()
+            },
+            PassiveCommandLoad {
+                agent: "codex".into(),
+                family: "go test".into(),
+                category: "test".into(),
+                cpu_core_ms_estimate: 100.0,
+                ..PassiveCommandLoad::default()
+            },
+        ];
+        let rows = compare_agents(&agents, Some(&commands));
+        assert_eq!(rows[0].agent, "codex");
+        assert_eq!(rows[0].average_cpu_cores_while_active, Some(1.0));
+        assert_eq!(rows[0].read_mib_per_active_hour, Some(50.0));
+        assert_eq!(rows[0].top_command_family.as_deref(), Some("go build"));
+        assert_eq!(
+            rows[0].activity_cpu_percent.as_ref().unwrap()["build"],
+            75.0
+        );
+        assert_eq!(rows[1].average_cpu_cores_while_active, Some(0.5));
+        assert!(rows[1].activity_cpu_percent.is_none());
+    }
+
     fn date(ms: i64) -> DateTime<Utc> {
         DateTime::from_timestamp_millis(ms).unwrap()
     }
@@ -1668,7 +2062,10 @@ mod tests {
             memory_total_bytes: Some(1000),
             swap_used_bytes: swap,
             swap_total_bytes: Some(1000),
+            root_disk_available_bytes: None,
+            root_disk_total_bytes: None,
             agents: None,
+            memory_consumers: None,
         }
     }
 
@@ -1954,7 +2351,10 @@ mod tests {
                 memory_total_bytes: None,
                 swap_used_bytes: None,
                 swap_total_bytes: None,
+                root_disk_available_bytes: None,
+                root_disk_total_bytes: None,
                 agents: None,
+                memory_consumers: None,
             }],
             None,
             (90, 90, 1),
