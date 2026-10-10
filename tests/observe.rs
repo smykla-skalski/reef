@@ -293,6 +293,75 @@ fn recorder_reloads_after_its_invocation_symlink_changes() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn recorder_launched_through_env_reloads_after_link_changes() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("reef-env-reload-{}-{nonce}", std::process::id()));
+    fs::create_dir(&dir).unwrap();
+    let invocation = dir.join("reef");
+    symlink(env!("CARGO_BIN_EXE_reef"), &invocation).unwrap();
+    let replacement = dir.join("replacement");
+    let marker = dir.join("reloaded");
+    fs::write(
+        &replacement,
+        "#!/bin/sh\n: > \"$REEF_RELOAD_MARKER\"\nexec \"$REEF_RELOAD_BINARY\" \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
+    let existing_path = std::env::var_os("PATH").unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(dir.clone()).chain(std::env::split_paths(&existing_path)),
+    )
+    .unwrap();
+
+    let mut running = Recorder(
+        Command::new("/usr/bin/env")
+            .arg("reef")
+            .args(["observe", "run", "--interval-seconds", "1", "--state-dir"])
+            .arg(&dir)
+            .env("PATH", path)
+            .env("REEF_RELOAD_MARKER", &marker)
+            .env("REEF_RELOAD_BINARY", env!("CARGO_BIN_EXE_reef"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    assert!(
+        wait_until(|| fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .any(|entry| { entry.file_name().to_string_lossy().starts_with("samples-") })),
+        "{}",
+        child_failure(&mut running)
+    );
+    let next = dir.join("reef-next");
+    symlink(&replacement, &next).unwrap();
+    fs::rename(&next, &invocation).unwrap();
+
+    assert!(
+        wait_until(|| marker.exists()),
+        "{}",
+        child_failure(&mut running)
+    );
+    let stopped = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args(["observe", "stop", "--state-dir"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(stopped.status.success(), "{stopped:?}");
+    assert!(wait_until(|| running.0.try_wait().unwrap().is_some()));
+    assert!(running.0.wait().unwrap().success());
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn registered_agent_is_reported_without_scheduling_its_process() {
     let nonce = SystemTime::now()
