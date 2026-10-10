@@ -7,11 +7,12 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 mod compare;
+mod html;
 pub use compare::{CompareOptions, run_compare};
 
 #[derive(Debug, clap::Args)]
@@ -38,6 +39,12 @@ pub struct Options {
     /// Report format.
     #[arg(long, value_enum, default_value_t = Format::Markdown)]
     format: Format,
+    /// Write a self-contained HTML report to a new file.
+    #[arg(long)]
+    output: Option<PathBuf>,
+    /// Open an HTML report in the default browser; requires --output.
+    #[arg(long, requires = "output")]
+    open: bool,
     /// Include individual pressure samples in the report.
     #[arg(long)]
     timeline: bool,
@@ -56,6 +63,7 @@ pub struct Options {
 enum Format {
     Markdown,
     Json,
+    Html,
 }
 
 fn parse_date(value: &str) -> Result<DateTime<Utc>, String> {
@@ -1504,6 +1512,12 @@ fn markdown_with_timeline(report: &Report, include_timeline: bool) -> String {
 }
 
 pub fn run(options: &Options) -> io::Result<()> {
+    if (options.output.is_some() || options.open) && !matches!(options.format, Format::Html) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--output and --open require --format html",
+        ));
+    }
     let to = options.to.unwrap_or_else(Utc::now);
     let from = options.from.unwrap_or(to - Duration::hours(24));
     if from >= to {
@@ -1526,6 +1540,7 @@ pub fn run(options: &Options) -> io::Result<()> {
     }
     let dir = state_dir(options.state_dir.as_deref())?;
     let samples = observations(&dir)?;
+    let host_series = html::HostSeries::from_samples(&samples, from, to);
     let agent_samples = agent_ticks(&dir)?;
     let agent_summaries = agent_rollups(&dir)?;
     let default_paths = history::paths()?;
@@ -1584,17 +1599,55 @@ pub fn run(options: &Options) -> io::Result<()> {
         report.empty = report.empty && report.cache.hits == 0 && report.cache.misses == 0;
         report
     };
+    write_report(&report, &host_series, options)
+}
+
+fn write_report(
+    report: &Report,
+    host_series: &html::HostSeries,
+    options: &Options,
+) -> io::Result<()> {
     match options.format {
-        Format::Markdown => print!("{}", markdown_with_timeline(&report, options.timeline)),
+        Format::Markdown => print!("{}", markdown_with_timeline(report, options.timeline)),
         Format::Json if options.timeline => println!(
             "{}",
             serde_json::to_string_pretty(&ReportWithTimeline {
-                report: &report,
+                report,
                 timeline: &report.timeline,
             })?
         ),
-        Format::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+        Format::Json => println!("{}", serde_json::to_string_pretty(report)?),
+        Format::Html => {
+            let page = html::render(report, host_series, options.timeline);
+            if let Some(path) = &options.output {
+                write_html(path, page.as_bytes())?;
+                if options.open {
+                    let path = fs::canonicalize(path)?;
+                    let path = path.to_str().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "HTML path is not UTF-8")
+                    })?;
+                    webbrowser::open(path)?;
+                }
+                println!("{}", path.display());
+            } else {
+                print!("{page}");
+            }
+        }
     }
+    Ok(())
+}
+
+fn write_html(path: &Path, page: &[u8]) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(page)?;
+    file.flush()?;
     Ok(())
 }
 
