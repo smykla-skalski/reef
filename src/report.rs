@@ -1099,7 +1099,11 @@ fn agents_markdown(agents: Option<&[AgentLoad]>) -> String {
                 agent.kind,
                 agent.active_samples,
                 agent.cpu_core_ms_estimate,
-                agent.peak_cpu_percent,
+                if agent.peak_cpu_percent == 0.0 {
+                    0.0
+                } else {
+                    agent.peak_cpu_percent
+                },
                 readable_bytes(i128::from(agent.peak_memory_bytes)),
                 readable_bytes(i128::from(agent.read_bytes)),
                 readable_bytes(i128::from(agent.written_bytes)),
