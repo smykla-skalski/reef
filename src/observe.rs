@@ -11,6 +11,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sysinfo::{Disks, ProcessRefreshKind, ProcessesToUpdate, System};
 
 mod platform;
+#[cfg(unix)]
+mod reload;
 
 const SEGMENT_BYTES: u64 = 1_048_576;
 
@@ -499,31 +501,41 @@ pub fn run(options: &ObserveOptions) -> io::Result<()> {
     })?;
     let mut pid_file = private_file(&dir.join("recorder.pid"), false, false)
         .map_err(|error| io::Error::new(error.kind(), format!("open recorder PID: {error}")))?;
-    pid_file
-        .set_len(0)
-        .map_err(|error| io::Error::new(error.kind(), format!("clear recorder PID: {error}")))?;
+    let replacing_process =
+        active_recorder_pid(&dir.join("recorder.pid"))? == Some(std::process::id());
     let stop_path = dir.join(format!("stop-{}", std::process::id()));
     if stop_path.exists() {
         fs::remove_file(&stop_path)?;
+        if replacing_process {
+            pid_file.set_len(0)?;
+            return Ok(());
+        }
     }
-    let pid = sysinfo::Pid::from_u32(std::process::id());
-    let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[pid]),
-        true,
-        ProcessRefreshKind::nothing(),
-    );
-    let started = system
-        .process(pid)
-        .ok_or_else(|| io::Error::other("cannot identify recorder process"))?
-        .start_time();
-    writeln!(pid_file, "{} {started}", std::process::id())?;
+    if !replacing_process {
+        pid_file.set_len(0).map_err(|error| {
+            io::Error::new(error.kind(), format!("clear recorder PID: {error}"))
+        })?;
+        let pid = sysinfo::Pid::from_u32(std::process::id());
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        let started = system
+            .process(pid)
+            .ok_or_else(|| io::Error::other("cannot identify recorder process"))?
+            .start_time();
+        writeln!(pid_file, "{} {started}", std::process::id())?;
+    }
     let result = record_loop(&dir, &stop_path, options);
     pid_file.set_len(0)?;
     result
 }
 
 fn record_loop(dir: &Path, stop_path: &Path, options: &ObserveOptions) -> io::Result<()> {
+    #[cfg(unix)]
+    let executable = reload::ExecutableWatch::capture();
     let interval = Duration::from_secs(options.interval_seconds);
     let tick_interval = Duration::from_secs(1);
     let mut system = System::new();
@@ -570,6 +582,12 @@ fn record_loop(dir: &Path, stop_path: &Path, options: &ObserveOptions) -> io::Re
                 )?;
             }
             append(dir, &observation, options)?;
+            #[cfg(unix)]
+            if let Some(executable) = &executable
+                && let Err(error) = executable.reload_if_changed()
+            {
+                eprintln!("reef observer could not reload updated executable: {error}");
+            }
         } else if let Some(tick) = agent_tick(&mut system, dir, tick_working_ms)? {
             append_agent_tick(dir, &tick, options)?;
         }
@@ -735,6 +753,31 @@ mod tests {
 
         assert_eq!(active_recorder_pid(&path).unwrap(), None);
 
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_requested_during_reload_is_not_discarded() {
+        let dir = std::env::temp_dir().join(format!("reef-reload-stop-{}", std::process::id()));
+        private_dir(&dir).unwrap();
+        let pid = sysinfo::Pid::from_u32(std::process::id());
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        let started = system.process(pid).unwrap().start_time();
+        fs::write(dir.join("recorder.pid"), format!("{pid} {started}\n")).unwrap();
+        let stop = dir.join(format!("stop-{pid}"));
+        fs::write(&stop, b"").unwrap();
+
+        run(&options(&dir)).unwrap();
+
+        assert!(!stop.exists());
+        assert_eq!(fs::read_to_string(dir.join("recorder.pid")).unwrap(), "");
+        assert_eq!(segments(&dir).unwrap().len(), 0);
         fs::remove_dir_all(dir).unwrap();
     }
 
