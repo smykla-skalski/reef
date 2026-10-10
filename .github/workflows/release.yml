@@ -138,3 +138,39 @@ jobs:
             fi
           done
           gh release edit "$reef_tag" --repo "$GITHUB_REPOSITORY" --draft=false
+
+  notify-tap:
+    name: Request Homebrew formula update
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Generate tap dispatch token
+        id: tap-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.SMYKLOT_APP_ID }}
+          private-key: ${{ secrets.SMYKLOT_APP_PRIVATE_KEY }}
+          owner: smykla-skalski
+          repositories: homebrew-tap
+          permission-contents: write
+
+      - name: Request Reef formula update
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version=$(<.release-version)
+          fi
+          gh api repos/smykla-skalski/homebrew-tap/dispatches --method POST \
+            -f event_type=reef-release \
+            -f "client_payload[version]=$version"
