@@ -8,6 +8,8 @@ mod cache;
 mod cache_impact;
 #[cfg(unix)]
 mod contain;
+#[cfg(unix)]
+mod control;
 mod history;
 mod observe;
 #[cfg(unix)]
@@ -200,13 +202,16 @@ enum AgentCommand {
         #[arg(long)]
         check: bool,
     },
-    /// Launch Codex or Claude Code with a process-scoped shim path.
+    /// Launch an agent with a process-scoped shim path.
     #[cfg(unix)]
     Launch {
         #[arg(value_enum)]
         agent: AgentName,
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        /// Measure eligible commands without scheduler admission.
+        #[arg(long)]
+        control: bool,
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -245,6 +250,7 @@ impl SetupAgent {
 enum AgentName {
     Codex,
     Claude,
+    Opencode,
 }
 
 #[cfg(unix)]
@@ -253,6 +259,7 @@ impl AgentName {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Opencode => "opencode",
         }
     }
 }
@@ -374,8 +381,14 @@ fn agent_command(command: AgentCommand) -> std::process::ExitCode {
         AgentCommand::Launch {
             agent,
             state_dir,
+            control,
             args,
-        } => command_result(agents::launch(agent.as_str(), state_dir.as_deref(), &args)),
+        } => command_result(agents::launch(
+            agent.as_str(),
+            state_dir.as_deref(),
+            control,
+            &args,
+        )),
         AgentCommand::Observe {
             agent,
             pid,
