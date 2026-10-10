@@ -156,7 +156,7 @@ fn append(dir: &Path, event: &Event) -> io::Result<()> {
     Ok(())
 }
 
-pub fn run(original: &Path, args: &[OsString], category: &str) -> io::Result<u8> {
+pub fn run(original: Option<&Path>, args: &[OsString], category: &str) -> io::Result<u8> {
     let dir =
         env::var_os("REEF_AGENT_CONTROL_DIR").ok_or_else(|| io::Error::other(TELEMETRY_WARNING))?;
     let dir = PathBuf::from(dir);
@@ -175,20 +175,28 @@ pub fn run(original: &Path, args: &[OsString], category: &str) -> io::Result<u8>
         assignment: Some("control".to_owned()),
     };
     append(&dir, &event).map_err(|_| io::Error::other(TELEMETRY_WARNING))?;
-    let command = std::iter::once(original.as_os_str().to_os_string())
-        .chain(args.iter().cloned())
-        .map(OsString::into_string)
-        .collect::<Result<Vec<_>, _>>();
-    let result = match command {
-        Ok(command) => run::run(
-            &command,
-            category,
-            &id,
-            RecordMode::Control(&dir.join(MEASUREMENTS)),
-        ),
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "control command arguments must be UTF-8",
+    let result = match original {
+        Some(original) => {
+            let command = std::iter::once(original.as_os_str().to_os_string())
+                .chain(args.iter().cloned())
+                .map(OsString::into_string)
+                .collect::<Result<Vec<_>, _>>();
+            match command {
+                Ok(command) => run::run(
+                    &command,
+                    category,
+                    &id,
+                    RecordMode::Control(&dir.join(MEASUREMENTS)),
+                ),
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "control command arguments must be UTF-8",
+                )),
+            }
+        }
+        None => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "control command executable is unavailable",
         )),
     };
     if result.is_ok() {

@@ -111,19 +111,20 @@ pub fn launch(
 pub fn shim(tool: &str) -> io::Result<u8> {
     let original_path = env::var_os("REEF_AGENT_ORIGINAL_PATH")
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Reef agent PATH is missing"))?;
-    let original = find_binary(tool, &original_path)?;
+    let original = find_binary(tool, &original_path);
     let args: Vec<OsString> = env::args_os().skip(1).collect();
     let Some(category) = classify(tool, &args) else {
-        return Err(Command::new(original).args(&args).exec());
+        return Err(Command::new(original?).args(&args).exec());
     };
     if env::var_os("REEF_ADMITTED").as_deref() == Some(OsStr::new("1"))
         || env::var_os("REEF_CONTROL_ATTEMPT").is_some()
     {
-        return Err(Command::new(original).args(&args).exec());
+        return Err(Command::new(original?).args(&args).exec());
     }
     if env::var_os("REEF_AGENT_CONTROL_DIR").is_some() {
-        return control::run(&original, &args, category);
+        return control::run(original.as_deref().ok(), &args, category);
     }
+    let original = original?;
     if args.iter().any(|arg| arg.to_str().is_none()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

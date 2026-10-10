@@ -257,6 +257,33 @@ fn simultaneous_agent_launches_share_private_shims() {
 }
 
 #[test]
+fn missing_control_command_is_counted_as_unavailable() {
+    for agent in ["codex", "claude", "opencode"] {
+        let fixture = Fixture::new(false);
+        fs::remove_file(fixture.path.join("bin/go")).unwrap();
+        let output = fixture
+            .launch_mode(agent, &["go", "test", "private-argument"], true)
+            .env("PATH", fixture.path.join("bin"))
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(!fixture.path.join("output").exists());
+        let report = fixture.control_report();
+        assert_eq!(report["control"]["available"], true);
+        assert_eq!(report["control"]["attempted"], 1);
+        assert_eq!(report["control"]["completed"], 0);
+        assert_eq!(report["control"]["pending"], 0);
+        assert_eq!(report["control"]["unavailable"], 1);
+        assert_eq!(report["command_count"], 0);
+        let events = fs::read_to_string(fixture.path.join("control/attempts.jsonl")).unwrap();
+        assert_eq!(events.lines().count(), 2);
+        assert!(events.contains("\"event\":\"assigned\""));
+        assert!(events.contains("\"event\":\"unavailable\""));
+        assert!(!events.contains("private-argument"));
+    }
+}
+
+#[test]
 fn control_counts_one_attempt_per_top_level_command_without_scheduler() {
     for agent in ["codex", "claude", "opencode"] {
         let fixture = Fixture::new(false);
