@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const EVENTS: &str = "attempts.jsonl";
 const MEASUREMENTS: &str = "measurements.jsonl";
+const ENROLLMENT_LOCK: &str = "enrollment.lock";
 const TELEMETRY_WARNING: &str = "private control telemetry unavailable; control enrollment refused";
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -96,6 +97,8 @@ pub(crate) fn private_file(path: &Path, create: bool) -> io::Result<File> {
 
 fn prepare_inner(dir: &Path) -> io::Result<()> {
     private_dir(dir, true)?;
+    let lock = private_file(&dir.join(ENROLLMENT_LOCK), true)?;
+    lock.lock_exclusive()?;
     if dir.join(EVENTS).exists() != dir.join(MEASUREMENTS).exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
