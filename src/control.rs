@@ -1,7 +1,7 @@
 use crate::run::{self, RecordMode};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -105,6 +105,10 @@ fn prepare_inner(dir: &Path) -> io::Result<()> {
     for name in [EVENTS, MEASUREMENTS] {
         private_file(&dir.join(name), true)?.sync_all()?;
     }
+    validate_existing(dir)
+}
+
+fn validate_existing(dir: &Path) -> io::Result<()> {
     let state = summary(Some(dir), 0, u128::MAX);
     if !state.available || state.warning.is_some() {
         return Err(io::Error::new(
@@ -156,9 +160,7 @@ pub fn run(original: &Path, args: &[OsString], category: &str) -> io::Result<u8>
     let dir =
         env::var_os("REEF_AGENT_CONTROL_DIR").ok_or_else(|| io::Error::other(TELEMETRY_WARNING))?;
     let dir = PathBuf::from(dir);
-    private_dir(&dir, false).map_err(|_| io::Error::other(TELEMETRY_WARNING))?;
-    private_file(&dir.join(MEASUREMENTS), false)
-        .map_err(|_| io::Error::other(TELEMETRY_WARNING))?;
+    validate_existing(&dir).map_err(|_| io::Error::other(TELEMETRY_WARNING))?;
     let id = attempt_id().map_err(|_| io::Error::other(TELEMETRY_WARNING))?;
     let agent = env::var("REEF_AGENT_KIND")
         .ok()
@@ -203,7 +205,7 @@ pub fn run(original: &Path, args: &[OsString], category: &str) -> io::Result<u8>
     })
 }
 
-fn read_telemetry(dir: &Path) -> io::Result<(Vec<Event>, BTreeSet<String>)> {
+fn read_telemetry(dir: &Path) -> io::Result<(Vec<Event>, BTreeMap<String, run::ControlRecord>)> {
     private_dir(dir, false)?;
     let file = private_file(&dir.join(EVENTS), false)?;
     FileExt::lock_shared(&file)?;
@@ -213,10 +215,10 @@ fn read_telemetry(dir: &Path) -> io::Result<(Vec<Event>, BTreeSet<String>)> {
         .collect::<io::Result<Vec<_>>>()?;
     let measurements = private_file(&dir.join(MEASUREMENTS), false)?;
     FileExt::lock_shared(&measurements)?;
-    let mut ids = BTreeSet::new();
+    let mut records = BTreeMap::new();
     for line in BufReader::new(&measurements).lines() {
-        let id = run::control_record_id(&line?)?;
-        if !ids.insert(id) {
+        let record = run::control_record(&line?)?;
+        if records.insert(record.id.clone(), record).is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "control measurement identity is invalid",
@@ -225,7 +227,15 @@ fn read_telemetry(dir: &Path) -> io::Result<(Vec<Event>, BTreeSet<String>)> {
     }
     FileExt::unlock(&measurements)?;
     FileExt::unlock(&file)?;
-    Ok((events, ids))
+    Ok((events, records))
+}
+
+struct Attempt {
+    at_unix_ms: u128,
+    agent: String,
+    category: String,
+    completed: bool,
+    unavailable: bool,
 }
 
 pub fn summary(dir: Option<&Path>, from_ms: u128, to_ms: u128) -> Summary {
@@ -235,7 +245,7 @@ pub fn summary(dir: Option<&Path>, from_ms: u128, to_ms: u128) -> Summary {
     let Ok((events, measurements)) = read_telemetry(&path) else {
         return Summary::unavailable();
     };
-    let mut attempts: BTreeMap<String, (u128, bool, bool)> = BTreeMap::new();
+    let mut attempts: BTreeMap<String, Attempt> = BTreeMap::new();
     for event in events {
         if event.attempt_id.len() != 32
             || !event
@@ -250,7 +260,16 @@ pub fn summary(dir: Option<&Path>, from_ms: u128, to_ms: u128) -> Summary {
         match event.kind.as_str() {
             "assigned" if event.assignment.as_deref() == Some("control") => {
                 if attempts
-                    .insert(event.attempt_id, (event.at_unix_ms, false, false))
+                    .insert(
+                        event.attempt_id,
+                        Attempt {
+                            at_unix_ms: event.at_unix_ms,
+                            agent: event.agent,
+                            category: event.category,
+                            completed: false,
+                            unavailable: false,
+                        },
+                    )
                     .is_some()
                 {
                     return Summary::unavailable();
@@ -260,35 +279,44 @@ pub fn summary(dir: Option<&Path>, from_ms: u128, to_ms: u128) -> Summary {
                 let Some(attempt) = attempts.get_mut(&event.attempt_id) else {
                     return Summary::unavailable();
                 };
-                if attempt.1 || attempt.2 || event.at_unix_ms < attempt.0 {
+                if attempt.completed
+                    || attempt.unavailable
+                    || event.at_unix_ms < attempt.at_unix_ms
+                    || event.agent != attempt.agent
+                    || event.category != attempt.category
+                {
                     return Summary::unavailable();
                 }
-                attempt.1 = event.kind == "completed";
-                attempt.2 = event.kind == "unavailable";
+                attempt.completed = event.kind == "completed";
+                attempt.unavailable = event.kind == "unavailable";
             }
             _ => return Summary::unavailable(),
         }
     }
-    if !measurements.iter().all(|id| attempts.contains_key(id)) {
+    if !measurements.iter().all(|(id, measurement)| {
+        attempts.get(id).is_some_and(|attempt| {
+            measurement.agent == attempt.agent && measurement.category == attempt.category
+        })
+    }) {
         return Summary::unavailable();
     }
     let selected: Vec<_> = attempts
         .values()
-        .filter(|(at, _, _)| *at >= from_ms && *at < to_ms)
+        .filter(|attempt| attempt.at_unix_ms >= from_ms && attempt.at_unix_ms < to_ms)
         .collect();
     let mut completed = 0;
     let mut unavailable = 0;
     let mut pending = 0;
     let mut gap = false;
-    for (id, (_, done, failed)) in attempts
+    for (id, attempt) in attempts
         .iter()
-        .filter(|(_, (at, _, _))| *at >= from_ms && *at < to_ms)
+        .filter(|(_, attempt)| attempt.at_unix_ms >= from_ms && attempt.at_unix_ms < to_ms)
     {
-        if *done && measurements.contains(id) {
+        if attempt.completed && measurements.contains_key(id) {
             completed += 1;
-        } else if *done || *failed {
+        } else if attempt.completed || attempt.unavailable {
             unavailable += 1;
-            gap |= *done;
+            gap |= attempt.completed;
         } else {
             pending += 1;
         }

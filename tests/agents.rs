@@ -139,8 +139,8 @@ fn wait_until(condition: impl Fn() -> bool) {
 }
 
 #[test]
-fn codex_and_claude_route_heavy_commands_and_preserve_status() {
-    for agent in ["codex", "claude"] {
+fn agents_route_heavy_commands_and_preserve_status() {
+    for agent in ["codex", "claude", "opencode"] {
         let fixture = Fixture::new(true);
         let output = fixture
             .launch(agent, &["go", "test", "./..."])
@@ -504,4 +504,92 @@ fn running_control_attempt_is_pending_until_its_measurement_finishes() {
     let completed = fixture.control_report();
     assert_eq!(completed["control"]["pending"], 0);
     assert_eq!(completed["control"]["completed"], 1);
+}
+
+#[test]
+fn mismatched_control_measurement_blocks_report_and_active_session() {
+    for field in ["category", "agent_kind"] {
+        let fixture = Fixture::new(false);
+        let first_done = fixture.path.join("first-done");
+        let proceed = fixture.path.join("proceed");
+        let child = fixture
+            .launch_mode(
+                "codex",
+                &[
+                    "sh",
+                    "-c",
+                    "go test; touch \"$REEF_TEST_FIRST_DONE\"; while [ ! -f \"$REEF_TEST_PROCEED\" ]; do sleep 0.02; done; go test",
+                ],
+                true,
+            )
+            .env("REEF_TEST_FIRST_DONE", &first_done)
+            .env("REEF_TEST_PROCEED", &proceed)
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        wait_until(|| first_done.exists());
+        let measurements = fixture.path.join("control/measurements.jsonl");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&measurements).unwrap()).unwrap();
+        record[field] = serde_json::Value::String(if field == "category" {
+            "lint".to_owned()
+        } else {
+            "claude".to_owned()
+        });
+        fs::write(&measurements, format!("{record}\n")).unwrap();
+        assert_eq!(fixture.control_report()["control"]["available"], false);
+        fs::write(&proceed, b"").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("control enrollment refused"),
+            "{output:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.path.join("output"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn mismatched_control_terminal_event_blocks_enrollment() {
+    let fixture = Fixture::new(false);
+    assert_eq!(
+        fixture
+            .launch_mode("codex", &["go", "test"], true)
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(7)
+    );
+    let events = fixture.path.join("control/attempts.jsonl");
+    let mut records: Vec<serde_json::Value> = fs::read_to_string(&events)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    records[1]["category"] = serde_json::Value::String("lint".to_owned());
+    let mut tampered = String::new();
+    for record in &records {
+        tampered.push_str(&record.to_string());
+        tampered.push('\n');
+    }
+    fs::write(&events, tampered).unwrap();
+    assert_eq!(fixture.control_report()["control"]["available"], false);
+    let before = fs::read_to_string(fixture.path.join("output")).unwrap();
+    let output = fixture
+        .launch_mode("codex", &["go", "test"], true)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("control enrollment refused"));
+    assert_eq!(
+        fs::read_to_string(fixture.path.join("output")).unwrap(),
+        before
+    );
 }

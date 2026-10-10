@@ -132,7 +132,7 @@ pub fn shim(tool: &str) -> io::Result<u8> {
     }
     let agent = env::var("REEF_AGENT_KIND")
         .ok()
-        .filter(|value| value == "codex" || value == "claude")
+        .filter(|value| matches!(value.as_str(), "codex" | "claude" | "opencode"))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid agent kind"))?;
     let session = env::var("REEF_AGENT_SESSION")
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "agent session is missing"))?;

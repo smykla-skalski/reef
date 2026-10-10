@@ -64,7 +64,13 @@ struct Measurement<'a> {
     limit_boundaries: Vec<Boundary>,
 }
 
-pub(crate) fn control_record_id(line: &str) -> io::Result<String> {
+pub(crate) struct ControlRecord {
+    pub id: String,
+    pub agent: String,
+    pub category: String,
+}
+
+pub(crate) fn control_record(line: &str) -> io::Result<ControlRecord> {
     let measurement: Measurement<'_> = serde_json::from_str(line)?;
     let id = measurement.identity;
     if id.len() != 32
@@ -82,7 +88,11 @@ pub(crate) fn control_record_id(line: &str) -> io::Result<String> {
             "control measurement is invalid",
         ));
     }
-    Ok(id.to_owned())
+    Ok(ControlRecord {
+        id: id.to_owned(),
+        agent: measurement.agent_kind.unwrap().to_owned(),
+        category: measurement.category.to_owned(),
+    })
 }
 
 #[derive(Default)]
