@@ -1,6 +1,6 @@
 [package]
 name = "reef"
-version = "0.0.3"
+version = "0.0.4"
 description = "Resource-aware scheduling for coding agents"
 authors = ["Marcin Skalski"]
 edition = "2024"
