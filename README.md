@@ -197,7 +197,7 @@ cargo run -- status
 
 ## Release
 
-Run the **Prepare release** GitHub Actions workflow on `main` and choose `patch`, `minor`, or `major`. It verifies the current published version, creates a version-bump branch with a GitHub-signed commit, and prints an **Open the version-bump PR** link in the run summary. Open that PR, review its branch checks, and merge it through the normal review process. The changed `.release-version` marker then starts the four-platform release workflow, which creates the unsigned `vX.Y.Z` tag and publishes archives and checksums only after its builds and tests pass. Ordinary merges do not bump or publish versions.
+Run the **Prepare release** GitHub Actions workflow on `main` and choose `patch`, `minor`, or `major`. It verifies the current published version, creates a version-bump branch with a GitHub-signed commit, and prints an **Open the version-bump PR** link in the run summary. Open that PR, review its branch checks, and merge it through the normal review process. The changed `.release-version` marker then starts the four-platform release workflow, which creates the unsigned `vX.Y.Z` tag and publishes archives and checksums only after its builds and tests pass. After publication, Reef asks the Homebrew tap to verify the release and open a formula PR. The tap update remains subject to review. Ordinary merges do not bump or publish versions.
 
 ## License
 
