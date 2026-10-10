@@ -132,7 +132,7 @@ reef observe stop
 
 Use `reef observe run` to keep the recorder in the foreground. All three commands accept `--state-dir` for an alternate location; pass it to `stop` as well when using a custom directory. Stopping takes effect within one second. A crashed recorder releases its lock, so the next run reuses its state files without manual cleanup. Do not delete `recorder.pid` or `recorder.lock` while a recorder is running.
 
-On Unix, a recorder launched through a stable command path such as Homebrew's `reef` link reloads itself after that link points to a new executable. It finishes the current host sample first, then replaces its process at the next host interval. This does not download upgrades. A recorder launched from a version-specific binary path stays on that version.
+On Unix, a recorder launched through a stable command path such as Homebrew's `reef` link reloads itself after that link points to a new executable. It finishes the current host sample first, then replaces its process at the next host interval. The replacement keeps the same PID and process start time, so use the executable mapped by the process to verify its version. This does not download upgrades. A recorder launched from a version-specific binary path stays on that version.
 
 Generate a workload report from observations and default command history; add custom record files with `--records`:
 
