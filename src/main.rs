@@ -21,6 +21,7 @@ mod run;
 mod schedule;
 mod schedule_events;
 mod status;
+mod tool_classification;
 
 use clap::ValueEnum;
 use clap::{Parser, Subcommand};

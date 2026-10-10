@@ -1,6 +1,6 @@
 use super::{CommandObservation, sum_metric};
 use crate::agent_observe::{AgentKind, Registration};
-use crate::agents;
+use crate::tool_classification;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
@@ -25,7 +25,7 @@ fn family(name: &str, args: &[OsString]) -> (&'static str, &'static str) {
     let tool = lower.strip_suffix(".exe").unwrap_or(&lower);
     match tool {
         "go" | "cargo" | "mise" | "make" => {
-            let category = agents::classify(tool, args).unwrap_or("other");
+            let category = tool_classification::classify(tool, args).unwrap_or("other");
             let family = match (tool, category) {
                 ("go", "build") => "go build",
                 ("go", "test") => "go test",
