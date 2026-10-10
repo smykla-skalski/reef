@@ -292,12 +292,12 @@ pub fn summary(dir: Option<&Path>, from_ms: u128, to_ms: u128) -> Summary {
                 };
                 if attempt.completed
                     || attempt.unavailable
-                    || event.at_unix_ms < attempt.at_unix_ms
                     || event.agent != attempt.agent
                     || event.category != attempt.category
                 {
                     return Summary::unavailable();
                 }
+                attempt.at_unix_ms = attempt.at_unix_ms.min(event.at_unix_ms);
                 attempt.completed = event.kind == "completed";
                 attempt.unavailable = event.kind == "unavailable";
             }
