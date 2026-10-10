@@ -343,6 +343,66 @@ fn control_counts_one_attempt_per_top_level_command_without_scheduler() {
 }
 
 #[test]
+fn concurrent_first_run_control_launches_enroll_distinct_attempts() {
+    let fixture = Fixture::new(false);
+
+    let children: [Child; 8] = std::array::from_fn(|_| {
+        fixture
+            .launch_mode("codex", &["go", "test"], true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    });
+    let outputs: Vec<_> = children
+        .into_iter()
+        .map(|child| child.wait_with_output().unwrap())
+        .collect();
+
+    assert!(
+        outputs.iter().all(|output| output.status.code() == Some(7)),
+        "{outputs:?}"
+    );
+    let report = fixture.control_report();
+    assert_eq!(report["control"]["available"], true);
+    assert_eq!(report["control"]["attempted"], 8);
+    assert_eq!(report["control"]["completed"], 8);
+    let events = fs::read_to_string(fixture.path.join("control/attempts.jsonl")).unwrap();
+    let identities: std::collections::BTreeSet<_> = events
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|record| record["event"] == "assigned")
+        .map(|record| record["attempt_id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(identities.len(), 8);
+}
+
+#[test]
+fn complete_control_store_in_read_only_directory_allows_enrollment() {
+    let fixture = Fixture::new(false);
+    let dir = fixture.path.join("control");
+    fs::create_dir(&dir).unwrap();
+    for name in ["attempts.jsonl", "measurements.jsonl"] {
+        let path = dir.join(name);
+        fs::write(&path, b"").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let output = fixture
+        .launch_mode("codex", &["go", "test"], true)
+        .output()
+        .unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    let report = fixture.control_report();
+    assert_eq!(report["control"]["available"], true);
+    assert_eq!(report["control"]["attempted"], 1);
+    assert_eq!(report["control"]["completed"], 1);
+}
+
+#[test]
 fn control_clock_rollback_keeps_report_and_enrollment_usable() {
     let fixture = Fixture::new(false);
     let first = fixture
