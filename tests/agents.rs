@@ -343,6 +343,60 @@ fn control_counts_one_attempt_per_top_level_command_without_scheduler() {
 }
 
 #[test]
+fn control_clock_rollback_keeps_report_and_enrollment_usable() {
+    let fixture = Fixture::new(false);
+    let first = fixture
+        .launch_mode("codex", &["go", "test"], true)
+        .output()
+        .unwrap();
+    assert_eq!(first.status.code(), Some(7));
+
+    let events_path = fixture.path.join("control/attempts.jsonl");
+    let mut events: Vec<serde_json::Value> = fs::read_to_string(&events_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let assigned_at = events[0]["at_unix_ms"].as_u64().unwrap();
+    events[0]["at_unix_ms"] = (assigned_at + 300_000).into();
+    fs::write(&events_path, format!("{}\n{}\n", events[0], events[1])).unwrap();
+
+    let measurements_path = fixture.path.join("control/measurements.jsonl");
+    let mut measurement: serde_json::Value =
+        serde_json::from_slice(&fs::read(&measurements_path).unwrap()).unwrap();
+    let started_at = measurement["started_at_unix_ms"].as_u64().unwrap();
+    measurement["started_at_unix_ms"] = (started_at + 300_000).into();
+    fs::write(&measurements_path, format!("{measurement}\n")).unwrap();
+
+    let report = fixture.control_report();
+    assert_eq!(report["control"]["available"], true);
+    assert_eq!(report["control"]["attempted"], 1);
+    assert_eq!(report["control"]["completed"], 1);
+    assert_eq!(report["control"]["unavailable"], 0);
+    assert_eq!(report["command_count"], 1);
+    let explicit = reef()
+        .args(["report", "--format", "json", "--state-dir"])
+        .arg(&fixture.path)
+        .arg("--control-state-dir")
+        .arg(fixture.path.join("control"))
+        .arg("--records")
+        .arg(&measurements_path)
+        .env("HOME", &fixture.path)
+        .output()
+        .unwrap();
+    assert!(explicit.status.success(), "{explicit:?}");
+    let explicit_report: serde_json::Value = serde_json::from_slice(&explicit.stdout).unwrap();
+    assert_eq!(explicit_report["command_count"], 1);
+
+    let second = fixture
+        .launch_mode("codex", &["go", "test"], true)
+        .output()
+        .unwrap();
+    assert_eq!(second.status.code(), Some(7), "{second:?}");
+    assert_eq!(fixture.control_report()["control"]["completed"], 2);
+}
+
+#[test]
 fn control_refuses_unwritable_telemetry_and_report_warns_on_missing_telemetry() {
     let fixture = Fixture::new(false);
     let missing = fixture.control_report();
