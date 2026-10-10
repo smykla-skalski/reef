@@ -1,5 +1,7 @@
 use serde_json::Value;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -102,7 +104,7 @@ fn html_report_contains_host_charts_and_sanitized_agent_cost() {
 }
 
 #[test]
-fn html_output_is_private_and_never_overwrites_an_existing_file() {
+fn html_output_is_private_and_replaces_an_existing_file() {
     let fixture = Fixture::new();
     let path = fixture.0.join("report.html");
     let mut command = reef();
@@ -115,16 +117,17 @@ fn html_output_is_private_and_never_overwrites_an_existing_file() {
         String::from_utf8(output.stdout).unwrap().trim(),
         path.to_str().unwrap()
     );
-    let original = fs::read(&path).unwrap();
-    assert!(original.starts_with(b"<!doctype html>"));
+    assert!(fs::read(&path).unwrap().starts_with(b"<!doctype html>"));
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
     }
+    fs::write(&path, b"stale report").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
     let second = reef()
         .args(["report", "--state-dir"])
         .arg(&fixture.0)
@@ -133,8 +136,78 @@ fn html_output_is_private_and_never_overwrites_an_existing_file() {
         .env("HOME", &fixture.0)
         .output()
         .unwrap();
-    assert!(!second.status.success());
-    assert_eq!(fs::read(&path).unwrap(), original);
+    assert!(second.status.success(), "{second:?}");
+    assert!(fs::read(&path).unwrap().starts_with(b"<!doctype html>"));
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn html_output_replaces_a_long_valid_filename() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("a".repeat(230));
+    fs::write(&path, b"stale report").unwrap();
+    let output = reef()
+        .args(["report", "--state-dir"])
+        .arg(&fixture.0)
+        .args(["--format", "html", "--output"])
+        .arg(&path)
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(fs::read(&path).unwrap().starts_with(b"<!doctype html>"));
+}
+
+#[test]
+fn html_output_does_not_replace_a_directory() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("report.html");
+    fs::create_dir(&path).unwrap();
+    let output = reef()
+        .args(["report", "--state-dir"])
+        .arg(&fixture.0)
+        .args(["--format", "html", "--output"])
+        .arg(&path)
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(path.is_dir());
+    assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn html_output_does_not_follow_or_replace_a_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    let target = fixture.0.join("target.html");
+    let path = fixture.0.join("report.html");
+    fs::write(&target, b"keep this file").unwrap();
+    symlink(&target, &path).unwrap();
+    let output = reef()
+        .args(["report", "--state-dir"])
+        .arg(&fixture.0)
+        .args(["--format", "html", "--output"])
+        .arg(&path)
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(fs::read(&target).unwrap(), b"keep this file");
+    assert!(
+        fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 2);
 }
 
 #[test]
