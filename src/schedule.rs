@@ -8,6 +8,7 @@ use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 use signal_hook::iterator::Signals;
+use socket2::{Domain, SockAddr, Socket, Type};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -62,6 +63,8 @@ enum Request {
         cpu: u32,
         memory_mib: u64,
         identity: String,
+        #[serde(default)]
+        max_wait_ms: Option<u64>,
     },
     Queue,
     Cancel {
@@ -483,6 +486,27 @@ fn monitor_pressure(state: &Arc<Mutex<State>>, stopping: &AtomicBool) {
     }
 }
 
+fn wait_deadline(max_wait_ms: Option<u64>) -> io::Result<Option<Instant>> {
+    max_wait_ms
+        .map(|ms| {
+            if ms == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "admission wait must be positive",
+                ));
+            }
+            Instant::now()
+                .checked_add(Duration::from_millis(ms))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "admission deadline is too large",
+                    )
+                })
+        })
+        .transpose()
+}
+
 fn handle(mut stream: UnixStream, shared: &Arc<Mutex<State>>) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     let request: Request = serde_json::from_slice(&read_line(&mut stream)?)?;
@@ -508,7 +532,9 @@ fn handle(mut stream: UnixStream, shared: &Arc<Mutex<State>>) -> io::Result<()> 
             cpu,
             memory_mib,
             identity,
+            max_wait_ms,
         } => {
+            let deadline = wait_deadline(max_wait_ms)?;
             let (id, position, reason) = {
                 let mut state = shared.lock().unwrap();
                 match state.add(cpu, memory_mib, identity) {
@@ -538,7 +564,7 @@ fn handle(mut stream: UnixStream, shared: &Arc<Mutex<State>>) -> io::Result<()> 
                 shared.lock().unwrap().remove(id);
                 return Err(error);
             }
-            let result = hold_job(&mut stream, shared, id);
+            let result = hold_job(&mut stream, shared, id, deadline);
             if result.is_err() {
                 let state = shared.lock().unwrap();
                 let submitted = state
@@ -570,7 +596,68 @@ fn handle(mut stream: UnixStream, shared: &Arc<Mutex<State>>) -> io::Result<()> 
     }
 }
 
-fn hold_job(stream: &mut UnixStream, shared: &Arc<Mutex<State>>, id: u64) -> io::Result<()> {
+fn expire_queue(
+    stream: &mut UnixStream,
+    shared: &Arc<Mutex<State>>,
+    id: u64,
+    deadline: Option<Instant>,
+    waited: &mut WaitNanos,
+    last_wait: Option<&(usize, String)>,
+    submitted: Instant,
+) -> io::Result<bool> {
+    if deadline.is_none_or(|deadline| Instant::now() < deadline) {
+        return Ok(false);
+    }
+    record_queue_event(
+        shared,
+        id,
+        "cancelled",
+        waited,
+        last_wait,
+        Instant::now(),
+        submitted,
+    );
+    shared.lock().unwrap().remove(id);
+    send(
+        stream,
+        &Reply::Error {
+            message: "pre-admission wait expired; command was not started".into(),
+        },
+    )?;
+    Ok(true)
+}
+
+fn poll_queued_client(stream: &mut UnixStream, deadline: Option<Instant>) -> io::Result<bool> {
+    if let Some(deadline) = deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        stream.set_read_timeout(Some(POLL.min(remaining)))?;
+    }
+    let mut byte = [0];
+    match stream.read(&mut byte) {
+        Ok(0) => Ok(true),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected queued client data",
+        )),
+        Err(error)
+            if error.kind() == io::ErrorKind::WouldBlock
+                || error.kind() == io::ErrorKind::TimedOut =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn hold_job(
+    stream: &mut UnixStream,
+    shared: &Arc<Mutex<State>>,
+    id: u64,
+    deadline: Option<Instant>,
+) -> io::Result<()> {
     stream.set_read_timeout(Some(POLL))?;
     let mut last_wait = shared.lock().unwrap().wait_status(id);
     let submitted = shared
@@ -590,6 +677,17 @@ fn hold_job(stream: &mut UnixStream, shared: &Arc<Mutex<State>>, id: u64) -> io:
             now.duration_since(last_tick).as_nanos(),
         );
         last_tick = now;
+        if expire_queue(
+            stream,
+            shared,
+            id,
+            deadline,
+            &mut waited,
+            last_wait.as_ref(),
+            submitted,
+        )? {
+            return Ok(());
+        }
         let decision = {
             let mut state = shared.lock().unwrap();
             if state
@@ -643,33 +741,21 @@ fn hold_job(stream: &mut UnixStream, shared: &Arc<Mutex<State>>, id: u64) -> io:
             }
             last_wait = wait;
         }
-        let mut byte = [0];
-        match stream.read(&mut byte) {
-            Ok(0) => {
-                record_queue_event(
-                    shared,
-                    id,
-                    "cancelled",
-                    &mut waited,
-                    last_wait.as_ref(),
-                    last_tick,
-                    submitted,
-                );
-                return Ok(());
-            }
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unexpected queued client data",
-                ));
-            }
-            Err(error)
-                if error.kind() == io::ErrorKind::WouldBlock
-                    || error.kind() == io::ErrorKind::TimedOut => {}
-            Err(error) => return Err(error),
+        if poll_queued_client(stream, deadline)? {
+            record_queue_event(
+                shared,
+                id,
+                "cancelled",
+                &mut waited,
+                last_wait.as_ref(),
+                last_tick,
+                submitted,
+            );
+            return Ok(());
         }
     }
 
+    stream.set_read_timeout(Some(POLL))?;
     finish_running(stream, shared, id, submitted)
 }
 
@@ -923,11 +1009,66 @@ fn connect(state_dir: Option<&Path>) -> io::Result<UnixStream> {
     })
 }
 
+fn connect_before_deadline(state_dir: Option<&Path>, deadline: Instant) -> io::Result<UnixStream> {
+    let path = socket_path(state_dir)?;
+    let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    let address = SockAddr::unix(&path)?;
+    socket
+        .connect_timeout(&address, remaining_wait(deadline)?)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "scheduler unavailable at {}: {error}; start `reef serve`",
+                    path.display()
+                ),
+            )
+        })?;
+    remaining_wait(deadline)?;
+    Ok(socket.into())
+}
+
 fn request(stream: &mut UnixStream, request: &Request) -> io::Result<Reply> {
     let mut bytes = serde_json::to_vec(request)?;
     bytes.push(b'\n');
     stream.write_all(&bytes)?;
     serde_json::from_slice(&read_line(stream)?).map_err(io::Error::other)
+}
+
+fn expired_wait() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "pre-admission wait expired; command was not started",
+    )
+}
+
+fn remaining_wait(deadline: Instant) -> io::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(expired_wait())
+    } else {
+        Ok(remaining)
+    }
+}
+
+fn request_before_deadline(
+    stream: &mut UnixStream,
+    request: &Request,
+    deadline: Instant,
+) -> io::Result<Reply> {
+    let mut bytes = serde_json::to_vec(request)?;
+    bytes.push(b'\n');
+    stream.set_write_timeout(Some(POLL.min(remaining_wait(deadline)?)))?;
+    stream.write_all(&bytes)?;
+    stream.set_write_timeout(None)?;
+    let mut buffer = Vec::new();
+    loop {
+        stream.set_read_timeout(Some(POLL.min(remaining_wait(deadline)?)))?;
+        if let Some(line) = poll_line(stream, &mut buffer)? {
+            remaining_wait(deadline)?;
+            return serde_json::from_slice(&line).map_err(io::Error::other);
+        }
+    }
 }
 
 pub fn queue(state_dir: Option<&Path>) -> io::Result<()> {
@@ -1005,7 +1146,45 @@ pub struct RunOptions<'a> {
     pub cpu: u32,
     pub memory_mib: u64,
     pub state_dir: Option<&'a Path>,
+    pub max_wait: Option<Duration>,
     pub limits: &'a crate::contain::Limits,
+}
+
+fn acquire_job(
+    stream: &mut UnixStream,
+    cpu: u32,
+    memory_mib: u64,
+    identity: &str,
+    max_wait_ms: Option<u64>,
+    deadline: Option<Instant>,
+) -> io::Result<u64> {
+    let acquire = Request::Acquire {
+        cpu,
+        memory_mib,
+        identity: identity.to_owned(),
+        max_wait_ms,
+    };
+    let response = if let Some(deadline) = deadline {
+        request_before_deadline(stream, &acquire, deadline)?
+    } else {
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        request(stream, &acquire)?
+    };
+    match response {
+        Reply::Queued {
+            id,
+            position,
+            reason,
+        } => {
+            eprintln!("reef: queued request {id} (position {position}: {reason})");
+            Ok(id)
+        }
+        Reply::Error { message } => Err(io::Error::new(io::ErrorKind::InvalidInput, message)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid admission response",
+        )),
+    }
 }
 
 pub fn schedule(options: RunOptions<'_>) -> io::Result<u8> {
@@ -1017,46 +1196,36 @@ pub fn schedule(options: RunOptions<'_>) -> io::Result<u8> {
         cpu,
         memory_mib,
         state_dir,
+        max_wait,
         limits,
     } = options;
     if std::env::var_os("REEF_ADMITTED").as_deref() == Some(std::ffi::OsStr::new("1")) {
         return run::run_with_limits(command, category, identity, record, None, limits);
     }
-    let mut stream = connect(state_dir)?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    let response = request(
-        &mut stream,
-        &Request::Acquire {
-            cpu,
-            memory_mib,
-            identity: identity.to_owned(),
-        },
-    )?;
-    let id = match response {
-        Reply::Queued {
-            id,
-            position,
-            reason,
-        } => {
-            eprintln!("reef: queued request {id} (position {position}: {reason})");
-            id
-        }
-        Reply::Error { message } => {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
-        }
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid admission response",
-            ));
-        }
+    let max_wait_ms = max_wait.map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX));
+    let client_deadline = wait_deadline(max_wait_ms)?;
+    let mut stream = if let Some(deadline) = client_deadline {
+        connect_before_deadline(state_dir, deadline)?
+    } else {
+        connect(state_dir)?
     };
+    let id = acquire_job(
+        &mut stream,
+        cpu,
+        memory_mib,
+        identity,
+        max_wait_ms,
+        client_deadline,
+    )?;
     let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT])?;
     stream.set_read_timeout(Some(POLL))?;
     let mut response_buffer = Vec::new();
     loop {
         if let Some(signal) = signals.pending().next() {
             return Ok(128_u8.saturating_add(u8::try_from(signal).unwrap_or(1)));
+        }
+        if let Some(deadline) = client_deadline {
+            stream.set_read_timeout(Some(POLL.min(remaining_wait(deadline)?)))?;
         }
         match poll_line(&mut stream, &mut response_buffer) {
             Ok(Some(line)) => match serde_json::from_slice::<Reply>(&line)? {
@@ -1068,6 +1237,9 @@ pub fn schedule(options: RunOptions<'_>) -> io::Result<u8> {
                     eprintln!("reef: request {id} is position {position}: {reason}");
                 }
                 Reply::Granted { id: granted } if granted == id => {
+                    if let Some(deadline) = client_deadline {
+                        remaining_wait(deadline)?;
+                    }
                     eprintln!("reef: admitted request {id}");
                     let mut lease = Lease {
                         stream,

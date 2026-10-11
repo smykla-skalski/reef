@@ -136,6 +136,9 @@ enum Command {
         no_record: bool,
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        /// Fail before command start if scheduler admission takes longer than this.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        max_wait_ms: Option<u64>,
         #[command(flatten)]
         limits: contain::Limits,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -521,6 +524,7 @@ fn main() -> std::process::ExitCode {
             record,
             no_record,
             state_dir,
+            max_wait_ms,
             limits,
             command,
         } => command_result(isolation.preflight().and_then(|()| {
@@ -532,6 +536,7 @@ fn main() -> std::process::ExitCode {
                 cpu,
                 memory_mib,
                 state_dir: state_dir.as_deref(),
+                max_wait: max_wait_ms.map(std::time::Duration::from_millis),
                 limits: &limits,
             })
         })),
