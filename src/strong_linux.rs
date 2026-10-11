@@ -1386,6 +1386,7 @@ fn create_owned_container(
         "--read-only",
         "--interactive",
         "--image-volume=ignore",
+        "--log-driver=none",
         "--http-proxy=false",
         "--tmpfs=/tmp:rw,nosuid,nodev,size=64m",
         "--tmpfs=/run:rw,nosuid,nodev,size=8m",
@@ -1415,6 +1416,7 @@ fn create_owned_container(
     verify_container_label(state_dir, &id, name, &token)?;
     persist_container_id(state_dir, &id)?;
     reject_effective_mounts(state_dir, &id)?;
+    reject_unsafe_effective_config(state_dir, &id)?;
     ensure_active(stopping, state_dir)?;
     if request.workspace_snapshot {
         let source = state_dir.join("workspace-snapshot/source");
@@ -1450,6 +1452,67 @@ fn reject_effective_mounts(state_dir: &Path, id: &str) -> io::Result<()> {
         return Err(io::Error::other(
             "effective container mounts are not allowed",
         ));
+    }
+    Ok(())
+}
+
+fn reject_unsafe_effective_config(state_dir: &Path, id: &str) -> io::Result<()> {
+    let mut inspect = podman_command(state_dir)?;
+    inspect.args(["inspect", "--format", "{{json .HostConfig}}", id]);
+    let output = bounded_output(&mut inspect, PODMAN_TIMEOUT, 16_384)?;
+    let config: serde_json::Value = serde_json::from_slice(&output)?;
+    let is = |field: &str, expected: &str| config[field].as_str() == Some(expected);
+    let empty = |field: &str| config[field].as_array().is_some_and(Vec::is_empty);
+    let security = config["SecurityOpt"]
+        .as_array()
+        .is_some_and(|options| options.iter().any(|option| option == "no-new-privileges"));
+    let dropped = config["CapDrop"].as_array().is_some_and(|capabilities| {
+        [
+            "CAP_CHOWN",
+            "CAP_DAC_OVERRIDE",
+            "CAP_FOWNER",
+            "CAP_FSETID",
+            "CAP_KILL",
+            "CAP_NET_BIND_SERVICE",
+            "CAP_SETFCAP",
+            "CAP_SETGID",
+            "CAP_SETPCAP",
+            "CAP_SETUID",
+            "CAP_SYS_CHROOT",
+        ]
+        .into_iter()
+        .all(|required| {
+            capabilities
+                .iter()
+                .any(|capability| capability.as_str() == Some(required))
+        })
+    });
+    let mappings = ["UidMap", "GidMap"].into_iter().all(|kind| {
+        config["IDMappings"][kind]
+            .as_array()
+            .is_some_and(|mappings| !mappings.is_empty())
+    });
+    if !is("NetworkMode", "none")
+        || !is("PidMode", "private")
+        || !is("IpcMode", "private")
+        || !is("CgroupMode", "private")
+        || !is("UTSMode", "private")
+        || config["Annotations"]["io.podman.annotations.userns"] != "auto"
+        || !is("Cgroups", "default")
+        || config["RestartPolicy"]["Name"] != "no"
+        || !security
+        || !dropped
+        || !mappings
+        || !empty("CapAdd")
+        || !empty("Binds")
+        || !empty("Devices")
+        || config["Privileged"] != false
+        || config["ReadonlyRootfs"] != true
+        || config["LogConfig"]["Type"] != "none"
+        || config["Memory"].as_u64() != Some(536_870_912)
+        || config["PidsLimit"].as_u64() != Some(64)
+    {
+        return Err(io::Error::other("effective container isolation is unsafe"));
     }
     Ok(())
 }
