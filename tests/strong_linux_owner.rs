@@ -91,6 +91,94 @@ fn contained_command_cannot_reach_host_control_planes() {
 }
 
 #[test]
+fn image_healthcheck_is_disabled_before_command_start() {
+    struct Fixture {
+        image: String,
+        context: std::path::PathBuf,
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = Command::new("podman")
+                .args(["image", "rm", "-f", &self.image])
+                .status();
+            let _ = std::fs::remove_dir_all(&self.context);
+        }
+    }
+
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let image = format!(
+        "localhost/reef-healthcheck-{}-{nonce}:test",
+        std::process::id()
+    );
+    let context = std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap())
+        .join(format!("reef-healthcheck-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&context).unwrap();
+    std::fs::write(
+        context.join("Containerfile"),
+        "FROM docker.io/library/alpine:3.22\nHEALTHCHECK --interval=1s CMD true\n",
+    )
+    .unwrap();
+
+    let fixture = Fixture { image, context };
+
+    let build = Command::new("podman")
+        .args([
+            "build",
+            "--format=docker",
+            "--pull=never",
+            "-t",
+            &fixture.image,
+        ])
+        .arg(&fixture.context)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let image_healthcheck = Command::new("podman")
+        .args([
+            "image",
+            "inspect",
+            "--format",
+            "{{json .Config.Healthcheck}}",
+            &fixture.image,
+        ])
+        .output()
+        .unwrap();
+    assert!(image_healthcheck.status.success());
+    assert_ne!(image_healthcheck.stdout, b"null\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner-probe",
+            "--image",
+            &fixture.image,
+            "--",
+            "sh",
+            "-c",
+            "sleep 2; echo healthcheck-disabled",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).ends_with("healthcheck-disabled\n"));
+}
+
+#[test]
 fn probe_returns_the_command_exit_only_after_owner_cleanup() {
     if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
         return;
