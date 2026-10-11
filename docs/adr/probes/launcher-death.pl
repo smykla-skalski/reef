@@ -1,6 +1,7 @@
 use strict;
 use warnings;
 use POSIX ();
+use Time::HiRes qw(CLOCK_MONOTONIC clock_gettime);
 
 # Manual macOS containment probe. Run only inside a disposable, task-owned VM.
 # The child and parent both expire after 240 seconds if cleanup fails.
@@ -14,8 +15,8 @@ if ($child == 0) {
     open my $metadata, '>', "$directory/child-meta" or die "$!\n";
     print {$metadata} "pid=$$ ppid=", getppid(), " marker=cleared\n";
     close $metadata or die "$!\n";
-    my $deadline = time() + 240;
-    while (time() < $deadline) {
+    my $deadline = clock_gettime(CLOCK_MONOTONIC) + 240;
+    while (clock_gettime(CLOCK_MONOTONIC) < $deadline) {
         open my $heartbeat, '>>', "$directory/child-heartbeat" or die "$!\n";
         print {$heartbeat} time(), "\n";
         close $heartbeat or die "$!\n";
