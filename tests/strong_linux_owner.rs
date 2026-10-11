@@ -1,7 +1,8 @@
 #![cfg(target_os = "linux")]
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -45,6 +46,762 @@ fn probe_returns_the_command_exit_only_after_owner_cleanup() {
         !state_dir.with_extension("done").exists(),
         "owner returned before tombstone cleanup"
     );
+}
+
+#[test]
+fn attached_command_forwards_input_output_error_and_exit_status() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let mut launcher = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner-probe",
+            "--image",
+            "docker.io/library/alpine:3.22",
+            "--",
+            "sh",
+            "-c",
+            "read line; printf 'out:%s\\n' \"$line\"; printf 'err:%s\\n' \"$line\" >&2; exit 7",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    launcher
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"hello\n")
+        .unwrap();
+    let output = launcher.wait_with_output().unwrap();
+
+    assert_eq!(output.status.code(), Some(7));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("READY reef-strong-"), "{stdout}");
+    assert!(stdout.ends_with("out:hello\n"), "{stdout}");
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), "err:hello\n");
+}
+
+#[test]
+fn slow_stdout_reader_does_not_truncate_finished_command_output() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let mut launcher = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner-probe",
+            "--image",
+            "docker.io/library/alpine:3.22",
+            "--",
+            "sh",
+            "-c",
+            "head -c 131072 /dev/zero",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = launcher.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let result = reader.read_line(&mut line);
+        let _ = sender.send((reader, line, result));
+    });
+    let (reader, line, read) = receiver.recv_timeout(Duration::from_secs(90)).unwrap();
+    read.unwrap();
+    assert!(line.starts_with("READY reef-strong-"));
+
+    thread::sleep(Duration::from_secs(8));
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = reader;
+        let mut output = Vec::new();
+        let result = reader.read_to_end(&mut output);
+        let _ = sender.send((result, output));
+    });
+    let (read, bytes) = match receiver.recv_timeout(Duration::from_secs(90)) {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = launcher.kill();
+            let _ = launcher.wait();
+            panic!("output drain timed out: {error}");
+        }
+    };
+    read.unwrap();
+    let result = launcher.wait_with_output().unwrap();
+    assert_eq!(
+        result.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(bytes.len(), 131_072);
+    assert!(bytes.iter().all(|byte| *byte == 0));
+}
+
+#[test]
+fn opted_in_usage_reports_observed_cgroup_load_without_command_text() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner-probe",
+            "--image",
+            "docker.io/library/alpine:3.22",
+            "--metrics",
+            "--",
+            "sh",
+            "-c",
+            "dd if=/dev/zero of=/tmp/blob bs=1M count=4 2>/dev/null; sleep 1",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let metrics = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("REEF_MEASUREMENT "))
+        .unwrap();
+    let values: serde_json::Value = serde_json::from_str(metrics).unwrap();
+    assert!(values["wall_ms"].as_u64().unwrap() >= 1_000);
+    assert!(values["observed_peak_memory_bytes"].as_u64().unwrap() > 0);
+    assert!(!metrics.contains("/tmp/blob"));
+}
+
+#[test]
+fn metrics_start_on_a_new_line_after_unterminated_command_stderr() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner-probe",
+            "--image",
+            "docker.io/library/alpine:3.22",
+            "--metrics",
+            "--",
+            "sh",
+            "-c",
+            "printf err >&2",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.starts_with("err\nREEF_MEASUREMENT "), "{stderr}");
+    let measurement = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("REEF_MEASUREMENT "));
+    assert!(measurement.is_some());
+}
+
+#[test]
+fn signal_to_launcher_reaches_contained_command_and_preserves_its_exit() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let mut launcher = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner-probe",
+            "--image",
+            "docker.io/library/alpine:3.22",
+            "--",
+            "sh",
+            "-c",
+            "trap 'printf forwarded >&2; exit 23' TERM; while :; do sleep 1; done",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = launcher.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(stdout).read_line(&mut line);
+        let _ = sender.send((result, line));
+    });
+    let (read, line) = receiver.recv_timeout(Duration::from_secs(90)).unwrap();
+    read.unwrap();
+    let name = line.strip_prefix("READY ").unwrap().trim().to_owned();
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(launcher.id()).unwrap()),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let output = launcher.wait_with_output().unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(23),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("forwarded"));
+    assert_container_gone(&name);
+    assert_owner_state_gone(&name);
+}
+
+#[test]
+fn ignored_signal_forces_teardown_before_cancelled_exit() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let mut launcher = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner-probe",
+            "--image",
+            "docker.io/library/alpine:3.22",
+            "--",
+            "sh",
+            "-c",
+            "trap '' TERM; while :; do sleep 1; done",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = launcher.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(stdout).read_line(&mut line);
+        let _ = sender.send((result, line));
+    });
+    let (read, line) = receiver.recv_timeout(Duration::from_secs(90)).unwrap();
+    read.unwrap();
+    let name = line.strip_prefix("READY ").unwrap().trim().to_owned();
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(launcher.id()).unwrap()),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let output = launcher.wait_with_output().unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(143),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_container_gone(&name);
+    assert_owner_state_gone(&name);
+}
+
+#[test]
+fn signal_during_probe_setup_removes_state_before_returning() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let mut launcher = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner-probe",
+            "--image",
+            "docker.io/library/alpine:3.22",
+            "--",
+            "sleep",
+            "10",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").unwrap();
+    let prefix = format!("reef-strong-{}-", launcher.id());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let name = loop {
+        let match_name = std::fs::read_dir(&runtime)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .find(|name| name.starts_with(&prefix));
+        if let Some(name) = match_name {
+            break name;
+        }
+        if Instant::now() >= deadline {
+            let _ = launcher.kill();
+            let _ = launcher.wait();
+            panic!("probe never created owner state");
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(launcher.id()).unwrap()),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = launcher.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = launcher.kill();
+            let _ = launcher.wait();
+            panic!("early cancellation did not return");
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(status.code(), Some(143));
+    assert_container_gone(&name);
+    assert_owner_state_gone(&name);
+}
+
+#[test]
+fn signal_during_stalled_owner_startup_removes_state() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").unwrap();
+    let shim =
+        std::path::Path::new(&runtime).join(format!("reef-systemd-stall-{}", std::process::id()));
+    std::fs::create_dir(&shim).unwrap();
+    let marker = shim.join("started");
+    let executable = shim.join("systemd-run");
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\n: > \"$REEF_SYSTEMD_RUN_MARKER\"\nexec sleep 30\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let original_path = std::env::var_os("PATH").unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(shim.clone()).chain(std::env::split_paths(&original_path)),
+    )
+    .unwrap();
+    let mut launcher = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner-probe",
+            "--image",
+            "docker.io/library/alpine:3.22",
+            "--",
+            "sleep",
+            "10",
+        ])
+        .env("PATH", path)
+        .env("REEF_SYSTEMD_RUN_MARKER", &marker)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let prefix = format!("reef-strong-{}-", launcher.id());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let name = loop {
+        let name = std::fs::read_dir(&runtime)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .find(|name| name.starts_with(&prefix));
+        if marker.exists()
+            && let Some(name) = name
+        {
+            break name;
+        }
+        if Instant::now() >= deadline {
+            let _ = launcher.kill();
+            let _ = launcher.wait();
+            panic!("stalled systemd-run shim did not start");
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(launcher.id()).unwrap()),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let status = loop {
+        if let Some(status) = launcher.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = launcher.kill();
+            let _ = launcher.wait();
+            panic!("startup cancellation did not return");
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(status.code(), Some(143));
+    assert_owner_state_gone(&name);
+    std::fs::remove_dir_all(shim).unwrap();
+}
+
+#[test]
+fn signal_during_stalled_podman_store_query_removes_state() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").unwrap();
+    let shim =
+        std::path::Path::new(&runtime).join(format!("reef-podman-stall-{}", std::process::id()));
+    std::fs::create_dir(&shim).unwrap();
+    let marker = shim.join("started");
+    let executable = shim.join("podman");
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\n: > \"$REEF_PODMAN_STALL_MARKER\"\nexec sleep 30\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let original_path = std::env::var_os("PATH").unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(shim.clone()).chain(std::env::split_paths(&original_path)),
+    )
+    .unwrap();
+    let mut launcher = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner-probe",
+            "--image",
+            "docker.io/library/alpine:3.22",
+            "--",
+            "sleep",
+            "10",
+        ])
+        .env("PATH", path)
+        .env("REEF_PODMAN_STALL_MARKER", &marker)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let prefix = format!("reef-strong-{}-", launcher.id());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let name = loop {
+        let name = std::fs::read_dir(&runtime)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .find(|name| name.starts_with(&prefix));
+        if marker.exists()
+            && let Some(name) = name
+        {
+            break name;
+        }
+        if Instant::now() >= deadline {
+            let _ = launcher.kill();
+            let _ = launcher.wait();
+            panic!("stalled Podman shim did not start");
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(launcher.id()).unwrap()),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = launcher.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = launcher.kill();
+            let _ = launcher.wait();
+            panic!("Podman setup cancellation did not return");
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(status.code(), Some(143));
+    assert_owner_state_gone(&name);
+    std::fs::remove_dir_all(shim).unwrap();
+}
+
+#[test]
+fn signal_after_podman_store_client_exit_stops_output_wait() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").unwrap();
+    let shim = std::path::Path::new(&runtime)
+        .join(format!("reef-podman-output-stall-{}", std::process::id()));
+    std::fs::create_dir(&shim).unwrap();
+    let marker = shim.join("started");
+    let executable = shim.join("podman");
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\nsleep 3 &\n: > \"$REEF_PODMAN_STALL_MARKER\"\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let original_path = std::env::var_os("PATH").unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(shim.clone()).chain(std::env::split_paths(&original_path)),
+    )
+    .unwrap();
+    let mut launcher = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner-probe",
+            "--image",
+            "docker.io/library/alpine:3.22",
+            "--",
+            "sleep",
+            "10",
+        ])
+        .env("PATH", path)
+        .env("REEF_PODMAN_STALL_MARKER", &marker)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let prefix = format!("reef-strong-{}-", launcher.id());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let name = loop {
+        let name = std::fs::read_dir(&runtime)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .find(|name| name.starts_with(&prefix));
+        if marker.exists()
+            && let Some(name) = name
+        {
+            break name;
+        }
+        if Instant::now() >= deadline {
+            let _ = launcher.kill();
+            let _ = launcher.wait();
+            panic!("Podman output-stall shim did not start");
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    thread::sleep(Duration::from_millis(200));
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(launcher.id()).unwrap()),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = launcher.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = launcher.kill();
+            let _ = launcher.wait();
+            panic!("Podman output wait ignored cancellation");
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(status.code(), Some(143));
+    assert_owner_state_gone(&name);
+    std::fs::remove_dir_all(shim).unwrap();
+}
+
+#[test]
+fn cancellation_does_not_wait_for_an_unread_stdout_pipe() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let mut launcher = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner-probe",
+            "--image",
+            "docker.io/library/alpine:3.22",
+            "--",
+            "sh",
+            "-c",
+            "trap '' TERM; head -c 131072 /dev/zero; while :; do sleep 1; done",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = launcher.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let result = reader.read_line(&mut line);
+        let _ = sender.send((reader, line, result));
+    });
+    let (reader, line, read) = receiver.recv_timeout(Duration::from_secs(90)).unwrap();
+    read.unwrap();
+    let name = line.strip_prefix("READY ").unwrap().trim().to_owned();
+    let _unread_output = reader;
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(launcher.id()).unwrap()),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let status = loop {
+        if let Some(status) = launcher.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = launcher.kill();
+            let _ = launcher.wait();
+            panic!("cancelled launcher waited for unread stdout");
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(status.code(), Some(143));
+    assert_container_gone(&name);
+    assert_owner_state_gone(&name);
+}
+
+#[test]
+fn cancellation_stops_a_post_exit_attach_blocked_on_output() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let mut launcher = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner-probe",
+            "--image",
+            "docker.io/library/alpine:3.22",
+            "--",
+            "sh",
+            "-c",
+            "head -c 196608 /dev/zero",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = launcher.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let result = reader.read_line(&mut line);
+        let _ = sender.send((reader, line, result));
+    });
+    let (reader, line, read) = receiver.recv_timeout(Duration::from_secs(90)).unwrap();
+    read.unwrap();
+    let name = line.strip_prefix("READY ").unwrap().trim().to_owned();
+    let _unread_output = reader;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let output = Command::new("podman")
+            .args(["inspect", "--format", "{{.State.Status}}", &name])
+            .output()
+            .unwrap();
+        if output.status.success() && output.stdout == b"exited\n" {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = launcher.kill();
+            let _ = launcher.wait();
+            panic!("container did not exit before attach drained");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(launcher.id()).unwrap()),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let status = loop {
+        if let Some(status) = launcher.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = launcher.kill();
+            let _ = launcher.wait();
+            panic!("post-exit cancellation waited for Podman attach");
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(status.code(), Some(143));
+    assert_container_gone(&name);
+    assert_owner_state_gone(&name);
+}
+
+#[test]
+fn cancellation_after_owner_completion_stops_an_unread_output_relay() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let mut launcher = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner-probe",
+            "--image",
+            "docker.io/library/alpine:3.22",
+            "--",
+            "sh",
+            "-c",
+            "head -c 131072 /dev/zero",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = launcher.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let result = reader.read_line(&mut line);
+        let _ = sender.send((reader, line, result));
+    });
+    let (reader, line, read) = receiver.recv_timeout(Duration::from_secs(90)).unwrap();
+    read.unwrap();
+    let name = line.strip_prefix("READY ").unwrap().trim().to_owned();
+    let _unread_output = reader;
+
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").unwrap();
+    let state_dir = std::path::Path::new(&runtime).join(&name);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while state_dir.exists() || state_dir.with_extension("done").exists() {
+        if Instant::now() >= deadline {
+            let _ = launcher.kill();
+            let _ = launcher.wait();
+            panic!("owner did not complete before output drain");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(launcher.try_wait().unwrap().is_none());
+    thread::sleep(Duration::from_millis(250));
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(launcher.id()).unwrap()),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = launcher.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = launcher.kill();
+            let _ = launcher.wait();
+            panic!("post-DONE cancellation waited for unread stdout");
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(status.code(), Some(143));
+    assert_container_gone(&name);
+    assert_owner_state_gone(&name);
 }
 
 #[test]

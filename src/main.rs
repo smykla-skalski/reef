@@ -184,6 +184,9 @@ struct StrongOwnerProbeArgs {
     workspace: Option<PathBuf>,
     #[arg(long)]
     approve_snapshot: bool,
+    /// Print bounded, best-effort container usage after verified teardown.
+    #[arg(long)]
+    metrics: bool,
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
 }
@@ -472,12 +475,7 @@ fn main() -> std::process::ExitCode {
             command,
         } => command_result(contain::exec_payload(&command, &snapshot, &expected_json)),
         #[cfg(target_os = "linux")]
-        Command::StrongOwnerProbe(options) => command_result(strong_linux::probe(
-            &options.image,
-            options.workspace.as_deref(),
-            options.approve_snapshot,
-            &options.command,
-        )),
+        Command::StrongOwnerProbe(options) => strong_owner_probe_result(&options),
         #[cfg(target_os = "linux")]
         Command::StrongOwner { state_dir, name } => result(strong_linux::owner(&state_dir, &name)),
         #[cfg(unix)]
@@ -555,6 +553,17 @@ fn main() -> std::process::ExitCode {
         #[cfg(unix)]
         Command::Shadow(options) => report_result(shadow::run(&options)),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn strong_owner_probe_result(options: &StrongOwnerProbeArgs) -> std::process::ExitCode {
+    command_result(strong_linux::probe(
+        &options.image,
+        options.workspace.as_deref(),
+        options.approve_snapshot,
+        options.metrics,
+        &options.command,
+    ))
 }
 
 fn report_result(result: std::io::Result<()>) -> std::process::ExitCode {
