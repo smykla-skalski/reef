@@ -519,7 +519,8 @@ fn recovery_finds_its_container_before_podman_writes_the_cid_file() {
         .status()
         .unwrap();
     assert!(created.success());
-    assert!(!state_dir.join("container.cid").exists());
+    // Podman can open the CID file before writing its ID and then be killed.
+    std::fs::File::create(state_dir.join("container.cid")).unwrap();
 
     let owner = Command::new(env!("CARGO_BIN_EXE_reef"))
         .args([

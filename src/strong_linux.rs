@@ -32,6 +32,10 @@ struct PodmanStore {
     run_root: std::path::PathBuf,
     #[serde(rename = "graphDriverName")]
     driver: String,
+    #[serde(rename = "configFile", default)]
+    config_file: std::path::PathBuf,
+    #[serde(default)]
+    explicit_roots: bool,
 }
 
 pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
@@ -296,8 +300,16 @@ fn pin_podman_store(state_dir: &Path) -> io::Result<()> {
         .arg("--remote=false")
         .args(["info", "--format", "{{json .Store}}"]);
     let output = bounded_output(&mut info, PODMAN_TIMEOUT, 65_536)?;
-    let store: PodmanStore = serde_json::from_slice(&output)?;
+    let mut store: PodmanStore = serde_json::from_slice(&output)?;
     validate_store(&store)?;
+    snapshot_storage_config(state_dir, &mut store)?;
+    let mut private_info = private_podman_command(state_dir, &store)?;
+    private_info.args(["info", "--format", "{{json .Store}}"]);
+    let private_output = bounded_output(&mut private_info, PODMAN_TIMEOUT, 65_536)?;
+    let private_store: PodmanStore = serde_json::from_slice(&private_output)?;
+    store.explicit_roots = private_store.graph_root != store.graph_root
+        || private_store.run_root != store.run_root
+        || private_store.driver != store.driver;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -306,9 +318,40 @@ fn pin_podman_store(state_dir: &Path) -> io::Result<()> {
     file.sync_all()
 }
 
+fn snapshot_storage_config(state_dir: &Path, store: &mut PodmanStore) -> io::Result<()> {
+    if !store.config_file.is_file() {
+        store.config_file = std::path::PathBuf::new();
+        return Ok(());
+    }
+    let bytes = fs::read(&store.config_file)?;
+    if bytes.len() > 1_048_576 {
+        return Err(io::Error::other(
+            "Podman storage configuration is too large",
+        ));
+    }
+    let config = std::str::from_utf8(&bytes).map_err(io::Error::other)?;
+    let original_home = std::env::var("HOME").map_err(io::Error::other)?;
+    if original_home.contains(['"', '\\', '\n', '\r']) {
+        return Err(io::Error::other("unsupported HOME path for Podman storage"));
+    }
+    let config = config
+        .replace("${HOME}", &original_home)
+        .replace("$HOME", &original_home);
+    let snapshot = state_dir.join("podman-home/.config/containers/storage.conf");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&snapshot)?;
+    file.write_all(config.as_bytes())?;
+    file.sync_all()?;
+    store.config_file = snapshot;
+    Ok(())
+}
+
 fn validate_store(store: &PodmanStore) -> io::Result<()> {
     if !store.graph_root.is_absolute()
         || !store.run_root.is_absolute()
+        || (!store.config_file.as_os_str().is_empty() && !store.config_file.is_absolute())
         || store.driver.is_empty()
         || !store
             .driver
@@ -575,10 +618,17 @@ fn read_container_id(state_dir: &Path) -> io::Result<Option<String>> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
-        let id = std::str::from_utf8(&contents)
-            .map_err(io::Error::other)?
-            .trim();
+        let id = match std::str::from_utf8(&contents) {
+            Ok(id) => id.trim(),
+            Err(_) if filename == "container.cid" => continue,
+            Err(error) => return Err(io::Error::other(error)),
+        };
         if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            if filename == "container.cid" {
+                // Podman may open this file before it has written the ID. The
+                // pre-created owner token can recover that creation window.
+                continue;
+            }
             return Err(io::Error::other("invalid recorded container ID"));
         }
         return Ok(Some(id.to_owned()));
@@ -608,8 +658,20 @@ fn podman_status(state_dir: &Path, args: &[&str]) -> io::Result<ExitStatus> {
 }
 
 fn podman_command(state_dir: &Path) -> io::Result<Command> {
-    let data_home = podman_data_home()?;
     let store = read_podman_store(state_dir)?;
+    let mut command = private_podman_command(state_dir, &store)?;
+    if store.explicit_roots {
+        command
+            .arg(format!("--root={}", store.graph_root.display()))
+            .arg(format!("--runroot={}", store.run_root.display()))
+            .arg(format!("--storage-driver={}", store.driver));
+    }
+    command.arg(format!("--hooks-dir={}", state_dir.join("hooks").display()));
+    Ok(command)
+}
+
+fn private_podman_command(state_dir: &Path, store: &PodmanStore) -> io::Result<Command> {
+    let data_home = podman_data_home()?;
     let home = state_dir.join("podman-home");
     let runtime = state_dir
         .parent()
@@ -625,16 +687,16 @@ fn podman_command(state_dir: &Path) -> io::Result<Command> {
             home.join(".config/containers/containers.conf"),
         )
         .env_remove("CONTAINERS_CONF_OVERRIDE")
-        .env_remove("CONTAINERS_STORAGE_CONF")
         .env_remove("STORAGE_DRIVER")
         .env_remove("STORAGE_OPTS")
         .env_remove("CONTAINER_HOST")
         .env_remove("CONTAINER_CONNECTION")
-        .arg("--remote=false")
-        .arg(format!("--root={}", store.graph_root.display()))
-        .arg(format!("--runroot={}", store.run_root.display()))
-        .arg(format!("--storage-driver={}", store.driver))
-        .arg(format!("--hooks-dir={}", state_dir.join("hooks").display()));
+        .arg("--remote=false");
+    if store.config_file.is_file() {
+        command.env("CONTAINERS_STORAGE_CONF", &store.config_file);
+    } else {
+        command.env_remove("CONTAINERS_STORAGE_CONF");
+    }
     Ok(command)
 }
 
