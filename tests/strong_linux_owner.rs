@@ -248,3 +248,59 @@ fn missing_owner_state_does_not_remove_an_unowned_container() {
     assert!(still_exists.success(), "owner removed an unowned container");
     assert!(removed.success());
 }
+
+#[test]
+fn existing_owner_state_does_not_remove_a_name_collision() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let name = format!("reef-strong-collision-{}", std::process::id());
+    let state_dir = std::path::Path::new(&std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join(&name);
+    let config = state_dir.join("podman-home/.config/containers");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::set_permissions(
+        &state_dir,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    std::fs::create_dir(state_dir.join("hooks")).unwrap();
+    std::fs::File::create(config.join("mounts.conf")).unwrap();
+    std::fs::File::create(config.join("containers.conf")).unwrap();
+    std::fs::File::create(state_dir.join("attempted")).unwrap();
+    let created = Command::new("podman")
+        .args([
+            "create",
+            "--pull=never",
+            &format!("--name={name}"),
+            "docker.io/library/alpine:3.22",
+            "true",
+        ])
+        .status()
+        .unwrap();
+    assert!(created.success());
+
+    let owner = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--name",
+            &name,
+        ])
+        .status()
+        .unwrap();
+    let still_exists = Command::new("podman")
+        .args(["container", "exists", &name])
+        .status()
+        .unwrap();
+    let removed = Command::new("podman")
+        .args(["rm", "--force", &name])
+        .status()
+        .unwrap();
+
+    assert!(owner.success());
+    assert!(still_exists.success(), "owner removed a name collision");
+    assert!(removed.success());
+    assert_owner_state_gone(&name);
+}

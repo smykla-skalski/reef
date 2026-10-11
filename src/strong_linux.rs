@@ -35,6 +35,7 @@ pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .ok_or_else(|| io::Error::other("XDG_RUNTIME_DIR is required"))?;
     let runtime = Path::new(&runtime);
+    let data_home = podman_data_home()?;
     let metadata = fs::symlink_metadata(runtime)?;
     if !metadata.is_dir()
         || metadata.uid() != nix::unistd::Uid::current().as_raw()
@@ -71,6 +72,8 @@ pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
             "--property=TimeoutStopSec=2s",
         ])
         .arg(format!("--unit={name}"))
+        .arg(format!("--setenv=XDG_DATA_HOME={}", data_home.display()))
+        .arg(format!("--setenv=XDG_RUNTIME_DIR={}", runtime.display()))
         .arg("--")
         .arg(executable)
         .arg("strong-owner")
@@ -304,15 +307,18 @@ fn run_owner(state_dir: &Path, name: &str, stopping: &AtomicBool) -> io::Result<
     ]);
     create
         .arg(format!("--name={name}"))
+        .arg(format!("--label=io.reef.owner={name}"))
         .arg(&start.image)
         .args(&start.command);
     if !bounded_status(&mut create, PODMAN_TIMEOUT)?.success() {
         return Err(io::Error::other("podman create failed"));
     }
     ensure_active(stopping)?;
-    reject_effective_mounts(state_dir, name)?;
+    let id = owned_container_id(state_dir, name)?
+        .ok_or_else(|| io::Error::other("created container is not owned by Reef"))?;
+    reject_effective_mounts(state_dir, &id)?;
     ensure_active(stopping)?;
-    if !podman_status(state_dir, &["start", name])?.success() {
+    if !podman_status(state_dir, &["start", &id])?.success() {
         return Err(io::Error::other("podman start failed"));
     }
     ensure_active(stopping)?;
@@ -321,7 +327,7 @@ fn run_owner(state_dir: &Path, name: &str, stopping: &AtomicBool) -> io::Result<
 
     let mut waiter = podman_command(state_dir)?;
     let mut waiter = waiter
-        .args(["wait", name])
+        .args(["wait", &id])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -356,9 +362,9 @@ fn ensure_active(stopping: &AtomicBool) -> io::Result<()> {
     }
 }
 
-fn reject_effective_mounts(state_dir: &Path, name: &str) -> io::Result<()> {
+fn reject_effective_mounts(state_dir: &Path, id: &str) -> io::Result<()> {
     let mut inspect = podman_command(state_dir)?;
-    inspect.args(["inspect", "--format", "{{json .Mounts}}", name]);
+    inspect.args(["inspect", "--format", "{{json .Mounts}}", id]);
     let output = bounded_output(&mut inspect, PODMAN_TIMEOUT, 16_384)?;
     let mounts: serde_json::Value = serde_json::from_slice(&output)?;
     if mounts.as_array().is_none_or(|mounts| !mounts.is_empty()) {
@@ -371,18 +377,53 @@ fn reject_effective_mounts(state_dir: &Path, name: &str) -> io::Result<()> {
 
 fn cleanup_until_absent(state_dir: &Path, name: &str) {
     loop {
+        let id = match owned_container_id(state_dir, name) {
+            Ok(Some(id)) => id,
+            Ok(None) => return,
+            Err(_) => {
+                thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+        };
         let Ok(mut remove) = podman_command(state_dir) else {
             thread::sleep(Duration::from_secs(1));
             continue;
         };
-        remove.args(["rm", "--force", "--time=0", name]);
+        remove.args(["rm", "--force", "--time=0", &id]);
         let _ = bounded_status(&mut remove, STOP_TIMEOUT);
-        if matches!(podman_status(state_dir, &["container", "exists", name]), Ok(status) if status.code() == Some(1))
-        {
-            return;
-        }
         thread::sleep(Duration::from_secs(1));
     }
+}
+
+fn owned_container_id(state_dir: &Path, name: &str) -> io::Result<Option<String>> {
+    let exists = podman_status(state_dir, &["container", "exists", name])?;
+    if exists.code() == Some(1) {
+        return Ok(None);
+    }
+    if !exists.success() {
+        return Err(io::Error::other("cannot verify container existence"));
+    }
+    let mut inspect = podman_command(state_dir)?;
+    inspect.args([
+        "container",
+        "inspect",
+        "--format",
+        "{{.Id}}|{{index .Config.Labels \"io.reef.owner\"}}",
+        name,
+    ]);
+    let output = bounded_output(&mut inspect, PODMAN_TIMEOUT, 256)?;
+    let output = std::str::from_utf8(&output).map_err(io::Error::other)?;
+    let (id, owner) = output
+        .trim_end()
+        .split_once('|')
+        .ok_or_else(|| io::Error::other("invalid container identity"))?;
+    if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::other("invalid container ID"));
+    }
+    if owner != name {
+        return Ok(None);
+    }
+    Ok(Some(id.to_owned()))
 }
 
 fn podman_status(state_dir: &Path, args: &[&str]) -> io::Result<ExitStatus> {
@@ -392,28 +433,44 @@ fn podman_status(state_dir: &Path, args: &[&str]) -> io::Result<ExitStatus> {
 }
 
 fn podman_command(state_dir: &Path) -> io::Result<Command> {
+    let data_home = podman_data_home()?;
+    let home = state_dir.join("podman-home");
+    let runtime = state_dir
+        .parent()
+        .ok_or_else(|| io::Error::other("invalid owner state path"))?;
+    let mut command = Command::new("podman");
+    command
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", data_home)
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env(
+            "CONTAINERS_CONF",
+            home.join(".config/containers/containers.conf"),
+        )
+        .env_remove("CONTAINERS_CONF_OVERRIDE")
+        .env_remove("CONTAINERS_STORAGE_CONF")
+        .env_remove("STORAGE_DRIVER")
+        .env_remove("STORAGE_OPTS")
+        .env_remove("CONTAINER_HOST")
+        .env_remove("CONTAINER_CONNECTION")
+        .arg("--remote=false")
+        .arg(format!("--hooks-dir={}", state_dir.join("hooks").display()));
+    Ok(command)
+}
+
+fn podman_data_home() -> io::Result<std::path::PathBuf> {
     let data_home = std::env::var_os("XDG_DATA_HOME")
         .or_else(|| {
             std::env::var_os("HOME")
                 .map(|home| Path::new(&home).join(".local/share").into_os_string())
         })
         .ok_or_else(|| io::Error::other("cannot resolve Podman image store"))?;
-    let home = state_dir.join("podman-home");
-    let mut command = Command::new("podman");
-    command
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("XDG_DATA_HOME", data_home)
-        .env(
-            "CONTAINERS_CONF",
-            home.join(".config/containers/containers.conf"),
-        )
-        .env_remove("CONTAINERS_CONF_OVERRIDE")
-        .env_remove("CONTAINER_HOST")
-        .env_remove("CONTAINER_CONNECTION")
-        .arg("--remote=false")
-        .arg(format!("--hooks-dir={}", state_dir.join("hooks").display()));
-    Ok(command)
+    let data_home = std::path::PathBuf::from(data_home);
+    if !data_home.is_absolute() {
+        return Err(io::Error::other("Podman image store path must be absolute"));
+    }
+    Ok(data_home)
 }
 
 fn bounded_status(command: &mut Command, timeout: Duration) -> io::Result<ExitStatus> {
