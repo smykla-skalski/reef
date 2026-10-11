@@ -1,0 +1,54 @@
+# ADR 0002: Require a per-command VM for full macOS descendant containment
+
+- Status: Research decision; macOS enforcement remains blocked
+- Date: 2026-10-11
+- Issue: [#75](https://github.com/smykla-skalski/reef/issues/75)
+- Follow-up implementation: [#68](https://github.com/smykla-skalski/reef/issues/68), draft [#71](https://github.com/smykla-skalski/reef/pull/71)
+
+## Context and guarantee
+
+Reef must stop every descendant of a managed macOS command when its launcher dies. A descendant may create a new session, clear `REEF_RUN_OWNER`, or ask launchd to start a sibling service. Process ancestry, a process group, and an inherited environment marker are therefore insufficient ownership boundaries. The guarantee cannot be narrowed to cooperative descendants.
+
+This ADR selects an isolation boundary and records a disposable local proof. It does not add a Reef VM owner, enable enforcement, or establish that the draft supervisor in #71 satisfies #68.
+
+## Decision
+
+Use one Apple Virtualization.framework macOS VM per managed command. The VM must have no host mount or reusable host credentials. An independent host owner must hold the VM identity and the only launcher-liveness channel; Reef must start that owner before the guest command and receive a readiness acknowledgement before recording the command as running. The liveness write end must be close-on-exec and unavailable to commands, SSH transports, and helpers. On EOF or a bounded heartbeat timeout, the owner must stop the entire VM and verify that its Virtualization driver exited before releasing the scheduler lease. If it cannot confirm teardown, Reef must retain an explicit unsafe state and block reuse or automatic retry.
+
+This is a per-command boundary, not a pool of commands inside one guest. A shared guest would let a command create a launchd sibling outside its process group or service. A sibling workload that must survive this command belongs in another VM or on the host, with separate ownership.
+
+## Options considered
+
+| Boundary | Full descendant containment | Privileges and setup | Filesystem and resource cost | Decision |
+| --- | --- | --- | --- | --- |
+| Process group plus inherited marker | Fails when a child calls `setsid()` and clears the marker | No VM setup; ordinary user privileges | Direct host filesystem; negligible isolation overhead | Reject for enforcement |
+| Shared Linux guest with a per-command systemd cgroup | Contains a detached child in its unit, but a command can start a sibling user unit outside that cgroup | Linux guest and systemd user manager | Shared guest filesystem and credentials; smaller per-command cost | Reject for the full guarantee |
+| One native macOS VM per command | Whole-VM termination stopped a detached marker-clearing child and a launchd sibling service in local probes | Apple-silicon host, Virtualization entitlement, installed macOS guest, guest toolchain | Explicit source transfer; 4 vCPU, 4 GiB configured RAM, 100 GiB virtual disk in this probe | Select for implementation research; owner integration remains unproven |
+
+The native installer used Apple's Virtualization.framework sample and an Apple restore image. It completed without the `hdiutil` detach operation that endpoint protection denied during the earlier Lima attempt. No endpoint protection setting or mount restriction was changed.
+
+## Local evidence
+
+- The disposable native guest used 4 vCPU, 4 GiB configured RAM, a 100 GiB ASIF virtual disk, NAT networking, and no host mount. The installation took about 3 minutes 20 seconds. The installed bundle occupied about 21 GiB before toolchain work; APFS clones shared unchanged extents. The Virtualization driver reached about 3.9 GiB resident memory during toolchain installation. Host free disk fell from about 177 GiB to 165 GiB across guest toolchain installation, build, tests, and clone writes; this is one observation, not a per-job budget.
+- A task-only source copy over SSH transferred 892 KiB. Its `.git` worktree pointer referred to a host-only path, causing one Git-based test to fail. A fresh public HTTPS clone in the guest at `6d47897163ae163920e0d707618073994aaa4b3d` restored repository semantics without host credentials. Pinned SSH host-key checking was used after matching the VM's NAT MAC address.
+- Guest Command Line Tools 26.6, mise 2026.10.7, and Rust 1.99.0 installed through their supported paths. `mise run build` passed in 21.24 seconds. On the exact public clone, `mise run check` passed formatting, Clippy with `-D warnings`, and all unit and integration suites through non-PTY SSH. The task-local Cargo target reached about 1.0 GiB; rustup about 1.3 GiB; Cargo cache about 112 MiB. Guest disk still had about 65 GiB available.
+- SSH allocated `/dev/ttys000` and preserved terminal stdin and stdout. In a fresh VM clone, one managed `reef run --no-record -- /bin/sh -c ...` verified `test -t 0`, `test -t 1`, a prompt/read/echo exchange, and exit 0. A separate full `mise run check` launched from an interactive SSH zsh suspended its foreground process group with `tty output` while `tests/run.rs` ran. The same check passed over non-PTY SSH. The cause and broader interactive-command behavior require a separate CLI investigation.
+- A detached Perl child called `setsid()`, deleted the marker, and wrote a persistent heartbeat in a VM clone. After SIGKILL of only that clone's verified host runner, guest SSH stopped and the VM driver exited. On reboot before the child's 240-second TTL, its heartbeat stayed at 24 lines and its PID was absent.
+- A separate VM clone ran a transient launchd system service as the disposable guest user. The service had PID 513, PPID 1, a cleared marker, and a persistent heartbeat. Its verified host VM runner was SIGKILLed at 09:29:48 UTC. The runner and VM driver exited and guest SSH closed. After reboot, at 09:31:07 and 09:32:18 UTC, both before the 240-second TTL, the heartbeat stayed at 17 lines with its last timestamp at 09:29:46 UTC; PID 513 and the launchd service were absent. The transient task plist and probe script were removed from the guest, while heartbeat evidence remained in the stopped task VM bundle.
+- A fresh clone reached SSH port 22 about 14-16 seconds after the VM-start log in the sibling probe. This is a single-host observation, not a latency guarantee. Provisioning, first-boot setup, toolchain download, and cache policy remain material startup costs.
+
+The owner-death probes killed the VM runner directly. They prove the VM boundary stops those workloads when the boundary is destroyed. They do **not** prove that a Reef launcher death automatically destroys the VM or that teardown is fail-closed under owner races.
+
+## Reproduction and failure behavior
+
+Each boundary probe used a fresh APFS clone of a stopped task VM, one bounded workload, and a unique signed runner path. The detached-child probe forked, called `setsid()`, cleared `REEF_RUN_OWNER`, and wrote a heartbeat under the guest user's home directory for 240 seconds. The sibling probe bootstrapped a transient launchd service as the guest user, confirmed PID 513 had PPID 1 and a cleared marker, and wrote the same durable heartbeat. For each probe, the operator confirmed the workload and heartbeat, synced the guest, SIGKILLed only the verified host VM runner, confirmed its driver and SSH endpoint disappeared, rebooted the same clone before TTL, and checked that the heartbeat count stayed fixed and the workload did not reappear. This sequence is reproducible boundary research; the operator, not Reef, performed teardown.
+
+The owner must fail closed if VM creation, restore, source transfer, guest authentication, command launch, heartbeat, normal shutdown, forced stop, or driver-exit confirmation fails. It must never report a cancelled command or release its lease while the VM can still execute. A launcher killed before readiness acknowledgement must leave no guest command running. A transport child must not inherit the liveness write end. A failed owner teardown must surface a recoverable unsafe state, not silently mark success. Commands with side effects must not be retried automatically after an ambiguous failure.
+
+## Research outcome and implementation gates
+
+#75 can close when this boundary research, its mechanism comparison, native command checks, and explicit limitations are accepted. Closing the research issue does not assert that Reef has implemented the owner. The independent owner, liveness protocol, and fail-closed teardown belong to #68.
+
+Before #68 enters a macOS enforcement canary, a reproducible test on one implementation revision must kill and stop the **Reef launcher**, not just the VM runner, and verify automatic owner-driven teardown for a `setsid` marker-clearing child and a launchd sibling service before their TTLs. It must cover pre-acknowledgement launch races, normal completion, cancellation, repeated SIGKILL and SIGSTOP, owner/driver exit confirmation, and failed-stop recovery. Build, test, lint, task-only workspace transfer, bounded resource use, and interactive terminal behavior must run on that same revision. Record cold and warm boot, peak host memory, incremental disk, and cleanup residue across enough repetitions to set an admission budget. Test a sibling workload in another VM to confirm that only the managed command's VM stops.
+
+#68 and draft #71 remain blocked until that owner and its failure tests pass an adversarial review on the real Reef CLI. This ADR does not authorize a macOS enforcement canary.
