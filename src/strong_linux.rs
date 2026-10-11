@@ -49,9 +49,13 @@ pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
     let name = format!("reef-strong-{}-{nonce}", std::process::id());
     let state_dir = runtime.join(&name);
     DirBuilder::new().mode(0o700).create(&state_dir)?;
-    let listener = UnixListener::bind(state_dir.join("owner.sock"))?;
+    let listener = UnixListener::bind(state_dir.join("owner.sock")).inspect_err(|_| {
+        cleanup_state_dir(&state_dir);
+    })?;
 
-    let executable = std::env::current_exe()?;
+    let executable = std::env::current_exe().inspect_err(|_| {
+        cleanup_state_dir(&state_dir);
+    })?;
     let output = Command::new("systemd-run")
         .args([
             "--user",
@@ -71,14 +75,63 @@ pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
         .arg(&state_dir)
         .arg("--name")
         .arg(&name)
-        .output()?;
+        .output()
+        .inspect_err(|_| {
+            cleanup_state_dir(&state_dir);
+        })?;
     if !output.status.success() {
+        cleanup_state_dir(&state_dir);
         return Err(io::Error::other(format!(
             "cannot start independent owner: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
 
+    let outcome = probe_connected(&listener, image, command, &name);
+    if outcome.is_err() {
+        // The launcher is still alive here. If the service was explicitly
+        // stopped, systemd will not restart it. Stop any remaining owner
+        // first, so it cannot create a container after our absence check.
+        quiesce_owner(&name);
+        cleanup_until_absent(&name);
+        cleanup_state_dir(&state_dir);
+    }
+    outcome
+}
+
+fn quiesce_owner(name: &str) {
+    let unit = format!("{name}.service");
+    loop {
+        let mut stop = Command::new("systemctl");
+        stop.args(["--user", "stop", &unit]);
+        if matches!(bounded_status(&mut stop, PODMAN_TIMEOUT), Ok(status) if status.success()) {
+            return;
+        }
+
+        // A collected transient unit can no longer start work. Keep retrying
+        // if the user manager itself is unavailable or reports another state.
+        let mut show = Command::new("systemctl");
+        show.args([
+            "--user",
+            "show",
+            "--property=LoadState,ActiveState",
+            "--value",
+            &unit,
+        ]);
+        if matches!(bounded_output(&mut show, PODMAN_TIMEOUT, 128), Ok(output) if output == b"not-found\ninactive\n")
+        {
+            return;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn probe_connected(
+    listener: &UnixListener,
+    image: &str,
+    command: &[String],
+    name: &str,
+) -> io::Result<u8> {
     listener.set_nonblocking(true)?;
     let deadline = Instant::now() + START_TIMEOUT;
     let mut stream = loop {
@@ -124,7 +177,12 @@ pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
 }
 
 pub fn owner(state_dir: &Path, name: &str) -> io::Result<()> {
-    validate_name(state_dir, name)?;
+    validate_name_path(state_dir, name)?;
+    if !state_dir.exists() {
+        cleanup_until_absent(name);
+        return Ok(());
+    }
+    validate_state_dir(state_dir)?;
     let stopping = Arc::new(AtomicBool::new(false));
     for signal in [
         signal_hook::consts::SIGTERM,
@@ -142,6 +200,7 @@ pub fn owner(state_dir: &Path, name: &str) -> io::Result<()> {
     {
         // A restarted owner may only recover; it must never rerun a command.
         cleanup_until_absent(name);
+        cleanup_state_dir(state_dir);
         return Ok(());
     }
 
@@ -150,7 +209,14 @@ pub fn owner(state_dir: &Path, name: &str) -> io::Result<()> {
     if let Ok(mut stream) = outcome {
         let _ = stream.write_all(b"DONE\n");
     }
+    cleanup_state_dir(state_dir);
     Ok(())
+}
+
+fn cleanup_state_dir(state_dir: &Path) {
+    let _ = fs::remove_file(state_dir.join("attempted"));
+    let _ = fs::remove_file(state_dir.join("owner.sock"));
+    let _ = fs::remove_dir(state_dir);
 }
 
 fn run_owner(state_dir: &Path, name: &str, stopping: &AtomicBool) -> io::Result<UnixStream> {
@@ -378,15 +444,26 @@ fn validate_image(image: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_name(state_dir: &Path, name: &str) -> io::Result<()> {
+fn validate_name_path(state_dir: &Path, name: &str) -> io::Result<()> {
     if !name.starts_with("reef-strong-")
         || !name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         || state_dir.file_name().is_none_or(|value| value != name)
-        || !fs::symlink_metadata(state_dir)?.is_dir()
-        || fs::symlink_metadata(state_dir)?.uid() != nix::unistd::Uid::current().as_raw()
-        || fs::symlink_metadata(state_dir)?.mode() & 0o077 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid owner name",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_state_dir(state_dir: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(state_dir)?;
+    if !metadata.is_dir()
+        || metadata.uid() != nix::unistd::Uid::current().as_raw()
+        || metadata.mode() & 0o077 != 0
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

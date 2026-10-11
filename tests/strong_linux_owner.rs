@@ -72,6 +72,36 @@ fn assert_init_process_gone(pid: u32) {
     }
 }
 
+fn assert_owner_state_gone(name: &str) {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").unwrap();
+    let state_dir = std::path::Path::new(&runtime).join(name);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while state_dir.exists() {
+        assert!(Instant::now() < deadline, "owner left runtime state behind");
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn owner_pid(name: &str) -> i32 {
+    let output = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            "--property=MainPID",
+            "--value",
+            &format!("{name}.service"),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let pid: i32 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(pid > 0);
+    pid
+}
+
 #[test]
 fn killing_the_reef_launcher_removes_a_detached_container_child() {
     if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
@@ -98,6 +128,7 @@ fn killing_the_reef_launcher_removes_a_detached_container_child() {
 
     assert_container_gone(&name);
     assert_init_process_gone(init_pid);
+    assert_owner_state_gone(&name);
 }
 
 #[test]
@@ -109,22 +140,7 @@ fn killing_the_supervised_owner_cleans_the_existing_container() {
     let (mut launcher, name) = started_probe();
     let init_pid = container_init_pid(&name);
     assert!(init_pid > 0);
-    let output = Command::new("systemctl")
-        .args([
-            "--user",
-            "show",
-            "--property=MainPID",
-            "--value",
-            &format!("{name}.service"),
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let pid: i32 = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .unwrap();
-    assert!(pid > 0);
+    let pid = owner_pid(&name);
 
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(pid),
@@ -135,6 +151,7 @@ fn killing_the_supervised_owner_cleans_the_existing_container() {
     assert!(!launcher.wait().unwrap().success());
     assert_container_gone(&name);
     assert_init_process_gone(init_pid);
+    assert_owner_state_gone(&name);
 }
 
 #[test]
@@ -146,6 +163,34 @@ fn stopping_the_owner_service_removes_its_container() {
     let (mut launcher, name) = started_probe();
     let init_pid = container_init_pid(&name);
     assert!(init_pid > 0);
+
+    let status = Command::new("systemctl")
+        .args(["--user", "stop", &format!("{name}.service")])
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    assert!(!launcher.wait().unwrap().success());
+    assert_container_gone(&name);
+    assert_init_process_gone(init_pid);
+    assert_owner_state_gone(&name);
+}
+
+#[test]
+fn stopping_an_unresponsive_owner_still_removes_its_container() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let (mut launcher, name) = started_probe();
+    let init_pid = container_init_pid(&name);
+    assert!(init_pid > 0);
+    let pid = owner_pid(&name);
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGSTOP,
+    )
+    .unwrap();
 
     let status = Command::new("systemctl")
         .args(["--user", "stop", &format!("{name}.service")])
