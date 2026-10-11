@@ -2,13 +2,14 @@
 
 use nix::fcntl::{FcntlArg, FdFlag, Flock, FlockArg, OFlag, fcntl};
 use serde::{Deserialize, Serialize};
-use std::ffi::OsString;
+use signal_hook::iterator::Signals;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,6 +20,11 @@ const START_TIMEOUT: Duration = Duration::from_secs(90);
 const PODMAN_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const OWNER_LOCK_TIMEOUT: Duration = Duration::from_secs(90);
+const CONTROL_TICK: Duration = Duration::from_millis(250);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+const CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const SIGNAL_GRACE: Duration = Duration::from_secs(2);
 const STORE_MAX_BYTES: usize = 65_536;
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
@@ -27,6 +33,56 @@ struct Start {
     image: String,
     command: Vec<String>,
     workspace_snapshot: bool,
+}
+
+struct ProbeListeners {
+    control: UnixListener,
+    input: UnixListener,
+    output: UnixListener,
+    error: UnixListener,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Usage {
+    wall_ms: u128,
+    observed_cpu_ms: Option<u64>,
+    observed_peak_memory_bytes: Option<u64>,
+    observed_io_read_bytes: Option<u64>,
+    observed_io_write_bytes: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Done {
+    code: u8,
+    usage: Usage,
+}
+
+#[derive(Default)]
+struct UsageSample {
+    cpu_usec: Option<u64>,
+    peak_memory_bytes: Option<u64>,
+    io_read_bytes: Option<u64>,
+    io_write_bytes: Option<u64>,
+}
+
+struct RunOutcome {
+    stream: UnixStream,
+    done: Done,
+}
+
+enum StoreOutput {
+    Done(Vec<u8>),
+    Cancelled(i32),
+}
+
+enum ProbeCompletion {
+    Finished(u8),
+    Cancelled(i32),
+}
+
+struct Monitored {
+    done: Done,
+    force_stop: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -47,9 +103,16 @@ pub fn probe(
     image: &str,
     workspace: Option<&Path>,
     approve_snapshot: bool,
+    metrics: bool,
     command: &[String],
 ) -> io::Result<u8> {
     validate_probe_request(image, workspace, approve_snapshot, command)?;
+    let mut signals = Signals::new([
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+        signal_hook::consts::SIGQUIT,
+    ])?;
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .ok_or_else(|| io::Error::other("XDG_RUNTIME_DIR is required"))?;
     let runtime = Path::new(&runtime);
@@ -82,24 +145,111 @@ pub fn probe(
     prepare_podman_home(&state_dir).inspect_err(|_| {
         let _ = cleanup_state_dir(&state_dir);
     })?;
-    pin_podman_store(&state_dir).inspect_err(|_| {
-        let _ = cleanup_state_dir(&state_dir);
-    })?;
+    match pin_podman_store(&state_dir, &mut signals) {
+        Ok(None) => {}
+        Ok(Some(signal)) => {
+            cleanup_state_dir(&state_dir)?;
+            return Ok(signal_exit_code(signal));
+        }
+        Err(error) => {
+            cleanup_state_dir(&state_dir)?;
+            return Err(error);
+        }
+    }
     write_owner_token(&state_dir).inspect_err(|_| {
         let _ = cleanup_state_dir(&state_dir);
     })?;
-    let listener = UnixListener::bind(state_dir.join("owner.sock")).inspect_err(|_| {
+    let listeners = bind_probe_listeners(&state_dir).inspect_err(|_| {
         let _ = cleanup_state_dir(&state_dir);
     })?;
 
     let executable = std::env::current_exe().inspect_err(|_| {
         let _ = cleanup_state_dir(&state_dir);
     })?;
+    if let Some(signal) = signals.pending().next() {
+        cleanup_state_dir(&state_dir)?;
+        return Ok(signal_exit_code(signal));
+    }
+    match start_owner_service(
+        &state_dir,
+        &name,
+        &data_home,
+        runtime,
+        &executable,
+        &mut signals,
+    ) {
+        Ok(None) => {}
+        Ok(Some(signal)) => {
+            cleanup_failed_probe(&state_dir, &name)?;
+            return Ok(signal_exit_code(signal));
+        }
+        Err(error) => {
+            cleanup_failed_probe(&state_dir, &name)?;
+            return Err(error);
+        }
+    }
+
+    let outcome = probe_connected(
+        &listeners,
+        &state_dir,
+        image,
+        workspace,
+        metrics,
+        command,
+        &mut signals,
+    );
+    if !matches!(outcome, Ok(ProbeCompletion::Finished(_))) {
+        cleanup_failed_probe(&state_dir, &name)?;
+    }
+    match outcome? {
+        ProbeCompletion::Finished(code) => Ok(code),
+        ProbeCompletion::Cancelled(signal) => Ok(signal_exit_code(signal)),
+    }
+}
+
+fn signal_exit_code(signal: i32) -> u8 {
+    u8::try_from(128 + signal).unwrap_or(1)
+}
+
+fn cleanup_failed_probe(state_dir: &Path, name: &str) -> io::Result<()> {
+    let cancellation = mark_cancelled(state_dir);
+    // An attached start client can outlive a killed owner. Remove its pinned
+    // container before waiting for the lock inherited by an in-flight start.
+    let _ = quiesce_owner(name);
+    cleanup_until_absent(state_dir);
+    let _lock = lock_state_until(state_dir, OWNER_LOCK_TIMEOUT)?;
+    cleanup_until_absent(state_dir);
+    cleanup_state_dir(state_dir)?;
+    cancellation
+}
+
+fn bind_probe_listeners(state_dir: &Path) -> io::Result<ProbeListeners> {
+    Ok(ProbeListeners {
+        control: UnixListener::bind(state_dir.join("owner.sock"))?,
+        input: UnixListener::bind(state_dir.join("stdin.sock"))?,
+        output: UnixListener::bind(state_dir.join("stdout.sock"))?,
+        error: UnixListener::bind(state_dir.join("stderr.sock"))?,
+    })
+}
+
+fn start_owner_service(
+    state_dir: &Path,
+    name: &str,
+    data_home: &Path,
+    runtime: &Path,
+    executable: &Path,
+    signals: &mut Signals,
+) -> io::Result<Option<i32>> {
     let mut data_home_env = OsString::from("--setenv=XDG_DATA_HOME=");
     data_home_env.push(data_home.as_os_str());
     let mut runtime_env = OsString::from("--setenv=XDG_RUNTIME_DIR=");
     runtime_env.push(runtime.as_os_str());
-    let output = Command::new("systemd-run")
+    let error_path = state_dir.join("start.stderr");
+    let error_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&error_path)?;
+    let mut child = Command::new("systemd-run")
         .args([
             "--user",
             "--collect",
@@ -117,35 +267,48 @@ pub fn probe(
         .arg(executable)
         .arg("strong-owner")
         .arg("--state-dir")
-        .arg(&state_dir)
+        .arg(state_dir)
         .arg("--name")
-        .arg(&name)
-        .output()
-        .inspect_err(|_| {
-            let _ = cleanup_state_dir(&state_dir);
-        })?;
-    if !output.status.success() {
-        let _ = cleanup_state_dir(&state_dir);
-        return Err(io::Error::other(format!(
-            "cannot start independent owner: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+        .arg(name)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(error_file))
+        .spawn()?;
+    let deadline = Instant::now() + START_TIMEOUT;
+    let status = loop {
+        if let Some(signal) = signals.pending().next() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(Some(signal));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "independent owner startup timed out",
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
+    };
+    if status.success() {
+        return Ok(None);
     }
-
-    let outcome = probe_connected(&listener, &state_dir, image, workspace, command, &name);
-    if outcome.is_err() {
-        let cancellation = mark_cancelled(&state_dir);
-        // The launcher is still alive here. If the service was explicitly
-        // stopped, systemd will not restart it. Stop any remaining owner
-        // first. The lock also covers an in-flight Podman create/start when
-        // the user bus is unavailable, so absence cannot precede creation.
-        let _ = quiesce_owner(&name);
-        let _lock = lock_state_until(&state_dir, OWNER_LOCK_TIMEOUT)?;
-        cleanup_until_absent(&state_dir);
-        cleanup_state_dir(&state_dir)?;
-        cancellation?;
-    }
-    outcome
+    let mut stderr = Vec::new();
+    File::open(error_path)?
+        .take(4_096)
+        .read_to_end(&mut stderr)?;
+    Err(io::Error::other(format!(
+        "cannot start independent owner: {}",
+        String::from_utf8_lossy(&stderr).trim()
+    )))
 }
 
 fn validate_probe_request(
@@ -241,17 +404,21 @@ fn lock_state_until(state_dir: &Path, timeout: Duration) -> io::Result<Option<Fl
 }
 
 fn probe_connected(
-    listener: &UnixListener,
+    listeners: &ProbeListeners,
     state_dir: &Path,
     image: &str,
     workspace: Option<&Path>,
+    metrics: bool,
     command: &[String],
-    name: &str,
-) -> io::Result<u8> {
-    listener.set_nonblocking(true)?;
+    signals: &mut Signals,
+) -> io::Result<ProbeCompletion> {
+    listeners.control.set_nonblocking(true)?;
     let deadline = Instant::now() + START_TIMEOUT;
     let mut stream = loop {
-        match listener.accept() {
+        if let Some(signal) = signals.pending().next() {
+            return Ok(ProbeCompletion::Cancelled(signal));
+        }
+        match listeners.control.accept() {
             Ok((stream, _)) => break stream,
             Err(error)
                 if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
@@ -261,7 +428,10 @@ fn probe_connected(
             Err(error) => return Err(error),
         }
     };
-    stream.set_read_timeout(Some(START_TIMEOUT))?;
+    if let Some(signal) = signals.pending().next() {
+        return Ok(ProbeCompletion::Cancelled(signal));
+    }
+    stream.set_read_timeout(Some(CONTROL_TICK))?;
     stream.set_write_timeout(Some(START_TIMEOUT))?;
     serde_json::to_writer(
         &mut stream,
@@ -273,34 +443,219 @@ fn probe_connected(
     )?;
     stream.write_all(b"\n")?;
     if let Some(workspace) = workspace {
-        crate::remote::create_local_source_snapshot(workspace, state_dir, &mut || {
+        let mut interrupted = None;
+        let copied = crate::remote::create_local_source_snapshot(workspace, state_dir, &mut || {
+            if let Some(signal) = signals.pending().next() {
+                interrupted = Some(signal);
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
             stream.write_all(b"PROGRESS\n")
-        })?;
+        });
+        if let Some(signal) = interrupted {
+            return Ok(ProbeCompletion::Cancelled(signal));
+        }
+        copied?;
+        if let Some(signal) = signals.pending().next() {
+            return Ok(ProbeCompletion::Cancelled(signal));
+        }
         stream.write_all(b"SNAPSHOT_READY\n")?;
     }
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    if line != "READY\n" {
-        return Err(io::Error::other(
-            "strong owner did not acknowledge command start",
-        ));
+    if let Some(signal) = read_owner_ack(&mut reader, signals, "IO_CONNECTED\n")? {
+        return Ok(ProbeCompletion::Cancelled(signal));
     }
-    println!("READY {name}");
+    let input = listeners.input.accept()?.0;
+    let output = listeners.output.accept()?.0;
+    let error = listeners.error.accept()?.0;
+    thread::spawn(move || {
+        let mut input = input;
+        let _ = io::copy(&mut io::stdin(), &mut input);
+        let _ = input.shutdown(std::net::Shutdown::Write);
+    });
+    if let Some(signal) = signals.pending().next() {
+        return Ok(ProbeCompletion::Cancelled(signal));
+    }
+    reader.get_mut().write_all(b"IO_READY\n")?;
+    if let Some(signal) = read_owner_ack(&mut reader, signals, "READY\n")? {
+        return Ok(ProbeCompletion::Cancelled(signal));
+    }
+    println!("READY {}", state_dir.file_name().unwrap().to_string_lossy());
     io::stdout().flush()?;
-    line.clear();
-    reader.get_mut().set_read_timeout(None)?;
-    reader.read_line(&mut line)?;
-    parse_done(&line)
+    relay_attached_command(reader, output, error, metrics, signals)
 }
 
-fn parse_done(line: &str) -> io::Result<u8> {
-    let code = line
-        .strip_prefix("DONE ")
-        .and_then(|value| value.strip_suffix('\n'))
-        .and_then(|value| value.parse::<u8>().ok())
+fn relay_attached_command(
+    mut reader: BufReader<UnixStream>,
+    output: UnixStream,
+    error: UnixStream,
+    metrics: bool,
+    signals: &mut Signals,
+) -> io::Result<ProbeCompletion> {
+    let output_cancel = reader.get_ref().try_clone()?;
+    let error_cancel = reader.get_ref().try_clone()?;
+    let output_failed = Arc::new(AtomicBool::new(false));
+    let output_failure = Arc::clone(&output_failed);
+    let error_failure = Arc::clone(&output_failed);
+    let output_relay = thread::spawn(move || {
+        let result = copy_output(output, io::stdout());
+        if result.is_err() {
+            output_failure.store(true, Ordering::Relaxed);
+            let _ = output_cancel.shutdown(std::net::Shutdown::Both);
+        }
+        result
+    });
+    let error_relay = thread::spawn(move || {
+        let result = copy_output(error, io::stderr());
+        if result.is_err() {
+            error_failure.store(true, Ordering::Relaxed);
+            let _ = error_cancel.shutdown(std::net::Shutdown::Both);
+        }
+        result
+    });
+    reader.get_mut().set_read_timeout(Some(CONTROL_TICK))?;
+    let (done, signalled, undelivered_signal) = wait_done(&mut reader, signals, &output_failed)?;
+    let mut drain_deadline = signalled.then(|| Instant::now() + CANCEL_DRAIN_TIMEOUT);
+    let mut late_signal = undelivered_signal;
+    let stdout_complete =
+        finish_relay(output_relay, signals, &mut drain_deadline, &mut late_signal)?;
+    let stderr_complete =
+        finish_relay(error_relay, signals, &mut drain_deadline, &mut late_signal)?;
+    if let Some(signal) = late_signal {
+        return Ok(ProbeCompletion::Cancelled(signal));
+    }
+    if metrics && stdout_complete && stderr_complete {
+        eprintln!("\nREEF_MEASUREMENT {}", serde_json::to_string(&done.usage)?);
+    }
+    Ok(ProbeCompletion::Finished(done.code))
+}
+
+fn read_owner_ack(
+    reader: &mut BufReader<UnixStream>,
+    signals: &mut Signals,
+    expected: &str,
+) -> io::Result<Option<i32>> {
+    let deadline = Instant::now() + START_TIMEOUT;
+    let mut line = String::new();
+    loop {
+        if let Some(signal) = signals.pending().next() {
+            return Ok(Some(signal));
+        }
+        match reader.read_line(&mut line) {
+            Ok(0) => return Err(io::Error::other("strong owner exited before command start")),
+            Ok(_) if line == expected => return Ok(None),
+            Ok(_) => return Err(io::Error::other("invalid strong owner acknowledgement")),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::Interrupted
+                ) && Instant::now() < deadline => {}
+            Err(error) => return Err(error),
+        }
+        if line.len() > 32 {
+            return Err(io::Error::other("invalid strong owner acknowledgement"));
+        }
+    }
+}
+
+fn copy_output(mut stream: UnixStream, mut destination: impl Write) -> io::Result<u64> {
+    let copied = io::copy(&mut stream, &mut destination)?;
+    destination.flush()?;
+    Ok(copied)
+}
+
+fn finish_relay(
+    relay: thread::JoinHandle<io::Result<u64>>,
+    signals: &mut Signals,
+    deadline: &mut Option<Instant>,
+    late_signal: &mut Option<i32>,
+) -> io::Result<bool> {
+    while !relay.is_finished() {
+        if let Some(signal) = signals.pending().next() {
+            late_signal.get_or_insert(signal);
+            deadline.get_or_insert_with(|| Instant::now() + CANCEL_DRAIN_TIMEOUT);
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            // The owner has already verified teardown. On cancellation,
+            // never wait indefinitely for an unread downstream pipe.
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    relay
+        .join()
+        .map_err(|_| io::Error::other("command output relay failed"))??;
+    Ok(true)
+}
+
+fn wait_done(
+    reader: &mut BufReader<UnixStream>,
+    signals: &mut Signals,
+    output_failed: &AtomicBool,
+) -> io::Result<(Done, bool, Option<i32>)> {
+    let mut message = Vec::with_capacity(256);
+    let mut last_heartbeat = Instant::now();
+    let mut signalled = false;
+    let mut undelivered_signal = None;
+    loop {
+        if output_failed.load(Ordering::Relaxed) {
+            return Err(io::Error::other("cannot forward command output"));
+        }
+        for signal in signals.pending() {
+            signalled = true;
+            match reader
+                .get_mut()
+                .write_all(format!("SIGNAL {signal}\n").as_bytes())
+            {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::BrokenPipe
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::NotConnected
+                    ) =>
+                {
+                    undelivered_signal.get_or_insert(signal);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+            reader.get_mut().write_all(b"PING\n")?;
+            last_heartbeat = Instant::now();
+        }
+        let mut chunk = [0_u8; 256];
+        match reader.read(&mut chunk) {
+            Ok(0) => return Err(io::Error::other("strong owner exited before cleanup")),
+            Ok(read) => {
+                message.extend_from_slice(&chunk[..read]);
+                if message.len() > 1_024 {
+                    return Err(io::Error::other("invalid owner completion"));
+                }
+                if message.last() == Some(&b'\n') {
+                    return Ok((parse_done(&message)?, signalled, undelivered_signal));
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn parse_done(line: &[u8]) -> io::Result<Done> {
+    let contents = line
+        .strip_prefix(b"DONE ")
+        .and_then(|value| value.strip_suffix(b"\n"))
         .ok_or_else(|| io::Error::other("strong owner exited without verified cleanup"))?;
-    Ok(code)
+    serde_json::from_slice(contents).map_err(io::Error::other)
 }
 
 pub fn owner(state_dir: &Path, name: &str) -> io::Result<()> {
@@ -340,10 +695,15 @@ pub fn owner(state_dir: &Path, name: &str) -> io::Result<()> {
     }
 
     let outcome = run_owner(state_dir, name, &stopping, &lock);
+    if let Err(error) = &outcome {
+        eprintln!("reef: strong owner failed: {error}");
+    }
     cleanup_until_absent(state_dir);
     cleanup_state_dir(state_dir)?;
-    if let Ok((mut stream, code)) = outcome {
-        let _ = stream.write_all(format!("DONE {code}\n").as_bytes());
+    if let Ok(mut outcome) = outcome {
+        let _ = outcome.stream.write_all(b"DONE ");
+        let _ = serde_json::to_writer(&mut outcome.stream, &outcome.done);
+        let _ = outcome.stream.write_all(b"\n");
     }
     Ok(())
 }
@@ -386,11 +746,14 @@ fn prepare_podman_home(state_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn pin_podman_store(state_dir: &Path) -> io::Result<()> {
+fn pin_podman_store(state_dir: &Path, signals: &mut Signals) -> io::Result<Option<i32>> {
     // Query with the launcher's real HOME before Podman is given its private
     // HOME. A system storage.conf may expand $HOME in rootless_storage_path.
     let mut info = launcher_podman_info(None);
-    let output = bounded_output(&mut info, PODMAN_TIMEOUT, 65_536)?;
+    let output = match bounded_store_output(&mut info, signals)? {
+        StoreOutput::Done(output) => output,
+        StoreOutput::Cancelled(signal) => return Ok(Some(signal)),
+    };
     let mut store: PodmanStore = serde_json::from_slice(&output)?;
     validate_store(&store)?;
     snapshot_storage_config(state_dir, &mut store)?;
@@ -399,13 +762,19 @@ fn pin_podman_store(state_dir: &Path) -> io::Result<()> {
         // exact snapshot that the owner will use so a concurrent config edit
         // cannot make the recorded baseline describe a different image store.
         let mut pinned_info = launcher_podman_info(Some(&store.config_file));
-        let pinned_output = bounded_output(&mut pinned_info, PODMAN_TIMEOUT, 65_536)?;
+        let pinned_output = match bounded_store_output(&mut pinned_info, signals)? {
+            StoreOutput::Done(output) => output,
+            StoreOutput::Cancelled(signal) => return Ok(Some(signal)),
+        };
         store = serde_json::from_slice(&pinned_output)?;
         validate_store(&store)?;
     }
     let mut private_info = private_podman_command(state_dir, &store)?;
     private_info.args(["info", "--format", "{{json .Store}}"]);
-    let private_output = bounded_output(&mut private_info, PODMAN_TIMEOUT, 65_536)?;
+    let private_output = match bounded_store_output(&mut private_info, signals)? {
+        StoreOutput::Done(output) => output,
+        StoreOutput::Cancelled(signal) => return Ok(Some(signal)),
+    };
     let private_store: PodmanStore = serde_json::from_slice(&private_output)?;
     if private_store.graph_root != store.graph_root
         || private_store.run_root != store.run_root
@@ -425,7 +794,71 @@ fn pin_podman_store(state_dir: &Path) -> io::Result<()> {
         .create_new(true)
         .open(state_dir.join("podman-store.json"))?;
     file.write_all(&bytes)?;
-    file.sync_all()
+    file.sync_all()?;
+    Ok(None)
+}
+
+fn bounded_store_output(command: &mut Command, signals: &mut Signals) -> io::Result<StoreOutput> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("missing Podman store output"))?;
+    let reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        stdout.take(65_537).read_to_end(&mut output)?;
+        Ok::<_, io::Error>(output)
+    });
+    let deadline = Instant::now() + PODMAN_TIMEOUT;
+    let status = loop {
+        if let Some(signal) = signals.pending().next() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(StoreOutput::Cancelled(signal));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Podman storage inspection timed out",
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
+    };
+    if !status.success() {
+        return Err(io::Error::other("Podman storage inspection failed"));
+    }
+    while !reader.is_finished() {
+        if let Some(signal) = signals.pending().next() {
+            return Ok(StoreOutput::Cancelled(signal));
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Podman storage output timed out",
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let output = reader
+        .join()
+        .map_err(|_| io::Error::other("Podman store output reader failed"))??;
+    if output.len() > 65_536 {
+        return Err(io::Error::other("Podman storage inspection failed"));
+    }
+    Ok(StoreOutput::Done(output))
 }
 
 fn launcher_podman_info(storage_config: Option<&Path>) -> Command {
@@ -533,7 +966,7 @@ fn run_owner(
     name: &str,
     stopping: &AtomicBool,
     lock: &Flock<File>,
-) -> io::Result<(UnixStream, u8)> {
+) -> io::Result<RunOutcome> {
     ensure_active(stopping, state_dir)?;
     let mut stream = UnixStream::connect(state_dir.join("owner.sock"))?;
     stream.set_read_timeout(Some(START_TIMEOUT))?;
@@ -555,8 +988,33 @@ fn run_owner(
         await_snapshot_ready(&mut reader)?;
     }
     let id = create_owned_container(state_dir, name, &start, stopping, lock)?;
+    let input = UnixStream::connect(state_dir.join("stdin.sock"))?;
+    let output = UnixStream::connect(state_dir.join("stdout.sock"))?;
+    let error = UnixStream::connect(state_dir.join("stderr.sock"))?;
+    stream.write_all(b"IO_CONNECTED\n")?;
+    await_io_ready(&mut reader)?;
+
+    let mut start_command = podman_command(state_dir)?;
+    let mut attached = start_command
+        .args([
+            "start",
+            "--attach",
+            "--interactive",
+            "--sig-proxy=false",
+            "--detach-keys=",
+            &id,
+        ])
+        .stdin(Stdio::from(OwnedFd::from(input)))
+        .stdout(Stdio::from(OwnedFd::from(output)))
+        .stderr(Stdio::from(OwnedFd::from(error)))
+        .spawn()?;
+    if let Err(error) = wait_container_started(state_dir, &id, &mut attached, stopping) {
+        let _ = attached.kill();
+        let _ = attached.wait();
+        return Err(error);
+    }
     stream.write_all(b"READY\n")?;
-    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+    stream.set_read_timeout(Some(CONTROL_TICK))?;
 
     let mut waiter = podman_command(state_dir)?;
     let mut waiter = waiter
@@ -564,30 +1022,276 @@ fn run_owner(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
+    let outcome = monitor_command(
+        &mut reader,
+        state_dir,
+        &id,
+        stopping,
+        &mut attached,
+        &mut waiter,
+    );
+    if outcome
+        .as_ref()
+        .map_or(true, |monitored| monitored.force_stop)
+    {
+        let _ = attached.kill();
+        let _ = attached.wait();
+        let _ = waiter.kill();
+        let _ = waiter.wait();
+    }
+    let done = outcome?.done;
+    Ok(RunOutcome { stream, done })
+}
+
+fn await_io_ready(reader: &mut BufReader<UnixStream>) -> io::Result<()> {
+    let mut line = String::new();
+    let count = (&mut *reader).take(32).read_line(&mut line)?;
+    if count == 0 || line != "IO_READY\n" {
+        return Err(io::Error::other("launcher did not accept command I/O"));
+    }
+    Ok(())
+}
+
+fn wait_container_started(
+    state_dir: &Path,
+    id: &str,
+    attached: &mut Child,
+    stopping: &AtomicBool,
+) -> io::Result<()> {
+    let deadline = Instant::now() + PODMAN_TIMEOUT;
+    let mut exited_at = None;
     loop {
         ensure_active(stopping, state_dir)?;
-        let mut byte = [0_u8];
-        match stream.read(&mut byte) {
-            Ok(0) => {
-                let _ = waiter.kill();
-                let _ = waiter.wait();
-                return Err(io::Error::other("launcher exited"));
+        let mut inspect = podman_command(state_dir)?;
+        inspect.args(["inspect", "--format", "{{.State.Status}}", id]);
+        if matches!(
+            bounded_output(&mut inspect, PODMAN_TIMEOUT, 128),
+            Ok(output) if matches!(output.as_slice(), b"running\n" | b"exited\n")
+        ) {
+            return Ok(());
+        }
+        if attached.try_wait()?.is_some() {
+            let at = exited_at.get_or_insert_with(Instant::now);
+            if at.elapsed() >= Duration::from_secs(1) {
+                return Err(io::Error::other("attached container did not start"));
             }
-            Ok(_) => return Err(io::Error::other("unexpected launcher data")),
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::other("attached container start timed out"));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn monitor_command(
+    reader: &mut BufReader<UnixStream>,
+    state_dir: &Path,
+    id: &str,
+    stopping: &AtomicBool,
+    attached: &mut Child,
+    waiter: &mut Child,
+) -> io::Result<Monitored> {
+    let started = Instant::now();
+    let mut last_heartbeat = Instant::now();
+    let mut control = Vec::new();
+    let mut first_signal = None;
+    let mut attached_exited_at = None;
+    let mut command_exit = None;
+    let mut sample = UsageSample::default();
+    let mut cgroup = locate_container_cgroup(state_dir, id);
+    loop {
+        ensure_active(stopping, state_dir)?;
+        if last_heartbeat.elapsed() >= HEARTBEAT_TIMEOUT {
+            return Err(io::Error::other("launcher heartbeat expired"));
+        }
+        if cgroup.is_none() {
+            cgroup = locate_container_cgroup(state_dir, id);
+        }
+        if let Some(path) = &cgroup {
+            sample_cgroup(path, &mut sample);
+        }
+        let mut chunk = [0_u8; 128];
+        match reader.read(&mut chunk) {
+            Ok(0) => return Err(io::Error::other("launcher exited")),
+            Ok(read) => {
+                control.extend_from_slice(&chunk[..read]);
+                if control.len() > 128 {
+                    return Err(io::Error::other("invalid launcher control message"));
+                }
+                while let Some(end) = control.iter().position(|byte| *byte == b'\n') {
+                    let line = control.drain(..=end).collect::<Vec<_>>();
+                    handle_control_line(&line, state_dir, id, &mut first_signal)?;
+                    last_heartbeat = Instant::now();
+                }
+            }
             Err(error)
                 if matches!(
                     error.kind(),
-                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    io::ErrorKind::TimedOut
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::Interrupted
                 ) => {}
             Err(error) => return Err(error),
         }
-        if let Some(status) = waiter.try_wait()? {
+        if command_exit.is_none()
+            && let Some(status) = waiter.try_wait()?
+        {
             ensure_podman_wait_succeeded(status)?;
             let mut stdout = waiter
                 .stdout
                 .take()
                 .ok_or_else(|| io::Error::other("missing container exit status"))?;
-            return Ok((stream, read_container_exit(&mut stdout)?));
+            command_exit = Some(read_container_exit(&mut stdout)?);
+        }
+        if let Some(attached_status) = attached.try_wait()? {
+            if let Some(code) = command_exit {
+                if attached_status.code() != Some(i32::from(code)) {
+                    return Err(io::Error::other("attached client lost command output"));
+                }
+                if let Some(path) = &cgroup {
+                    sample_cgroup(path, &mut sample);
+                }
+                return Ok(Monitored {
+                    done: Done {
+                        code,
+                        usage: sample.finish(started.elapsed()),
+                    },
+                    force_stop: false,
+                });
+            }
+            let at = attached_exited_at.get_or_insert_with(Instant::now);
+            if at.elapsed() >= Duration::from_secs(1) {
+                return Err(io::Error::other("attached client lost command output"));
+            }
+        }
+        if let Some((signal, at)) = first_signal
+            && at.elapsed() >= SIGNAL_GRACE
+        {
+            return Ok(Monitored {
+                done: Done {
+                    code: u8::try_from(128 + signal).unwrap_or(1),
+                    usage: sample.finish(started.elapsed()),
+                },
+                force_stop: true,
+            });
+        }
+    }
+}
+
+fn handle_control_line(
+    line: &[u8],
+    state_dir: &Path,
+    id: &str,
+    first_signal: &mut Option<(i32, Instant)>,
+) -> io::Result<()> {
+    if line == b"PING\n" {
+        return Ok(());
+    }
+    let signal = match line {
+        b"SIGNAL 2\n" => (2, "INT"),
+        b"SIGNAL 3\n" => (3, "QUIT"),
+        b"SIGNAL 15\n" => (15, "TERM"),
+        b"SIGNAL 1\n" => (1, "HUP"),
+        _ => return Err(io::Error::other("invalid launcher control message")),
+    };
+    let status = podman_status_bounded(
+        state_dir,
+        &["kill", "--signal", signal.1, id],
+        Duration::from_secs(5),
+    )?;
+    if !status.success() {
+        let mut inspect = podman_command(state_dir)?;
+        inspect.args(["inspect", "--format", "{{.State.Status}}", id]);
+        if !matches!(
+            bounded_output(&mut inspect, Duration::from_secs(2), 128),
+            Ok(output) if output == b"exited\n"
+        ) {
+            return Err(io::Error::other("cannot forward command signal"));
+        }
+    }
+    first_signal.get_or_insert((signal.0, Instant::now()));
+    Ok(())
+}
+
+fn locate_container_cgroup(state_dir: &Path, id: &str) -> Option<PathBuf> {
+    let mut inspect = podman_command(state_dir).ok()?;
+    inspect.args(["inspect", "--format", "{{.State.Pid}}", id]);
+    let output = bounded_output(&mut inspect, Duration::from_secs(2), 32).ok()?;
+    let pid = std::str::from_utf8(&output)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    if pid == 0 {
+        return None;
+    }
+    let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let relative = cgroup.lines().find_map(|line| line.strip_prefix("0::/"))?;
+    let relative = Path::new(relative);
+    let expected = format!("libpod-{id}.scope");
+    if !relative
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)))
+        || !relative
+            .components()
+            .any(|part| part.as_os_str() == OsStr::new(&expected))
+    {
+        return None;
+    }
+    let path = Path::new("/sys/fs/cgroup").join(relative);
+    path.join("cpu.stat").is_file().then_some(path)
+}
+
+fn sample_cgroup(path: &Path, sample: &mut UsageSample) {
+    if let Some(cpu_usec) = read_named_counter(&path.join("cpu.stat"), "usage_usec") {
+        sample.cpu_usec = Some(sample.cpu_usec.unwrap_or(0).max(cpu_usec));
+    }
+    if let Ok(memory) = fs::read_to_string(path.join("memory.peak"))
+        && let Ok(memory) = memory.trim().parse::<u64>()
+    {
+        sample.peak_memory_bytes = Some(sample.peak_memory_bytes.unwrap_or(0).max(memory));
+    }
+    if let Ok(io) = fs::read_to_string(path.join("io.stat")) {
+        let (read, written) = parse_io_stat(&io);
+        sample.io_read_bytes = Some(sample.io_read_bytes.unwrap_or(0).max(read));
+        sample.io_write_bytes = Some(sample.io_write_bytes.unwrap_or(0).max(written));
+    }
+}
+
+fn read_named_counter(path: &Path, key: &str) -> Option<u64> {
+    fs::read_to_string(path).ok()?.lines().find_map(|line| {
+        line.strip_prefix(key)
+            .and_then(|value| value.strip_prefix(' '))
+            .and_then(|value| value.parse().ok())
+    })
+}
+
+fn parse_io_stat(value: &str) -> (u64, u64) {
+    let mut read = 0_u64;
+    let mut written = 0_u64;
+    for field in value.split_ascii_whitespace() {
+        if let Some(bytes) = field.strip_prefix("rbytes=")
+            && let Ok(bytes) = bytes.parse::<u64>()
+        {
+            read = read.saturating_add(bytes);
+        }
+        if let Some(bytes) = field.strip_prefix("wbytes=")
+            && let Ok(bytes) = bytes.parse::<u64>()
+        {
+            written = written.saturating_add(bytes);
+        }
+    }
+    (read, written)
+}
+
+impl UsageSample {
+    fn finish(self, elapsed: Duration) -> Usage {
+        Usage {
+            wall_ms: elapsed.as_millis(),
+            observed_cpu_ms: self.cpu_usec.map(|value| value / 1_000),
+            observed_peak_memory_bytes: self.peak_memory_bytes,
+            observed_io_read_bytes: self.io_read_bytes,
+            observed_io_write_bytes: self.io_write_bytes,
         }
     }
 }
@@ -680,6 +1384,7 @@ fn create_owned_container(
         "--cap-drop=all",
         "--security-opt=no-new-privileges",
         "--read-only",
+        "--interactive",
         "--image-volume=ignore",
         "--http-proxy=false",
         "--tmpfs=/tmp:rw,nosuid,nodev,size=64m",
@@ -725,12 +1430,6 @@ fn create_owned_container(
         }
         ensure_active(stopping, state_dir)?;
     }
-    let mut start = podman_command(state_dir)?;
-    start.args(["start", &id]);
-    if !bounded_status_with_lock(&mut start, PODMAN_TIMEOUT, lock)?.success() {
-        return Err(io::Error::other("podman start failed"));
-    }
-    ensure_active(stopping, state_dir)?;
     Ok(id)
 }
 
@@ -878,9 +1577,17 @@ fn persist_container_id(state_dir: &Path, id: &str) -> io::Result<()> {
 }
 
 fn podman_status(state_dir: &Path, args: &[&str]) -> io::Result<ExitStatus> {
+    podman_status_bounded(state_dir, args, PODMAN_TIMEOUT)
+}
+
+fn podman_status_bounded(
+    state_dir: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> io::Result<ExitStatus> {
     let mut command = podman_command(state_dir)?;
     command.args(args);
-    bounded_status(&mut command, PODMAN_TIMEOUT)
+    bounded_status(&mut command, timeout)
 }
 
 fn podman_command(state_dir: &Path) -> io::Result<Command> {
@@ -1062,7 +1769,7 @@ fn validate_state_dir(state_dir: &Path) -> io::Result<()> {
 mod tests {
     use super::{
         PodmanStore, STORE_MAX_BYTES, await_snapshot_ready, ensure_podman_wait_succeeded,
-        parse_container_exit, parse_done, read_container_exit, read_podman_store,
+        parse_container_exit, parse_done, parse_io_stat, read_container_exit, read_podman_store,
     };
     use std::fs;
     use std::io::{BufReader, Write};
@@ -1122,13 +1829,37 @@ mod tests {
     fn command_exit_is_not_confused_with_owner_cleanup() {
         for (container_output, expected) in [(b"0\n".as_slice(), 0), (b"7\n", 7), (b"255\n", 255)] {
             assert_eq!(parse_container_exit(container_output).unwrap(), expected);
-            assert_eq!(parse_done(&format!("DONE {expected}\n")).unwrap(), expected);
+            let completion = format!(
+                "DONE {{\"code\":{expected},\"usage\":{{\"wall_ms\":4,\"observed_cpu_ms\":null,\"observed_peak_memory_bytes\":null,\"observed_io_read_bytes\":null,\"observed_io_write_bytes\":null}}}}\n"
+            );
+            assert_eq!(parse_done(completion.as_bytes()).unwrap().code, expected);
         }
         for invalid in [b"-1\n".as_slice(), b"256\n", b"0\nextra", b"", b" 7\n"] {
             assert!(parse_container_exit(invalid).is_err());
         }
-        for invalid in ["DONE\n", "DONE 256\n", "DONE -1\n", "DONE 7", "READY\n"] {
+        for invalid in [
+            b"DONE\n".as_slice(),
+            b"DONE 256\n",
+            b"DONE -1\n",
+            b"DONE 7",
+            b"READY\n",
+        ] {
             assert!(parse_done(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn sampled_block_io_sums_all_devices_without_counting_other_fields() {
+        let cases = [
+            (
+                "8:0 rbytes=100 wbytes=20 rios=1\n8:16 rbytes=7 wbytes=3\n",
+                (107, 23),
+            ),
+            ("", (0, 0)),
+            ("8:0 rios=9 wios=2\n", (0, 0)),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(parse_io_stat(input), expected);
         }
     }
 
