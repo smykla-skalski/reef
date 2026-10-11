@@ -55,14 +55,14 @@ pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
     let state_dir = runtime.join(&name);
     DirBuilder::new().mode(0o700).create(&state_dir)?;
     prepare_podman_home(&state_dir).inspect_err(|_| {
-        cleanup_state_dir(&state_dir);
+        let _ = cleanup_state_dir(&state_dir);
     })?;
     let listener = UnixListener::bind(state_dir.join("owner.sock")).inspect_err(|_| {
-        cleanup_state_dir(&state_dir);
+        let _ = cleanup_state_dir(&state_dir);
     })?;
 
     let executable = std::env::current_exe().inspect_err(|_| {
-        cleanup_state_dir(&state_dir);
+        let _ = cleanup_state_dir(&state_dir);
     })?;
     let mut data_home_env = OsString::from("--setenv=XDG_DATA_HOME=");
     data_home_env.push(data_home.as_os_str());
@@ -91,10 +91,10 @@ pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
         .arg(&name)
         .output()
         .inspect_err(|_| {
-            cleanup_state_dir(&state_dir);
+            let _ = cleanup_state_dir(&state_dir);
         })?;
     if !output.status.success() {
-        cleanup_state_dir(&state_dir);
+        let _ = cleanup_state_dir(&state_dir);
         return Err(io::Error::other(format!(
             "cannot start independent owner: {}",
             String::from_utf8_lossy(&output.stderr).trim()
@@ -107,8 +107,8 @@ pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
         // stopped, systemd will not restart it. Stop any remaining owner
         // first, so it cannot create a container after our absence check.
         quiesce_owner(&name);
-        cleanup_until_absent(&state_dir, &name);
-        cleanup_state_dir(&state_dir);
+        cleanup_until_absent(&state_dir);
+        cleanup_state_dir(&state_dir)?;
     }
     outcome
 }
@@ -193,8 +193,9 @@ fn probe_connected(
 pub fn owner(state_dir: &Path, name: &str) -> io::Result<()> {
     validate_name_path(state_dir, name)?;
     if !state_dir.exists() {
-        // State is removed only after confirmed teardown. A missing state
-        // directory does not prove ownership of any same-named container.
+        // The owner can die after renaming verified state to its tombstone.
+        // Recovery never resolves a container by the old name.
+        cleanup_state_dir(state_dir)?;
         return Ok(());
     }
     validate_state_dir(state_dir)?;
@@ -214,30 +215,36 @@ pub fn owner(state_dir: &Path, name: &str) -> io::Result<()> {
         .is_err()
     {
         // A restarted owner may only recover; it must never rerun a command.
-        cleanup_until_absent(state_dir, name);
-        cleanup_state_dir(state_dir);
+        cleanup_until_absent(state_dir);
+        cleanup_state_dir(state_dir)?;
         return Ok(());
     }
 
     let outcome = run_owner(state_dir, name, &stopping);
-    cleanup_until_absent(state_dir, name);
+    cleanup_until_absent(state_dir);
+    cleanup_state_dir(state_dir)?;
     if let Ok(mut stream) = outcome {
         let _ = stream.write_all(b"DONE\n");
     }
-    cleanup_state_dir(state_dir);
     Ok(())
 }
 
-fn cleanup_state_dir(state_dir: &Path) {
+fn cleanup_state_dir(state_dir: &Path) -> io::Result<()> {
     // A restarted owner must see either the complete state or no state. Move
     // it out of the service's known path before deleting individual entries.
     let tombstone = state_dir.with_extension("done");
-    if fs::rename(state_dir, &tombstone).is_err() {
-        return;
+    match fs::rename(state_dir, &tombstone) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     // Podman writes private cache entries beneath this task-owned tree. Do
     // not assume the directory contains only the files Reef created.
-    let _ = fs::remove_dir_all(tombstone);
+    match fs::remove_dir_all(tombstone) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn prepare_podman_home(state_dir: &Path) -> io::Result<()> {
@@ -298,6 +305,7 @@ fn run_owner(state_dir: &Path, name: &str, stopping: &AtomicBool) -> io::Result<
         "--cap-drop=all",
         "--security-opt=no-new-privileges",
         "--read-only",
+        "--image-volume=ignore",
         "--http-proxy=false",
         "--tmpfs=/tmp:rw,nosuid,nodev,size=64m",
         "--tmpfs=/run:rw,nosuid,nodev,size=8m",
@@ -308,14 +316,20 @@ fn run_owner(state_dir: &Path, name: &str, stopping: &AtomicBool) -> io::Result<
     create
         .arg(format!("--name={name}"))
         .arg(format!("--label=io.reef.owner={name}"))
+        .arg(format!(
+            "--cidfile={}",
+            state_dir.join("container.cid").display()
+        ))
         .arg(&start.image)
         .args(&start.command);
     if !bounded_status(&mut create, PODMAN_TIMEOUT)?.success() {
         return Err(io::Error::other("podman create failed"));
     }
     ensure_active(stopping)?;
-    let id = owned_container_id(state_dir, name)?
-        .ok_or_else(|| io::Error::other("created container is not owned by Reef"))?;
+    let id = read_container_id(state_dir)?
+        .ok_or_else(|| io::Error::other("podman did not record the created container ID"))?;
+    verify_container_label(state_dir, &id, name)?;
+    persist_container_id(state_dir, &id)?;
     reject_effective_mounts(state_dir, &id)?;
     ensure_active(stopping)?;
     if !podman_status(state_dir, &["start", &id])?.success() {
@@ -375,55 +389,76 @@ fn reject_effective_mounts(state_dir: &Path, id: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn cleanup_until_absent(state_dir: &Path, name: &str) {
-    loop {
-        let id = match owned_container_id(state_dir, name) {
-            Ok(Some(id)) => id,
+fn cleanup_until_absent(state_dir: &Path) {
+    let id = loop {
+        match read_container_id(state_dir) {
+            Ok(Some(id)) => break id,
             Ok(None) => return,
-            Err(_) => {
+            Err(_) => thread::sleep(Duration::from_secs(1)),
+        }
+    };
+    loop {
+        match podman_status(state_dir, &["container", "exists", &id]) {
+            Ok(status) if status.code() == Some(1) => return,
+            Ok(status) if status.success() => {}
+            _ => {
                 thread::sleep(Duration::from_secs(1));
                 continue;
             }
-        };
+        }
         let Ok(mut remove) = podman_command(state_dir) else {
             thread::sleep(Duration::from_secs(1));
             continue;
         };
-        remove.args(["rm", "--force", "--time=0", &id]);
+        remove.args(["rm", "--force", "--volumes", "--time=0", &id]);
         let _ = bounded_status(&mut remove, STOP_TIMEOUT);
         thread::sleep(Duration::from_secs(1));
     }
 }
 
-fn owned_container_id(state_dir: &Path, name: &str) -> io::Result<Option<String>> {
-    let exists = podman_status(state_dir, &["container", "exists", name])?;
-    if exists.code() == Some(1) {
-        return Ok(None);
-    }
-    if !exists.success() {
-        return Err(io::Error::other("cannot verify container existence"));
-    }
+fn verify_container_label(state_dir: &Path, id: &str, name: &str) -> io::Result<()> {
     let mut inspect = podman_command(state_dir)?;
     inspect.args([
         "container",
         "inspect",
         "--format",
-        "{{.Id}}|{{index .Config.Labels \"io.reef.owner\"}}",
-        name,
+        "{{index .Config.Labels \"io.reef.owner\"}}",
+        id,
     ]);
-    let output = bounded_output(&mut inspect, PODMAN_TIMEOUT, 256)?;
-    let output = std::str::from_utf8(&output).map_err(io::Error::other)?;
-    let (id, owner) = output
-        .trim_end()
-        .split_once('|')
-        .ok_or_else(|| io::Error::other("invalid container identity"))?;
-    if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(io::Error::other("invalid container ID"));
+    let output = bounded_output(&mut inspect, PODMAN_TIMEOUT, 128)?;
+    if output != format!("{name}\n").as_bytes() {
+        return Err(io::Error::other("created container is not owned by Reef"));
     }
-    if owner != name {
-        return Ok(None);
+    Ok(())
+}
+
+fn read_container_id(state_dir: &Path) -> io::Result<Option<String>> {
+    for filename in ["owned.id", "container.cid"] {
+        let contents = match fs::read(state_dir.join(filename)) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let id = std::str::from_utf8(&contents)
+            .map_err(io::Error::other)?
+            .trim();
+        if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(io::Error::other("invalid recorded container ID"));
+        }
+        return Ok(Some(id.to_owned()));
     }
-    Ok(Some(id.to_owned()))
+    Ok(None)
+}
+
+fn persist_container_id(state_dir: &Path, id: &str) -> io::Result<()> {
+    let pending = state_dir.join("owned.id.pending");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pending)?;
+    file.write_all(id.as_bytes())?;
+    file.sync_all()?;
+    fs::rename(pending, state_dir.join("owned.id"))
 }
 
 fn podman_status(state_dir: &Path, args: &[&str]) -> io::Result<ExitStatus> {

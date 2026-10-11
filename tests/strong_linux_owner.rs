@@ -365,3 +365,109 @@ fn non_utf8_image_store_is_rejected_before_owner_start() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("image store path must be UTF-8"));
     assert_no_state_for_launcher(pid);
 }
+
+#[test]
+fn recovery_does_not_remove_a_replacement_with_the_same_name_and_label() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let name = format!("reef-strong-replacement-{}", std::process::id());
+    let state_dir = std::path::Path::new(&std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join(&name);
+    let config = state_dir.join("podman-home/.config/containers");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::set_permissions(
+        &state_dir,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    std::fs::create_dir(state_dir.join("hooks")).unwrap();
+    std::fs::File::create(config.join("mounts.conf")).unwrap();
+    std::fs::File::create(config.join("containers.conf")).unwrap();
+    std::fs::File::create(state_dir.join("attempted")).unwrap();
+
+    let create = || {
+        let output = Command::new("podman")
+            .args([
+                "create",
+                "--pull=never",
+                &format!("--name={name}"),
+                &format!("--label=io.reef.owner={name}"),
+                "docker.io/library/alpine:3.22",
+                "true",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let original_id = create();
+    assert!(
+        Command::new("podman")
+            .args(["rm", "--force", &original_id])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let replacement_id = create();
+    std::fs::write(state_dir.join("owned.id"), original_id).unwrap();
+
+    let owner = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--name",
+            &name,
+        ])
+        .status()
+        .unwrap();
+    let still_exists = Command::new("podman")
+        .args(["container", "exists", &replacement_id])
+        .status()
+        .unwrap();
+    let removed = Command::new("podman")
+        .args(["rm", "--force", &replacement_id])
+        .status()
+        .unwrap();
+
+    assert!(owner.success());
+    assert!(
+        still_exists.success(),
+        "owner removed a replacement container"
+    );
+    assert!(removed.success());
+    assert_owner_state_gone(&name);
+}
+
+#[test]
+fn recovery_removes_a_tombstone_after_the_original_state_is_gone() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let name = format!("reef-strong-tombstone-{}", std::process::id());
+    let state_dir = std::path::Path::new(&std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join(&name);
+    let tombstone = state_dir.with_extension("done");
+    std::fs::create_dir_all(tombstone.join("podman-home/.cache/containers")).unwrap();
+    std::fs::write(
+        tombstone.join("podman-home/.cache/containers/residue"),
+        b"cache",
+    )
+    .unwrap();
+    assert!(!state_dir.exists());
+
+    let owner = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--name",
+            &name,
+        ])
+        .status()
+        .unwrap();
+
+    assert!(owner.success());
+    assert!(!tombstone.exists(), "recovery left its tombstone");
+}
