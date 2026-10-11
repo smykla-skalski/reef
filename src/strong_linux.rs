@@ -5,7 +5,7 @@ use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,6 +49,9 @@ pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
     let name = format!("reef-strong-{}-{nonce}", std::process::id());
     let state_dir = runtime.join(&name);
     DirBuilder::new().mode(0o700).create(&state_dir)?;
+    prepare_podman_home(&state_dir).inspect_err(|_| {
+        cleanup_state_dir(&state_dir);
+    })?;
     let listener = UnixListener::bind(state_dir.join("owner.sock")).inspect_err(|_| {
         cleanup_state_dir(&state_dir);
     })?;
@@ -93,7 +96,7 @@ pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
         // stopped, systemd will not restart it. Stop any remaining owner
         // first, so it cannot create a container after our absence check.
         quiesce_owner(&name);
-        cleanup_until_absent(&name);
+        cleanup_until_absent(&state_dir, &name);
         cleanup_state_dir(&state_dir);
     }
     outcome
@@ -179,7 +182,8 @@ fn probe_connected(
 pub fn owner(state_dir: &Path, name: &str) -> io::Result<()> {
     validate_name_path(state_dir, name)?;
     if !state_dir.exists() {
-        cleanup_until_absent(name);
+        // State is removed only after confirmed teardown. A missing state
+        // directory does not prove ownership of any same-named container.
         return Ok(());
     }
     validate_state_dir(state_dir)?;
@@ -199,13 +203,13 @@ pub fn owner(state_dir: &Path, name: &str) -> io::Result<()> {
         .is_err()
     {
         // A restarted owner may only recover; it must never rerun a command.
-        cleanup_until_absent(name);
+        cleanup_until_absent(state_dir, name);
         cleanup_state_dir(state_dir);
         return Ok(());
     }
 
     let outcome = run_owner(state_dir, name, &stopping);
-    cleanup_until_absent(name);
+    cleanup_until_absent(state_dir, name);
     if let Ok(mut stream) = outcome {
         let _ = stream.write_all(b"DONE\n");
     }
@@ -214,9 +218,43 @@ pub fn owner(state_dir: &Path, name: &str) -> io::Result<()> {
 }
 
 fn cleanup_state_dir(state_dir: &Path) {
-    let _ = fs::remove_file(state_dir.join("attempted"));
-    let _ = fs::remove_file(state_dir.join("owner.sock"));
-    let _ = fs::remove_dir(state_dir);
+    // A restarted owner must see either the complete state or no state. Move
+    // it out of the service's known path before deleting individual entries.
+    let tombstone = state_dir.with_extension("done");
+    if fs::rename(state_dir, &tombstone).is_err() {
+        return;
+    }
+    let _ = fs::remove_file(tombstone.join("attempted"));
+    let _ = fs::remove_file(tombstone.join("owner.sock"));
+    let home = tombstone.join("podman-home");
+    let config = home.join(".config/containers");
+    let _ = fs::remove_file(config.join("mounts.conf"));
+    let _ = fs::remove_file(config.join("containers.conf"));
+    let _ = fs::remove_dir(config);
+    let _ = fs::remove_dir(home.join(".config"));
+    let _ = fs::remove_dir(home);
+    let _ = fs::remove_dir(tombstone.join("hooks"));
+    let _ = fs::remove_dir(tombstone);
+}
+
+fn prepare_podman_home(state_dir: &Path) -> io::Result<()> {
+    let home = state_dir.join("podman-home");
+    let config = home.join(".config/containers");
+    DirBuilder::new().mode(0o700).create(&home)?;
+    DirBuilder::new().mode(0o700).create(home.join(".config"))?;
+    DirBuilder::new().mode(0o700).create(&config)?;
+    DirBuilder::new()
+        .mode(0o700)
+        .create(state_dir.join("hooks"))?;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(config.join("mounts.conf"))?;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(config.join("containers.conf"))?;
+    Ok(())
 }
 
 fn run_owner(state_dir: &Path, name: &str, stopping: &AtomicBool) -> io::Result<UnixStream> {
@@ -239,13 +277,12 @@ fn run_owner(state_dir: &Path, name: &str, stopping: &AtomicBool) -> io::Result<
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty command"));
     }
     ensure_active(stopping)?;
-    if podman_status(&["image", "exists", &start.image])?.code() != Some(0) {
+    if podman_status(state_dir, &["image", "exists", &start.image])?.code() != Some(0) {
         return Err(io::Error::other("container image is not available locally"));
     }
     ensure_active(stopping)?;
-    reject_default_mount_files()?;
 
-    let mut create = Command::new("podman");
+    let mut create = podman_command(state_dir)?;
     create.args([
         "create",
         "--pull=never",
@@ -273,17 +310,17 @@ fn run_owner(state_dir: &Path, name: &str, stopping: &AtomicBool) -> io::Result<
         return Err(io::Error::other("podman create failed"));
     }
     ensure_active(stopping)?;
-    reject_effective_mounts(name)?;
-    reject_default_mount_files()?;
+    reject_effective_mounts(state_dir, name)?;
     ensure_active(stopping)?;
-    if !podman_status(&["start", name])?.success() {
+    if !podman_status(state_dir, &["start", name])?.success() {
         return Err(io::Error::other("podman start failed"));
     }
     ensure_active(stopping)?;
     stream.write_all(b"READY\n")?;
     stream.set_read_timeout(Some(Duration::from_millis(100)))?;
 
-    let mut waiter = Command::new("podman")
+    let mut waiter = podman_command(state_dir)?;
+    let mut waiter = waiter
         .args(["wait", name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -319,8 +356,8 @@ fn ensure_active(stopping: &AtomicBool) -> io::Result<()> {
     }
 }
 
-fn reject_effective_mounts(name: &str) -> io::Result<()> {
-    let mut inspect = Command::new("podman");
+fn reject_effective_mounts(state_dir: &Path, name: &str) -> io::Result<()> {
+    let mut inspect = podman_command(state_dir)?;
     inspect.args(["inspect", "--format", "{{json .Mounts}}", name]);
     let output = bounded_output(&mut inspect, PODMAN_TIMEOUT, 16_384)?;
     let mounts: serde_json::Value = serde_json::from_slice(&output)?;
@@ -332,40 +369,15 @@ fn reject_effective_mounts(name: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn reject_default_mount_files() -> io::Result<()> {
-    let mut paths = vec![
-        PathBuf::from("/usr/share/containers/mounts.conf"),
-        PathBuf::from("/etc/containers/mounts.conf"),
-    ];
-    let config_home = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".config")))
-        .ok_or_else(|| io::Error::other("cannot resolve Podman user configuration"))?;
-    paths.push(config_home.join("containers/mounts.conf"));
-    for path in paths {
-        let contents = match fs::read_to_string(&path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        if contents
-            .lines()
-            .any(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
-        {
-            return Err(io::Error::other(
-                "Podman default mount configuration is not allowed",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn cleanup_until_absent(name: &str) {
+fn cleanup_until_absent(state_dir: &Path, name: &str) {
     loop {
-        let mut remove = Command::new("podman");
+        let Ok(mut remove) = podman_command(state_dir) else {
+            thread::sleep(Duration::from_secs(1));
+            continue;
+        };
         remove.args(["rm", "--force", "--time=0", name]);
         let _ = bounded_status(&mut remove, STOP_TIMEOUT);
-        if matches!(podman_status(&["container", "exists", name]), Ok(status) if status.code() == Some(1))
+        if matches!(podman_status(state_dir, &["container", "exists", name]), Ok(status) if status.code() == Some(1))
         {
             return;
         }
@@ -373,10 +385,35 @@ fn cleanup_until_absent(name: &str) {
     }
 }
 
-fn podman_status(args: &[&str]) -> io::Result<ExitStatus> {
-    let mut command = Command::new("podman");
+fn podman_status(state_dir: &Path, args: &[&str]) -> io::Result<ExitStatus> {
+    let mut command = podman_command(state_dir)?;
     command.args(args);
     bounded_status(&mut command, PODMAN_TIMEOUT)
+}
+
+fn podman_command(state_dir: &Path) -> io::Result<Command> {
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| Path::new(&home).join(".local/share").into_os_string())
+        })
+        .ok_or_else(|| io::Error::other("cannot resolve Podman image store"))?;
+    let home = state_dir.join("podman-home");
+    let mut command = Command::new("podman");
+    command
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", data_home)
+        .env(
+            "CONTAINERS_CONF",
+            home.join(".config/containers/containers.conf"),
+        )
+        .env_remove("CONTAINERS_CONF_OVERRIDE")
+        .env_remove("CONTAINER_HOST")
+        .env_remove("CONTAINER_CONNECTION")
+        .arg("--remote=false")
+        .arg(format!("--hooks-dir={}", state_dir.join("hooks").display()));
+    Ok(command)
 }
 
 fn bounded_status(command: &mut Command, timeout: Duration) -> io::Result<ExitStatus> {

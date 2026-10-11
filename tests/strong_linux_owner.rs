@@ -75,8 +75,9 @@ fn assert_init_process_gone(pid: u32) {
 fn assert_owner_state_gone(name: &str) {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").unwrap();
     let state_dir = std::path::Path::new(&runtime).join(name);
+    let tombstone = state_dir.with_extension("done");
     let deadline = Instant::now() + Duration::from_secs(20);
-    while state_dir.exists() {
+    while state_dir.exists() || tombstone.exists() {
         assert!(Instant::now() < deadline, "owner left runtime state behind");
         thread::sleep(Duration::from_millis(100));
     }
@@ -201,4 +202,49 @@ fn stopping_an_unresponsive_owner_still_removes_its_container() {
     assert!(!launcher.wait().unwrap().success());
     assert_container_gone(&name);
     assert_init_process_gone(init_pid);
+}
+
+#[test]
+fn missing_owner_state_does_not_remove_an_unowned_container() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let name = format!("reef-strong-unowned-{}", std::process::id());
+    let state_dir = std::path::Path::new(&std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join(&name);
+    assert!(!state_dir.exists());
+    let created = Command::new("podman")
+        .args([
+            "create",
+            "--pull=never",
+            &format!("--name={name}"),
+            "docker.io/library/alpine:3.22",
+            "true",
+        ])
+        .status()
+        .unwrap();
+    assert!(created.success());
+
+    let owner = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--name",
+            &name,
+        ])
+        .status()
+        .unwrap();
+    let still_exists = Command::new("podman")
+        .args(["container", "exists", &name])
+        .status()
+        .unwrap();
+    let removed = Command::new("podman")
+        .args(["rm", "--force", &name])
+        .status()
+        .unwrap();
+
+    assert!(owner.success());
+    assert!(still_exists.success(), "owner removed an unowned container");
+    assert!(removed.success());
 }
