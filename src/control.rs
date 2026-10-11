@@ -36,6 +36,23 @@ pub struct Summary {
     pub pending: Option<usize>,
     pub unavailable: Option<usize>,
     pub warning: Option<&'static str>,
+    pub groups: Vec<Group>,
+}
+
+#[derive(Default, Serialize)]
+pub struct Group {
+    pub agent: String,
+    pub category: String,
+    pub assigned: usize,
+    pub measured: usize,
+    pub pending: usize,
+    pub unavailable: usize,
+    pub success: usize,
+    pub failed: usize,
+    pub cancelled: usize,
+    pub measured_wall_ms: u128,
+    pub measured_cpu_ms: u128,
+    pub peak_memory_bytes: u64,
 }
 
 impl Summary {
@@ -315,6 +332,15 @@ pub fn summary(dir: Option<&Path>, from_ms: u128, to_ms: u128) -> Summary {
     }) {
         return Summary::unavailable();
     }
+    summarize_attempts(&attempts, &measurements, from_ms, to_ms)
+}
+
+fn summarize_attempts(
+    attempts: &BTreeMap<String, Attempt>,
+    measurements: &BTreeMap<String, run::ControlRecord>,
+    from_ms: u128,
+    to_ms: u128,
+) -> Summary {
     let selected: Vec<_> = attempts
         .values()
         .filter(|attempt| attempt.at_unix_ms >= from_ms && attempt.at_unix_ms < to_ms)
@@ -323,17 +349,39 @@ pub fn summary(dir: Option<&Path>, from_ms: u128, to_ms: u128) -> Summary {
     let mut unavailable = 0;
     let mut pending = 0;
     let mut gap = false;
+    let mut groups: BTreeMap<(String, String), Group> = BTreeMap::new();
     for (id, attempt) in attempts
         .iter()
         .filter(|(_, attempt)| attempt.at_unix_ms >= from_ms && attempt.at_unix_ms < to_ms)
     {
+        let group = groups
+            .entry((attempt.agent.clone(), attempt.category.clone()))
+            .or_insert_with(|| Group {
+                agent: attempt.agent.clone(),
+                category: attempt.category.clone(),
+                ..Group::default()
+            });
+        group.assigned += 1;
         if attempt.completed && measurements.contains_key(id) {
             completed += 1;
+            let measurement = &measurements[id];
+            group.measured += 1;
+            match measurement.status.as_str() {
+                "success" => group.success += 1,
+                "failed" => group.failed += 1,
+                "cancelled" => group.cancelled += 1,
+                _ => return Summary::unavailable(),
+            }
+            group.measured_wall_ms = group.measured_wall_ms.saturating_add(measurement.wall_ms);
+            group.measured_cpu_ms = group.measured_cpu_ms.saturating_add(measurement.cpu_ms);
+            group.peak_memory_bytes = group.peak_memory_bytes.max(measurement.peak_memory_bytes);
         } else if attempt.completed || attempt.unavailable {
             unavailable += 1;
+            group.unavailable += 1;
             gap |= attempt.completed;
         } else {
             pending += 1;
+            group.pending += 1;
         }
     }
     Summary {
@@ -343,6 +391,7 @@ pub fn summary(dir: Option<&Path>, from_ms: u128, to_ms: u128) -> Summary {
         pending: Some(pending),
         unavailable: Some(unavailable),
         warning: gap.then_some("control measurements are missing for recorded attempts"),
+        groups: groups.into_values().collect(),
     }
 }
 

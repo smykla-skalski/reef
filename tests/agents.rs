@@ -274,6 +274,13 @@ fn missing_control_command_is_counted_as_unavailable() {
         assert_eq!(report["control"]["completed"], 0);
         assert_eq!(report["control"]["pending"], 0);
         assert_eq!(report["control"]["unavailable"], 1);
+        let group = &report["control"]["groups"][0];
+        assert_eq!(group["agent"], agent);
+        assert_eq!(group["category"], "test");
+        assert_eq!(group["assigned"], 1);
+        assert_eq!(group["measured"], 0);
+        assert_eq!(group["unavailable"], 1);
+        assert_eq!(group["measured_cpu_ms"], 0);
         assert_eq!(report["command_count"], 0);
         let events = fs::read_to_string(fixture.path.join("control/attempts.jsonl")).unwrap();
         assert_eq!(events.lines().count(), 2);
@@ -319,6 +326,42 @@ fn control_counts_one_attempt_per_top_level_command_without_scheduler() {
         assert_eq!(report["control"]["completed"], 1);
         assert_eq!(report["control"]["pending"], 0);
         assert_eq!(report["control"]["unavailable"], 0);
+        let group = &report["control"]["groups"][0];
+        assert_eq!(group["agent"], agent);
+        assert_eq!(group["category"], "test");
+        assert_eq!(group["assigned"], 1);
+        assert_eq!(group["measured"], 1);
+        assert_eq!(group["failed"], 1);
+        assert_eq!(group["success"], 0);
+        assert_eq!(group["cancelled"], 0);
+        assert!(group["measured_wall_ms"].as_u64().is_some());
+        assert!(group["peak_memory_bytes"].as_u64().is_some());
+        let markdown = reef()
+            .args(["report", "--state-dir"])
+            .arg(&fixture.path)
+            .arg("--control-state-dir")
+            .arg(fixture.path.join("control"))
+            .env("HOME", &fixture.path)
+            .output()
+            .unwrap();
+        assert!(markdown.status.success(), "{markdown:?}");
+        let markdown = String::from_utf8(markdown.stdout).unwrap();
+        assert!(markdown.contains("| Agent | Category | Assigned | Measured |"));
+        assert!(markdown.contains(&format!("| {agent} | test | 1 | 1 |")));
+        assert!(!markdown.contains("private-argument"));
+        let html = reef()
+            .args(["report", "--format", "html", "--state-dir"])
+            .arg(&fixture.path)
+            .arg("--control-state-dir")
+            .arg(fixture.path.join("control"))
+            .env("HOME", &fixture.path)
+            .output()
+            .unwrap();
+        assert!(html.status.success(), "{html:?}");
+        let html = String::from_utf8(html.stdout).unwrap();
+        assert!(html.contains("<th>Measured</th>"));
+        assert!(html.contains(&format!("<td>{agent}</td><td>test</td>")));
+        assert!(!html.contains("private-argument"));
         assert_eq!(report["command_count"], 1);
         assert_eq!(report["agent_commands"][0]["agent"], agent);
         let events = fs::read_to_string(fixture.path.join("control/attempts.jsonl")).unwrap();

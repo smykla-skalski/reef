@@ -68,6 +68,10 @@ pub(crate) struct ControlRecord {
     pub id: String,
     pub agent: String,
     pub category: String,
+    pub status: String,
+    pub wall_ms: u128,
+    pub cpu_ms: u128,
+    pub peak_memory_bytes: u64,
 }
 
 pub(crate) fn control_record(line: &str) -> io::Result<ControlRecord> {
@@ -91,6 +95,10 @@ pub(crate) fn control_record(line: &str) -> io::Result<ControlRecord> {
         id: id.to_owned(),
         agent: measurement.agent_kind.unwrap().to_owned(),
         category: measurement.category.to_owned(),
+        status: measurement.status.to_owned(),
+        wall_ms: measurement.wall_ms,
+        cpu_ms: measurement.tree_cpu_ms,
+        peak_memory_bytes: measurement.tree_peak_memory_bytes,
     })
 }
 
