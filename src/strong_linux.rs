@@ -291,17 +291,20 @@ fn prepare_podman_home(state_dir: &Path) -> io::Result<()> {
 fn pin_podman_store(state_dir: &Path) -> io::Result<()> {
     // Query with the launcher's real HOME before Podman is given its private
     // HOME. A system storage.conf may expand $HOME in rootless_storage_path.
-    let mut info = Command::new("podman");
-    info.env_remove("STORAGE_DRIVER")
-        .env_remove("STORAGE_OPTS")
-        .env_remove("CONTAINER_HOST")
-        .env_remove("CONTAINER_CONNECTION")
-        .arg("--remote=false")
-        .args(["info", "--format", "{{json .Store}}"]);
+    let mut info = launcher_podman_info(None);
     let output = bounded_output(&mut info, PODMAN_TIMEOUT, 65_536)?;
     let mut store: PodmanStore = serde_json::from_slice(&output)?;
     validate_store(&store)?;
     snapshot_storage_config(state_dir, &mut store)?;
+    if store.config_file.is_file() {
+        // The first query discovers the selected file. Re-query through the
+        // exact snapshot that the owner will use so a concurrent config edit
+        // cannot make the recorded baseline describe a different image store.
+        let mut pinned_info = launcher_podman_info(Some(&store.config_file));
+        let pinned_output = bounded_output(&mut pinned_info, PODMAN_TIMEOUT, 65_536)?;
+        store = serde_json::from_slice(&pinned_output)?;
+        validate_store(&store)?;
+    }
     let mut private_info = private_podman_command(state_dir, &store)?;
     private_info.args(["info", "--format", "{{json .Store}}"]);
     let private_output = bounded_output(&mut private_info, PODMAN_TIMEOUT, 65_536)?;
@@ -321,6 +324,20 @@ fn pin_podman_store(state_dir: &Path) -> io::Result<()> {
         .open(state_dir.join("podman-store.json"))?;
     serde_json::to_writer(&mut file, &store)?;
     file.sync_all()
+}
+
+fn launcher_podman_info(storage_config: Option<&Path>) -> Command {
+    let mut info = Command::new("podman");
+    info.env_remove("STORAGE_DRIVER")
+        .env_remove("STORAGE_OPTS")
+        .env_remove("CONTAINER_HOST")
+        .env_remove("CONTAINER_CONNECTION")
+        .arg("--remote=false")
+        .args(["info", "--format", "{{json .Store}}"]);
+    if let Some(path) = storage_config {
+        info.env("CONTAINERS_STORAGE_CONF", path);
+    }
+    info
 }
 
 fn snapshot_storage_config(state_dir: &Path, store: &mut PodmanStore) -> io::Result<()> {
