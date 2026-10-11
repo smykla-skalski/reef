@@ -8,16 +8,24 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 fn started_probe() -> (std::process::Child, String) {
-    let mut launcher = Command::new(env!("CARGO_BIN_EXE_reef"))
-        .args([
-            "strong-owner-probe",
-            "--image",
-            "docker.io/library/alpine:3.22",
-            "--",
-            "sh",
-            "-c",
-            "setsid sleep 300 & wait",
-        ])
+    started_probe_with_path(None)
+}
+
+fn started_probe_with_path(path: Option<std::ffi::OsString>) -> (std::process::Child, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_reef"));
+    command.args([
+        "strong-owner-probe",
+        "--image",
+        "docker.io/library/alpine:3.22",
+        "--",
+        "sh",
+        "-c",
+        "setsid sleep 300 & wait",
+    ]);
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    let mut launcher = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -35,6 +43,40 @@ fn started_probe() -> (std::process::Child, String) {
     assert!(name.starts_with("reef-strong-"));
 
     (launcher, name)
+}
+
+#[test]
+fn unavailable_systemctl_does_not_block_launcher_cleanup() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").unwrap();
+    let shim =
+        std::path::Path::new(&runtime).join(format!("reef-systemctl-fail-{}", std::process::id()));
+    std::fs::create_dir(&shim).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/false", shim.join("systemctl")).unwrap();
+    let original_path = std::env::var_os("PATH").unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(shim.clone()).chain(std::env::split_paths(&original_path)),
+    )
+    .unwrap();
+    let (mut launcher, name) = started_probe_with_path(Some(path));
+    let init_pid = container_init_pid(&name);
+    let pid = owner_pid(&name);
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+
+    assert!(!launcher.wait().unwrap().success());
+    assert_container_gone(&name);
+    assert_init_process_gone(init_pid);
+    assert_owner_state_gone(&name);
+    std::fs::remove_file(shim.join("systemctl")).unwrap();
+    std::fs::remove_dir(&shim).unwrap();
 }
 
 fn assert_container_gone(name: &str) {
@@ -277,6 +319,7 @@ fn existing_owner_state_does_not_remove_a_name_collision() {
     )
     .unwrap();
     std::fs::create_dir(state_dir.join("hooks")).unwrap();
+    std::fs::File::create(state_dir.join("owner.lock")).unwrap();
     std::fs::File::create(config.join("mounts.conf")).unwrap();
     std::fs::File::create(config.join("containers.conf")).unwrap();
     std::fs::File::create(state_dir.join("attempted")).unwrap();
@@ -440,6 +483,7 @@ fn recovery_does_not_remove_a_replacement_with_the_same_name_and_label() {
     )
     .unwrap();
     std::fs::create_dir(state_dir.join("hooks")).unwrap();
+    std::fs::File::create(state_dir.join("owner.lock")).unwrap();
     std::fs::File::create(config.join("mounts.conf")).unwrap();
     std::fs::File::create(config.join("containers.conf")).unwrap();
     std::fs::File::create(state_dir.join("attempted")).unwrap();
@@ -553,6 +597,7 @@ fn recovery_finds_its_container_before_podman_writes_the_cid_file() {
     )
     .unwrap();
     std::fs::create_dir(state_dir.join("hooks")).unwrap();
+    std::fs::File::create(state_dir.join("owner.lock")).unwrap();
     std::fs::File::create(config.join("mounts.conf")).unwrap();
     std::fs::File::create(config.join("containers.conf")).unwrap();
     std::fs::File::create(state_dir.join("attempted")).unwrap();

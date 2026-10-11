@@ -1,5 +1,6 @@
 //! Experimental Linux owner proof. Public strong mode remains fail-closed.
 
+use nix::fcntl::{FcntlArg, FdFlag, Flock, FlockArg, fcntl};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -16,6 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const START_TIMEOUT: Duration = Duration::from_secs(90);
 const PODMAN_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const OWNER_LOCK_TIMEOUT: Duration = Duration::from_secs(90);
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Deserialize, Serialize)]
@@ -69,6 +71,11 @@ pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
     let name = format!("reef-strong-{}-{nonce}", std::process::id());
     let state_dir = runtime.join(&name);
     DirBuilder::new().mode(0o700).create(&state_dir)?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(state_dir.join("owner.lock"))?;
     prepare_podman_home(&state_dir).inspect_err(|_| {
         let _ = cleanup_state_dir(&state_dir);
     })?;
@@ -124,23 +131,27 @@ pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
 
     let outcome = probe_connected(&listener, image, command, &name);
     if outcome.is_err() {
+        mark_cancelled(&state_dir)?;
         // The launcher is still alive here. If the service was explicitly
         // stopped, systemd will not restart it. Stop any remaining owner
-        // first, so it cannot create a container after our absence check.
-        quiesce_owner(&name);
+        // first. The lock also covers an in-flight Podman create/start when
+        // the user bus is unavailable, so absence cannot precede creation.
+        let _ = quiesce_owner(&name);
+        let _lock = lock_state_until(&state_dir, OWNER_LOCK_TIMEOUT)?;
         cleanup_until_absent(&state_dir);
         cleanup_state_dir(&state_dir)?;
     }
     outcome
 }
 
-fn quiesce_owner(name: &str) {
+fn quiesce_owner(name: &str) -> bool {
     let unit = format!("{name}.service");
-    loop {
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    while Instant::now() < deadline {
         let mut stop = Command::new("systemctl");
         stop.args(["--user", "stop", &unit]);
         if matches!(bounded_status(&mut stop, PODMAN_TIMEOUT), Ok(status) if status.success()) {
-            return;
+            return true;
         }
 
         // A collected transient unit can no longer start work. Keep retrying
@@ -155,9 +166,49 @@ fn quiesce_owner(name: &str) {
         ]);
         if matches!(bounded_output(&mut show, PODMAN_TIMEOUT, 128), Ok(output) if output == b"not-found\ninactive\n")
         {
-            return;
+            return true;
         }
         thread::sleep(Duration::from_secs(1));
+    }
+    false
+}
+
+fn mark_cancelled(state_dir: &Path) -> io::Result<()> {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(state_dir.join("cancelled"))
+    {
+        Ok(file) => file.sync_all(),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn lock_state_until(state_dir: &Path, timeout: Duration) -> io::Result<Option<Flock<File>>> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(state_dir.join("owner.lock"))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !state_dir.exists() => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let deadline = Instant::now() + timeout;
+    let mut file = file;
+    loop {
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => return Ok(Some(lock)),
+            Err((returned, nix::errno::Errno::EWOULDBLOCK)) if Instant::now() < deadline => {
+                file = returned;
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err((_, error)) => return Err(io::Error::other(error)),
+        }
     }
 }
 
@@ -220,6 +271,12 @@ pub fn owner(state_dir: &Path, name: &str) -> io::Result<()> {
         return Ok(());
     }
     validate_state_dir(state_dir)?;
+    let Some(lock) = lock_state_until(state_dir, OWNER_LOCK_TIMEOUT)? else {
+        return Ok(());
+    };
+    if !state_dir.exists() {
+        return Ok(());
+    }
     let stopping = Arc::new(AtomicBool::new(false));
     for signal in [
         signal_hook::consts::SIGTERM,
@@ -241,7 +298,7 @@ pub fn owner(state_dir: &Path, name: &str) -> io::Result<()> {
         return Ok(());
     }
 
-    let outcome = run_owner(state_dir, name, &stopping);
+    let outcome = run_owner(state_dir, name, &stopping, &lock);
     cleanup_until_absent(state_dir);
     cleanup_state_dir(state_dir)?;
     if let Ok(mut stream) = outcome {
@@ -426,8 +483,13 @@ fn read_owner_token(state_dir: &Path) -> io::Result<Option<String>> {
     Ok(Some(token.to_owned()))
 }
 
-fn run_owner(state_dir: &Path, name: &str, stopping: &AtomicBool) -> io::Result<UnixStream> {
-    ensure_active(stopping)?;
+fn run_owner(
+    state_dir: &Path,
+    name: &str,
+    stopping: &AtomicBool,
+    lock: &Flock<File>,
+) -> io::Result<UnixStream> {
+    ensure_active(stopping, state_dir)?;
     let mut stream = UnixStream::connect(state_dir.join("owner.sock"))?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut request = String::new();
@@ -445,11 +507,51 @@ fn run_owner(state_dir: &Path, name: &str, stopping: &AtomicBool) -> io::Result<
     if start.command.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty command"));
     }
-    ensure_active(stopping)?;
-    if podman_status(state_dir, &["image", "exists", &start.image])?.code() != Some(0) {
+    let id = create_owned_container(state_dir, name, &start, stopping, lock)?;
+    stream.write_all(b"READY\n")?;
+    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+
+    let mut waiter = podman_command(state_dir)?;
+    let mut waiter = waiter
+        .args(["wait", &id])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    loop {
+        ensure_active(stopping, state_dir)?;
+        let mut byte = [0_u8];
+        match stream.read(&mut byte) {
+            Ok(0) => {
+                let _ = waiter.kill();
+                let _ = waiter.wait();
+                return Err(io::Error::other("launcher exited"));
+            }
+            Ok(_) => return Err(io::Error::other("unexpected launcher data")),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(error),
+        }
+        if waiter.try_wait()?.is_some() {
+            return Ok(stream);
+        }
+    }
+}
+
+fn create_owned_container(
+    state_dir: &Path,
+    name: &str,
+    request: &Start,
+    stopping: &AtomicBool,
+    lock: &Flock<File>,
+) -> io::Result<String> {
+    ensure_active(stopping, state_dir)?;
+    if podman_status(state_dir, &["image", "exists", &request.image])?.code() != Some(0) {
         return Err(io::Error::other("container image is not available locally"));
     }
-    ensure_active(stopping)?;
+    ensure_active(stopping, state_dir)?;
     let token =
         read_owner_token(state_dir)?.ok_or_else(|| io::Error::other("missing owner token"))?;
 
@@ -482,56 +584,29 @@ fn run_owner(state_dir: &Path, name: &str, stopping: &AtomicBool) -> io::Result<
             "--cidfile={}",
             state_dir.join("container.cid").display()
         ))
-        .arg(&start.image)
-        .args(&start.command);
-    if !bounded_status(&mut create, PODMAN_TIMEOUT)?.success() {
+        .arg(&request.image)
+        .args(&request.command);
+    if !bounded_status_with_lock(&mut create, PODMAN_TIMEOUT, lock)?.success() {
         return Err(io::Error::other("podman create failed"));
     }
-    ensure_active(stopping)?;
+    ensure_active(stopping, state_dir)?;
     let id = read_container_id(state_dir)?
         .ok_or_else(|| io::Error::other("podman did not record the created container ID"))?;
     verify_container_label(state_dir, &id, name, &token)?;
     persist_container_id(state_dir, &id)?;
     reject_effective_mounts(state_dir, &id)?;
-    ensure_active(stopping)?;
-    if !podman_status(state_dir, &["start", &id])?.success() {
+    ensure_active(stopping, state_dir)?;
+    let mut start = podman_command(state_dir)?;
+    start.args(["start", &id]);
+    if !bounded_status_with_lock(&mut start, PODMAN_TIMEOUT, lock)?.success() {
         return Err(io::Error::other("podman start failed"));
     }
-    ensure_active(stopping)?;
-    stream.write_all(b"READY\n")?;
-    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-
-    let mut waiter = podman_command(state_dir)?;
-    let mut waiter = waiter
-        .args(["wait", &id])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    loop {
-        ensure_active(stopping)?;
-        let mut byte = [0_u8];
-        match stream.read(&mut byte) {
-            Ok(0) => {
-                let _ = waiter.kill();
-                let _ = waiter.wait();
-                return Err(io::Error::other("launcher exited"));
-            }
-            Ok(_) => return Err(io::Error::other("unexpected launcher data")),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                ) => {}
-            Err(error) => return Err(error),
-        }
-        if waiter.try_wait()?.is_some() {
-            return Ok(stream);
-        }
-    }
+    ensure_active(stopping, state_dir)?;
+    Ok(id)
 }
 
-fn ensure_active(stopping: &AtomicBool) -> io::Result<()> {
-    if stopping.load(Ordering::Relaxed) {
+fn ensure_active(stopping: &AtomicBool, state_dir: &Path) -> io::Result<()> {
+    if stopping.load(Ordering::Relaxed) || state_dir.join("cancelled").exists() {
         Err(io::Error::other("owner was stopped"))
     } else {
         Ok(())
@@ -738,6 +813,33 @@ fn bounded_status(command: &mut Command, timeout: Duration) -> io::Result<ExitSt
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
+    wait_bounded(&mut child, timeout)
+}
+
+fn bounded_status_with_lock(
+    command: &mut Command,
+    timeout: Duration,
+    lock: &Flock<File>,
+) -> io::Result<ExitStatus> {
+    // The owner can be killed while Podman is creating or starting a
+    // container. Let that one child retain the flock until it exits, so the
+    // launcher cannot verify absence while creation is still in flight.
+    let flags = FdFlag::from_bits_truncate(fcntl(&**lock, FcntlArg::F_GETFD)?);
+    fcntl(&**lock, FcntlArg::F_SETFD(flags & !FdFlag::FD_CLOEXEC))?;
+    let spawned = command.stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    let restored = fcntl(&**lock, FcntlArg::F_SETFD(flags));
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            restored?;
+            return Err(error);
+        }
+    };
+    if let Err(error) = restored {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(io::Error::other(error));
+    }
     wait_bounded(&mut child, timeout)
 }
 
