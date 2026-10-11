@@ -30,3 +30,9 @@ The initial canary copies a bounded source snapshot into the isolated environmen
 6. Start with a bounded read-only canary and compare measured control/treatment outcomes. Roll back new treatment on containment, latency, or data-coverage failures.
 
 The guarantee covers work inside the selected guest or container. Work delegated to an allowed external service is outside it. No backend can claim full descendant containment while it can reach an uncontrolled host service that executes on its behalf.
+
+## Linux owner proof (not enabled)
+
+The hidden `strong-owner-probe` command starts a rootless Podman container through a transient systemd user service. The independent owner receives the image and command over a private Unix socket, watches the launcher's connection, and removes the named container with zero grace when the connection closes. A systemd restart enters recovery-only mode and never starts the command a second time. The probe rejects inherited Podman mounts before container start. Native opt-in tests kill the launcher and owner, and explicitly stop the owner service, while a child has detached inside the container.
+
+This is an owner and teardown proof, not an executable strong backend. It does not transfer a workspace, forward terminal I/O, return the command's exit status or measurements, integrate with scheduler leases, or prove escape resistance. `reef run --isolation strong` and `reef schedule --isolation strong` continue to reject before starting a command. The probe requires a local image, rootless Podman, and a systemd user manager; it is not for workloads with source changes or credentials.

@@ -25,6 +25,8 @@ mod schedule_events;
 #[cfg(unix)]
 mod shadow;
 mod status;
+#[cfg(target_os = "linux")]
+mod strong_linux;
 mod tool_classification;
 
 use clap::ValueEnum;
@@ -57,6 +59,24 @@ enum Command {
         expected_json: String,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+    /// Internal Linux owner probe; not the public strong-isolation backend.
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    StrongOwnerProbe {
+        #[arg(long)]
+        image: String,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Internal entry point for the independently supervised Linux owner.
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    StrongOwner {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        name: String,
     },
     /// Launch a coding agent with resource-aware command shims.
     Agents {
@@ -441,6 +461,12 @@ fn main() -> std::process::ExitCode {
             expected_json,
             command,
         } => command_result(contain::exec_payload(&command, &snapshot, &expected_json)),
+        #[cfg(target_os = "linux")]
+        Command::StrongOwnerProbe { image, command } => {
+            command_result(strong_linux::probe(&image, &command))
+        }
+        #[cfg(target_os = "linux")]
+        Command::StrongOwner { state_dir, name } => result(strong_linux::owner(&state_dir, &name)),
         #[cfg(unix)]
         Command::Cache { command } => cache_command(command),
         Command::Agents { command } => agent_command(command),
@@ -506,20 +532,11 @@ fn main() -> std::process::ExitCode {
         Command::Remote(options) => command_result(remote::submit(&options)),
         #[cfg(unix)]
         Command::RemoteWorker(options) => command_result(remote::worker(&options)),
-        Command::Observe { command } => {
-            let result = match command {
-                ObserveCommand::Start(options) => observe::start(&options),
-                ObserveCommand::Run(options) => observe::run(&options),
-                ObserveCommand::Stop { state_dir } => observe::stop(state_dir.as_deref()),
-            };
-            match result {
-                Ok(()) => std::process::ExitCode::SUCCESS,
-                Err(error) => {
-                    eprintln!("reef: {error}");
-                    std::process::ExitCode::FAILURE
-                }
-            }
-        }
+        Command::Observe { command } => result(match command {
+            ObserveCommand::Start(options) => observe::start(&options),
+            ObserveCommand::Run(options) => observe::run(&options),
+            ObserveCommand::Stop { state_dir } => observe::stop(state_dir.as_deref()),
+        }),
         Command::Report(options) => report_result(report::run(&options)),
         Command::Compare(options) => report_result(report::run_compare(&options)),
         #[cfg(unix)]
