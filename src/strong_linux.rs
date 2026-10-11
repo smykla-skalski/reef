@@ -1,10 +1,11 @@
 //! Experimental Linux owner proof. Public strong mode remains fail-closed.
 
-use nix::fcntl::{FcntlArg, FdFlag, Flock, FlockArg, fcntl};
+use nix::fcntl::{FcntlArg, FdFlag, Flock, FlockArg, OFlag, fcntl};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::fd::AsFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -258,13 +259,16 @@ fn probe_connected(
     line.clear();
     reader.get_mut().set_read_timeout(None)?;
     reader.read_line(&mut line)?;
-    if line == "DONE\n" {
-        Ok(0)
-    } else {
-        Err(io::Error::other(
-            "strong owner exited without verified cleanup",
-        ))
-    }
+    parse_done(&line)
+}
+
+fn parse_done(line: &str) -> io::Result<u8> {
+    let code = line
+        .strip_prefix("DONE ")
+        .and_then(|value| value.strip_suffix('\n'))
+        .and_then(|value| value.parse::<u8>().ok())
+        .ok_or_else(|| io::Error::other("strong owner exited without verified cleanup"))?;
+    Ok(code)
 }
 
 pub fn owner(state_dir: &Path, name: &str) -> io::Result<()> {
@@ -306,8 +310,8 @@ pub fn owner(state_dir: &Path, name: &str) -> io::Result<()> {
     let outcome = run_owner(state_dir, name, &stopping, &lock);
     cleanup_until_absent(state_dir);
     cleanup_state_dir(state_dir)?;
-    if let Ok(mut stream) = outcome {
-        let _ = stream.write_all(b"DONE\n");
+    if let Ok((mut stream, code)) = outcome {
+        let _ = stream.write_all(format!("DONE {code}\n").as_bytes());
     }
     Ok(())
 }
@@ -497,7 +501,7 @@ fn run_owner(
     name: &str,
     stopping: &AtomicBool,
     lock: &Flock<File>,
-) -> io::Result<UnixStream> {
+) -> io::Result<(UnixStream, u8)> {
     ensure_active(stopping, state_dir)?;
     let mut stream = UnixStream::connect(state_dir.join("owner.sock"))?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -523,7 +527,7 @@ fn run_owner(
     let mut waiter = podman_command(state_dir)?;
     let mut waiter = waiter
         .args(["wait", &id])
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
     loop {
@@ -545,9 +549,50 @@ fn run_owner(
         }
         if let Some(status) = waiter.try_wait()? {
             ensure_podman_wait_succeeded(status)?;
-            return Ok(stream);
+            let mut stdout = waiter
+                .stdout
+                .take()
+                .ok_or_else(|| io::Error::other("missing container exit status"))?;
+            return Ok((stream, read_container_exit(&mut stdout)?));
         }
     }
+}
+
+fn read_container_exit<R: Read + AsFd>(stdout: &mut R) -> io::Result<u8> {
+    // A Podman descendant can retain the wait client's stdout after the
+    // client exits. Read only the short status line; never wait for EOF.
+    let flags = OFlag::from_bits_truncate(fcntl(&*stdout, FcntlArg::F_GETFL)?);
+    fcntl(&*stdout, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+    let mut output = [0_u8; 8];
+    let mut length = 0;
+    loop {
+        if length == output.len() {
+            return Err(io::Error::other("invalid container exit status"));
+        }
+        match stdout.read(&mut output[length..]) {
+            Ok(0) => return Err(io::Error::other("missing container exit status")),
+            Ok(read) => {
+                length += read;
+                if output[..length].contains(&b'\n') {
+                    return parse_container_exit(&output[..length]);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Err(io::Error::other("incomplete container exit status"));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn parse_container_exit(output: &[u8]) -> io::Result<u8> {
+    let value = std::str::from_utf8(output).map_err(io::Error::other)?;
+    let value = value
+        .strip_suffix('\n')
+        .ok_or_else(|| io::Error::other("invalid container exit status"))?;
+    value
+        .parse::<u8>()
+        .map_err(|_| io::Error::other("invalid container exit status"))
 }
 
 fn ensure_podman_wait_succeeded(status: ExitStatus) -> io::Result<()> {
@@ -949,11 +994,19 @@ fn validate_state_dir(state_dir: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PodmanStore, STORE_MAX_BYTES, ensure_podman_wait_succeeded, read_podman_store};
+    use super::{
+        PodmanStore, STORE_MAX_BYTES, ensure_podman_wait_succeeded, parse_container_exit,
+        parse_done, read_container_exit, read_podman_store,
+    };
     use std::fs;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
     use std::os::unix::process::ExitStatusExt;
     use std::path::PathBuf;
     use std::process::ExitStatus;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -984,5 +1037,33 @@ mod tests {
     fn failed_podman_wait_is_not_command_completion() {
         assert!(ensure_podman_wait_succeeded(ExitStatus::from_raw(0)).is_ok());
         assert!(ensure_podman_wait_succeeded(ExitStatus::from_raw(256)).is_err());
+    }
+
+    #[test]
+    fn command_exit_is_not_confused_with_owner_cleanup() {
+        for (container_output, expected) in [(b"0\n".as_slice(), 0), (b"7\n", 7), (b"255\n", 255)] {
+            assert_eq!(parse_container_exit(container_output).unwrap(), expected);
+            assert_eq!(parse_done(&format!("DONE {expected}\n")).unwrap(), expected);
+        }
+        for invalid in [b"-1\n".as_slice(), b"256\n", b"0\nextra", b"", b" 7\n"] {
+            assert!(parse_container_exit(invalid).is_err());
+        }
+        for invalid in ["DONE\n", "DONE 256\n", "DONE -1\n", "DONE 7", "READY\n"] {
+            assert!(parse_done(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn exit_status_does_not_wait_for_a_lingering_pipe_writer() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(b"7\n").unwrap();
+        let (send, receive) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            send.send(read_container_exit(&mut reader)).unwrap();
+        });
+        let result = receive.recv_timeout(Duration::from_secs(1));
+        drop(writer);
+        worker.join().unwrap();
+        assert_eq!(result.unwrap().unwrap(), 7);
     }
 }

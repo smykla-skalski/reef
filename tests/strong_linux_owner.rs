@@ -11,6 +11,42 @@ fn started_probe() -> (std::process::Child, String) {
     started_probe_with_path(None)
 }
 
+#[test]
+fn probe_returns_the_command_exit_only_after_owner_cleanup() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner-probe",
+            "--image",
+            "docker.io/library/alpine:3.22",
+            "--",
+            "sh",
+            "-c",
+            "exit 7",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(7));
+    let line = String::from_utf8(output.stdout).unwrap();
+    let name = line.strip_prefix("READY ").unwrap().trim();
+    let container = Command::new("podman")
+        .args(["container", "exists", name])
+        .status()
+        .unwrap();
+    assert_eq!(container.code(), Some(1), "owner returned before teardown");
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").unwrap();
+    let state_dir = std::path::Path::new(&runtime).join(name);
+    assert!(!state_dir.exists(), "owner returned before state cleanup");
+    assert!(
+        !state_dir.with_extension("done").exists(),
+        "owner returned before tombstone cleanup"
+    );
+}
+
 fn started_probe_with_path(path: Option<std::ffi::OsString>) -> (std::process::Child, String) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_reef"));
     command.args([
