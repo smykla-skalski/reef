@@ -518,6 +518,50 @@ fn host_charts(report: &Report, series: &HostSeries) -> String {
     out
 }
 
+#[cfg(unix)]
+fn control_html(control: &crate::control::Summary) -> String {
+    let mut out = String::from("<section><h2>Opt-in control attempts</h2>");
+    if !control.available {
+        out.push_str("<p class=\"note\">Warning: private control telemetry is missing, unreadable, or invalid. Counts are unavailable.</p></section>");
+        return out;
+    }
+    let _ = write!(
+        out,
+        "<p>Attempted: {} · Completed: {} · Pending: {} · Unavailable: {}</p>",
+        control.attempted.unwrap_or_default(),
+        control.completed.unwrap_or_default(),
+        control.pending.unwrap_or_default(),
+        control.unavailable.unwrap_or_default(),
+    );
+    if let Some(warning) = control.warning {
+        let _ = write!(out, "<p class=\"note\">Warning: {}.</p>", escape(warning));
+    }
+    if !control.groups.is_empty() {
+        out.push_str("<p class=\"note\">Costs include only completed attempts with valid measurements. Pending and unavailable attempts are excluded.</p><div class=\"table-wrap\"><table><thead><tr><th>Agent</th><th>Category</th><th>Assigned</th><th>Measured</th><th>Pending</th><th>Unavailable</th><th>Success</th><th>Failed</th><th>Cancelled</th><th>Measured wall</th><th>Measured CPU</th><th>Peak memory</th></tr></thead><tbody>");
+        for group in &control.groups {
+            let _ = write!(
+                out,
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                escape(&group.agent),
+                escape(&group.category),
+                group.assigned,
+                group.measured,
+                group.pending,
+                group.unavailable,
+                group.success,
+                group.failed,
+                group.cancelled,
+                escape(&readable_duration(Some(group.measured_wall_ms))),
+                escape(&readable_duration(Some(group.measured_cpu_ms))),
+                escape(&readable_bytes(i128::from(group.peak_memory_bytes))),
+            );
+        }
+        out.push_str("</tbody></table></div>");
+    }
+    out.push_str("</section>");
+    out
+}
+
 pub(super) fn render(report: &Report, series: &HostSeries, include_timeline: bool) -> String {
     let mut out = String::from(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:"><title>Reef workload report</title><style>
@@ -573,25 +617,7 @@ pub(super) fn render(report: &Report, series: &HostSeries, include_timeline: boo
     }
     out.push_str("</div>");
     #[cfg(unix)]
-    {
-        out.push_str("<section><h2>Opt-in control attempts</h2>");
-        if report.control.available {
-            let _ = write!(
-                out,
-                "<p>Attempted: {} · Completed: {} · Pending: {} · Unavailable: {}</p>",
-                report.control.attempted.unwrap_or_default(),
-                report.control.completed.unwrap_or_default(),
-                report.control.pending.unwrap_or_default(),
-                report.control.unavailable.unwrap_or_default(),
-            );
-            if let Some(warning) = report.control.warning {
-                let _ = write!(out, "<p class=\"note\">Warning: {}.</p>", escape(warning));
-            }
-        } else {
-            out.push_str("<p class=\"note\">Warning: private control telemetry is missing, unreadable, or invalid. Counts are unavailable.</p>");
-        }
-        out.push_str("</section>");
-    }
+    out.push_str(&control_html(&report.control));
     out.push_str(&host_charts(report, series));
     out.push_str(&memory_consumers(report, series));
     out.push_str(&agent_comparison(report));

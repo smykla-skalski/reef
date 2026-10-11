@@ -1801,6 +1801,50 @@ fn timeline_markdown(events: &[PressureEvent]) -> String {
     out
 }
 
+#[cfg(unix)]
+fn control_markdown(control: &control::Summary) -> String {
+    let mut out = String::from("## Opt-in control attempts\n\n");
+    if !control.available {
+        out.push_str("Warning: private control telemetry is missing, unreadable, or invalid. Counts are unavailable.\n\n");
+        return out;
+    }
+    let _ = write!(
+        out,
+        "- Attempted: {}\n- Completed: {}\n- Pending: {}\n- Unavailable: {}\n\n",
+        control.attempted.unwrap_or_default(),
+        control.completed.unwrap_or_default(),
+        control.pending.unwrap_or_default(),
+        control.unavailable.unwrap_or_default(),
+    );
+    if let Some(warning) = control.warning {
+        let _ = writeln!(out, "Warning: {warning}.\n");
+    }
+    if !control.groups.is_empty() {
+        out.push_str("Measured costs cover completed attempts with a valid command record; pending and unavailable attempts are excluded from cost totals.\n\n");
+        out.push_str("| Agent | Category | Assigned | Measured | Pending | Unavailable | Success | Failed | Cancelled | Measured wall | Measured CPU | Peak memory |\n| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+        for group in &control.groups {
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                group.agent,
+                group.category,
+                group.assigned,
+                group.measured,
+                group.pending,
+                group.unavailable,
+                group.success,
+                group.failed,
+                group.cancelled,
+                readable_duration(Some(group.measured_wall_ms)),
+                readable_duration(Some(group.measured_cpu_ms)),
+                readable_bytes(i128::from(group.peak_memory_bytes)),
+            );
+        }
+        out.push('\n');
+    }
+    out
+}
+
 fn markdown_with_timeline(report: &Report, include_timeline: bool) -> String {
     let mut out = format!(
         "# Reef workload report\n\n- Range: {} to {} (end exclusive)\n- Empty: {}\n- Host observations: {}\n- Host observations with agents: {}\n- Observed working time: {}\n- Peak host memory: {}\n- Peak root disk used: {}\n- Swap growth: {}\n- Peak command concurrency: {}\n\n",
@@ -1818,24 +1862,7 @@ fn markdown_with_timeline(report: &Report, include_timeline: bool) -> String {
         printable(report.peak_command_concurrency),
     );
     #[cfg(unix)]
-    {
-        out.push_str("## Opt-in control attempts\n\n");
-        if report.control.available {
-            let _ = write!(
-                out,
-                "- Attempted: {}\n- Completed: {}\n- Pending: {}\n- Unavailable: {}\n\n",
-                report.control.attempted.unwrap_or_default(),
-                report.control.completed.unwrap_or_default(),
-                report.control.pending.unwrap_or_default(),
-                report.control.unavailable.unwrap_or_default(),
-            );
-            if let Some(warning) = report.control.warning {
-                let _ = writeln!(out, "Warning: {warning}.\n");
-            }
-        } else {
-            out.push_str("Warning: private control telemetry is missing, unreadable, or invalid. Counts are unavailable.\n\n");
-        }
-    }
+    out.push_str(&control_markdown(&report.control));
     out.push_str("## Commands\n\n");
     if let Some(categories) = &report.categories {
         out.push_str("Whole commands overlapping the range; percentages are shares of measured commands. Concurrent wall times can exceed elapsed time.\n\n");
