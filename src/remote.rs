@@ -3,7 +3,9 @@ use crate::schedule;
 use clap::Args;
 use fs2::FileExt;
 use nix::errno::Errno;
+use nix::fcntl::{FcntlArg, OFlag, fcntl, open, openat};
 use nix::sys::signal::{Signal, killpg};
+use nix::sys::stat::Mode;
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -17,10 +19,12 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_FILES: usize = 10_000;
 const MAX_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_GIT_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const CACHE_TTL: Duration = Duration::from_hours(168);
 const CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
@@ -470,11 +474,91 @@ fn shell_quote(value: &str) -> String {
 fn check(output: &std::process::Output, stage: &str) -> io::Result<()> {
     if output.status.success() {
         Ok(())
+    } else if output.stderr.is_empty() {
+        Err(io::Error::other(format!(
+            "{stage} failed with status {}",
+            output.status
+        )))
     } else {
         Err(io::Error::other(format!(
             "{stage} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         )))
+    }
+}
+
+fn git_output(command: &mut Command, timeout: Duration) -> io::Result<std::process::Output> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("missing Git output"))?;
+    let flags = match fcntl(&stdout, FcntlArg::F_GETFL) {
+        Ok(flags) => OFlag::from_bits_truncate(flags),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::other(error));
+        }
+    };
+    if let Err(error) = fcntl(&stdout, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(io::Error::other(error));
+    }
+    let deadline = Instant::now() + timeout;
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let drained = match stdout.read(&mut buffer) {
+            Ok(0) => true,
+            Ok(count) => {
+                if output.len() + count > MAX_GIT_OUTPUT_BYTES {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(invalid("Git file listing exceeds size limit"));
+                }
+                output.extend_from_slice(&buffer[..count]);
+                false
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => true,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+        let status = match child.try_wait() {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+        if let Some(status) = status
+            && drained
+        {
+            return Ok(std::process::Output {
+                status,
+                stdout: output,
+                stderr: Vec::new(),
+            });
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Git command timed out",
+            ));
+        }
+        if drained {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
@@ -535,11 +619,9 @@ fn safe_path(path: &Path) -> io::Result<()> {
 }
 
 fn git_paths(repo: &Path, args: &[&str]) -> io::Result<BTreeSet<PathBuf>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()?;
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo).args(args);
+    let output = git_output(&mut command, GIT_TIMEOUT)?;
     check(&output, "git file listing")?;
     Ok(output
         .stdout
@@ -560,24 +642,98 @@ fn reject_symlink_ancestors(root: &Path, relative: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn open_source_file(root: &Path, relative: &Path) -> io::Result<File> {
+    let directory_flags =
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let mut directory = open(root, directory_flags, Mode::empty()).map_err(io::Error::other)?;
+    let mut parts = relative.components().peekable();
+    while let Some(part) = parts.next() {
+        let name = Path::new(part.as_os_str());
+        if parts.peek().is_none() {
+            let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC;
+            let file = openat(&directory, name, flags, Mode::empty()).map_err(io::Error::other)?;
+            return Ok(File::from(file));
+        }
+        directory =
+            openat(&directory, name, directory_flags, Mode::empty()).map_err(io::Error::other)?;
+    }
+    Err(invalid("empty source path"))
+}
+
 fn make_snapshot(
     repo: &Path,
     included: &[PathBuf],
     policy: &Policy,
     command: &[String],
 ) -> io::Result<Snapshot> {
+    let candidate = std::env::temp_dir().join(format!(
+        "reef-snapshot-{:x}{:x}",
+        std::process::id(),
+        now_nanos()
+    ));
+    let path = create_private_snapshot_dir(&candidate)?;
+    let snapshot = Snapshot { path };
+    let files = copy_source(
+        repo,
+        included,
+        &snapshot.path.join("source"),
+        &mut || Ok(()),
+    )?;
+    let manifest = JobManifest {
+        repository: policy.repository.clone(),
+        toolchain: policy.toolchain.clone(),
+        os: policy.os.clone(),
+        arch: policy.arch.clone(),
+        command: command.to_vec(),
+        files,
+    };
+    let manifest_path = snapshot.path.join("job.json");
+    serde_json::to_writer(File::create(&manifest_path)?, &manifest)?;
+    fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600))?;
+    Ok(snapshot)
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn create_local_source_snapshot(
+    repo: &Path,
+    state_dir: &Path,
+    progress: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    // The independent owner removes this directory even if the launcher dies
+    // during the copy. Unlike a remote job, no command line is persisted.
+    let snapshot = state_dir.join("workspace-snapshot");
+    create_private_snapshot_subdir(&snapshot)?;
+    copy_source(repo, &[], &snapshot.join("source"), progress)?;
+    Ok(())
+}
+
+fn copy_source(
+    repo: &Path,
+    included: &[PathBuf],
+    source_root: &Path,
+    progress: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<Vec<FileEntry>> {
     let root = fs::canonicalize(repo)?;
-    let top = Command::new("git")
+    progress()?;
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(&root)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()?;
+        .args(["rev-parse", "--show-toplevel"]);
+    let top = git_output(&mut command, GIT_TIMEOUT)?;
     check(&top, "git root")?;
+    progress()?;
     if fs::canonicalize(String::from_utf8_lossy(&top.stdout).trim())? != root {
         return Err(invalid("--repo must name the worktree root"));
     }
     let mut paths = git_paths(&root, &["ls-files", "--cached", "-z"])?;
-    let untracked = git_paths(&root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    progress()?;
+    let untracked = if included.is_empty() {
+        BTreeSet::new()
+    } else {
+        git_paths(&root, &["ls-files", "--others", "--exclude-standard", "-z"])?
+    };
+    progress()?;
     for path in included {
         if !untracked.contains(path) {
             return Err(invalid(
@@ -589,18 +745,11 @@ fn make_snapshot(
     if paths.len() > MAX_FILES {
         return Err(invalid("snapshot exceeds file-count limit"));
     }
-    let candidate = std::env::temp_dir().join(format!(
-        "reef-snapshot-{:x}{:x}",
-        std::process::id(),
-        now_nanos()
-    ));
-    let path = create_private_snapshot_dir(&candidate)?;
-    let snapshot = Snapshot { path };
-    let source_root = snapshot.path.join("source");
-    create_private_snapshot_subdir(&source_root)?;
+    create_private_snapshot_subdir(source_root)?;
     let mut files = Vec::new();
     let mut total = 0_u64;
     for relative in paths {
+        progress()?;
         safe_path(&relative)?;
         reject_symlink_ancestors(&root, &relative)?;
         let source = root.join(&relative);
@@ -621,22 +770,27 @@ fn make_snapshot(
             return Err(invalid("snapshot exceeds 100 MiB"));
         }
         let destination = source_root.join(&relative);
-        create_private_snapshot_parents(&source_root, &relative)?;
-        let mut input = File::open(&source)?;
+        create_private_snapshot_parents(source_root, &relative)?;
+        let mut input = open_source_file(&root, &relative)?;
+        let opened = input.metadata()?;
+        if !opened.is_file() || opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+            return Err(invalid("source changed during snapshot"));
+        }
         let mut output = File::create(&destination)?;
         let mut hasher = Sha256::new();
-        let mut buffer = [0_u8; 8192];
-        loop {
-            let count = input.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            hasher.update(&buffer[..count]);
-            output.write_all(&buffer[..count])?;
-        }
+        copy_bounded_file(
+            &mut input,
+            &mut output,
+            metadata.len(),
+            &mut hasher,
+            progress,
+        )?;
         fs::set_permissions(&destination, metadata.permissions())?;
         let after = fs::symlink_metadata(&source)?;
-        if after.len() != metadata.len()
+        if !after.is_file()
+            || after.dev() != metadata.dev()
+            || after.ino() != metadata.ino()
+            || after.len() != metadata.len()
             || after.mtime() != metadata.mtime()
             || after.mtime_nsec() != metadata.mtime_nsec()
         {
@@ -651,18 +805,37 @@ fn make_snapshot(
             sha256: hex_digest(hasher.finalize()),
         });
     }
-    let manifest = JobManifest {
-        repository: policy.repository.clone(),
-        toolchain: policy.toolchain.clone(),
-        os: policy.os.clone(),
-        arch: policy.arch.clone(),
-        command: command.to_vec(),
-        files,
-    };
-    let manifest_path = snapshot.path.join("job.json");
-    serde_json::to_writer(File::create(&manifest_path)?, &manifest)?;
-    fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600))?;
-    Ok(snapshot)
+    Ok(files)
+}
+
+fn copy_bounded_file<R: Read, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    expected_bytes: u64,
+    hasher: &mut Sha256,
+    progress: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    let mut buffer = [0_u8; 8192];
+    let mut copied = 0_u64;
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(count as u64)
+            .ok_or_else(|| invalid("snapshot size overflow"))?;
+        if copied > expected_bytes {
+            return Err(invalid("source changed during snapshot"));
+        }
+        hasher.update(&buffer[..count]);
+        output.write_all(&buffer[..count])?;
+        progress()?;
+    }
+    if copied != expected_bytes {
+        return Err(invalid("source changed during snapshot"));
+    }
+    Ok(())
 }
 
 fn create_private_snapshot_subdir(path: &Path) -> io::Result<()> {
@@ -1053,14 +1226,16 @@ fn stop_group(pid: u32) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AllowedCommand, Policy, WorkerOptions, create_private_snapshot_dir, hex_digest,
-        make_snapshot, worker,
+        AllowedCommand, Policy, WorkerOptions, copy_bounded_file, create_local_source_snapshot,
+        create_private_snapshot_dir, git_output, hex_digest, make_snapshot, open_source_file,
+        worker,
     };
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
@@ -1140,6 +1315,39 @@ mod tests {
     }
 
     #[test]
+    fn blocked_git_command_is_killed_at_deadline() {
+        let error =
+            git_output(Command::new("sleep").arg("5"), Duration::from_millis(50)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn ready_git_output_is_drained_without_per_chunk_delay() {
+        let output = git_output(
+            Command::new("head").args(["-c", "4194304", "/dev/zero"]),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn snapshot_copy_rejects_growth_before_writing_past_declared_size() {
+        let mut output = Vec::new();
+        let mut hasher = sha2::Sha256::default();
+        let result = copy_bounded_file(
+            &mut &b"abcdef"[..],
+            &mut output,
+            3,
+            &mut hasher,
+            &mut || Ok(()),
+        );
+        assert!(result.is_err());
+        assert_eq!(output, Vec::<u8>::new());
+    }
+
+    #[test]
     fn snapshot_directory_collision_preserves_existing_content() {
         let fixture = Fixture::new();
         let candidate = fixture.0.join("snapshot");
@@ -1206,6 +1414,40 @@ mod tests {
     }
 
     #[test]
+    fn local_snapshot_copies_only_tracked_source_without_command_manifest() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo();
+        fs::write(repo.join("tracked.txt"), "changed").unwrap();
+        fs::write(repo.join("untracked.txt"), "private").unwrap();
+        add(&repo, "tracked.txt");
+        let state = fixture.0.join("owner-state");
+        fs::create_dir(&state).unwrap();
+
+        create_local_source_snapshot(&repo, &state, &mut || Ok(())).unwrap();
+
+        let root = state.join("workspace-snapshot");
+        assert_eq!(
+            fs::read_to_string(root.join("source/tracked.txt")).unwrap(),
+            "changed"
+        );
+        assert!(!root.join("source/untracked.txt").exists());
+        assert!(!root.join("job.json").exists());
+    }
+
+    #[test]
+    fn local_snapshot_rejects_tracked_sensitive_path() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo();
+        fs::write(repo.join(".env"), "private").unwrap();
+        add(&repo, ".env");
+        let state = fixture.0.join("owner-state");
+        fs::create_dir(&state).unwrap();
+
+        assert!(create_local_source_snapshot(&repo, &state, &mut || Ok(())).is_err());
+        assert!(!state.join("workspace-snapshot/source/.env").exists());
+    }
+
+    #[test]
     fn snapshot_rejects_symlink_that_escapes_worktree() {
         let fixture = Fixture::new();
         let repo = fixture.repo();
@@ -1215,6 +1457,18 @@ mod tests {
         let result = make_snapshot(&repo, &[], &policy(), &["sh".into()]);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn source_open_never_follows_final_or_parent_symlinks() {
+        let fixture = Fixture::new();
+        let repo = fixture.repo();
+        fs::write(fixture.0.join("secret"), "secret").unwrap();
+        symlink(fixture.0.join("secret"), repo.join("final-link")).unwrap();
+        symlink(&fixture.0, repo.join("parent-link")).unwrap();
+
+        assert!(open_source_file(&repo, Path::new("final-link")).is_err());
+        assert!(open_source_file(&repo, Path::new("parent-link/secret")).is_err());
     }
 
     #[test]
