@@ -29,6 +29,8 @@ mod status;
 mod strong_linux;
 mod tool_classification;
 
+#[cfg(target_os = "linux")]
+use clap::Args;
 use clap::ValueEnum;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -63,12 +65,7 @@ enum Command {
     /// Internal Linux owner probe; not the public strong-isolation backend.
     #[cfg(target_os = "linux")]
     #[command(hide = true)]
-    StrongOwnerProbe {
-        #[arg(long)]
-        image: String,
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-        command: Vec<String>,
-    },
+    StrongOwnerProbe(StrongOwnerProbeArgs),
     /// Internal entry point for the independently supervised Linux owner.
     #[cfg(target_os = "linux")]
     #[command(hide = true)]
@@ -176,6 +173,19 @@ enum Command {
     /// Replay hypothetical admission decisions from passive host samples.
     #[cfg(unix)]
     Shadow(shadow::ShadowOptions),
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Args)]
+struct StrongOwnerProbeArgs {
+    #[arg(long)]
+    image: String,
+    #[arg(long, requires = "approve_snapshot")]
+    workspace: Option<PathBuf>,
+    #[arg(long)]
+    approve_snapshot: bool,
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
 }
 
 #[cfg(unix)]
@@ -462,9 +472,12 @@ fn main() -> std::process::ExitCode {
             command,
         } => command_result(contain::exec_payload(&command, &snapshot, &expected_json)),
         #[cfg(target_os = "linux")]
-        Command::StrongOwnerProbe { image, command } => {
-            command_result(strong_linux::probe(&image, &command))
-        }
+        Command::StrongOwnerProbe(options) => command_result(strong_linux::probe(
+            &options.image,
+            options.workspace.as_deref(),
+            options.approve_snapshot,
+            &options.command,
+        )),
         #[cfg(target_os = "linux")]
         Command::StrongOwner { state_dir, name } => result(strong_linux::owner(&state_dir, &name)),
         #[cfg(unix)]

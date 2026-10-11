@@ -47,6 +47,72 @@ fn probe_returns_the_command_exit_only_after_owner_cleanup() {
     );
 }
 
+#[test]
+fn opt_in_workspace_snapshot_is_read_only_and_excludes_untracked_files() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").unwrap();
+    let repo =
+        std::path::Path::new(&runtime).join(format!("reef-strong-source-{}", std::process::id()));
+    std::fs::create_dir(&repo).unwrap();
+    assert!(
+        Command::new("git")
+            .arg("init")
+            .arg(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(repo.join("tracked.txt"), "tracked\n").unwrap();
+    std::fs::write(repo.join("untracked.txt"), "private\n").unwrap();
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["add", "tracked.txt"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .arg("strong-owner-probe")
+        .arg("--image")
+        .arg("docker.io/library/alpine:3.22")
+        .arg("--workspace")
+        .arg(&repo)
+        .arg("--approve-snapshot")
+        .args([
+            "--",
+            "sh",
+            "-c",
+            "test \"$(cat tracked.txt)\" = tracked && test ! -e untracked.txt && ! touch new.txt",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let line = String::from_utf8(output.stdout).unwrap();
+    let name = line.strip_prefix("READY ").unwrap().trim();
+    assert!(!std::path::Path::new(&runtime).join(name).exists());
+    assert_eq!(
+        Command::new("podman")
+            .args(["container", "exists", name])
+            .status()
+            .unwrap()
+            .code(),
+        Some(1)
+    );
+    std::fs::remove_dir_all(repo).unwrap();
+}
+
 fn started_probe_with_path(path: Option<std::ffi::OsString>) -> (std::process::Child, String) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_reef"));
     command.args([

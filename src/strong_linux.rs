@@ -26,6 +26,7 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 struct Start {
     image: String,
     command: Vec<String>,
+    workspace_snapshot: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -42,16 +43,13 @@ struct PodmanStore {
     config_file: std::path::PathBuf,
 }
 
-pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
-    if nix::unistd::Uid::current().is_root() {
-        return Err(io::Error::other(
-            "strong owner requires an unprivileged user",
-        ));
-    }
-    validate_image(image)?;
-    if command.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty command"));
-    }
+pub fn probe(
+    image: &str,
+    workspace: Option<&Path>,
+    approve_snapshot: bool,
+    command: &[String],
+) -> io::Result<u8> {
+    validate_probe_request(image, workspace, approve_snapshot, command)?;
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .ok_or_else(|| io::Error::other("XDG_RUNTIME_DIR is required"))?;
     let runtime = Path::new(&runtime);
@@ -134,7 +132,7 @@ pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
         )));
     }
 
-    let outcome = probe_connected(&listener, image, command, &name);
+    let outcome = probe_connected(&listener, &state_dir, image, workspace, command, &name);
     if outcome.is_err() {
         let cancellation = mark_cancelled(&state_dir);
         // The launcher is still alive here. If the service was explicitly
@@ -148,6 +146,30 @@ pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
         cancellation?;
     }
     outcome
+}
+
+fn validate_probe_request(
+    image: &str,
+    workspace: Option<&Path>,
+    approve_snapshot: bool,
+    command: &[String],
+) -> io::Result<()> {
+    if nix::unistd::Uid::current().is_root() {
+        return Err(io::Error::other(
+            "strong owner requires an unprivileged user",
+        ));
+    }
+    validate_image(image)?;
+    if command.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty command"));
+    }
+    if workspace.is_some() != approve_snapshot {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workspace snapshot requires --workspace and --approve-snapshot",
+        ));
+    }
+    Ok(())
 }
 
 fn quiesce_owner(name: &str) -> bool {
@@ -220,7 +242,9 @@ fn lock_state_until(state_dir: &Path, timeout: Duration) -> io::Result<Option<Fl
 
 fn probe_connected(
     listener: &UnixListener,
+    state_dir: &Path,
     image: &str,
+    workspace: Option<&Path>,
     command: &[String],
     name: &str,
 ) -> io::Result<u8> {
@@ -238,14 +262,22 @@ fn probe_connected(
         }
     };
     stream.set_read_timeout(Some(START_TIMEOUT))?;
+    stream.set_write_timeout(Some(START_TIMEOUT))?;
     serde_json::to_writer(
         &mut stream,
         &Start {
             image: image.to_owned(),
             command: command.to_vec(),
+            workspace_snapshot: workspace.is_some(),
         },
     )?;
     stream.write_all(b"\n")?;
+    if let Some(workspace) = workspace {
+        crate::remote::create_local_source_snapshot(workspace, state_dir, &mut || {
+            stream.write_all(b"PROGRESS\n")
+        })?;
+        stream.write_all(b"SNAPSHOT_READY\n")?;
+    }
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line)?;
@@ -504,11 +536,10 @@ fn run_owner(
 ) -> io::Result<(UnixStream, u8)> {
     ensure_active(stopping, state_dir)?;
     let mut stream = UnixStream::connect(state_dir.join("owner.sock"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_read_timeout(Some(START_TIMEOUT))?;
     let mut request = String::new();
-    BufReader::new(stream.try_clone()?)
-        .take(16_385)
-        .read_line(&mut request)?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    (&mut reader).take(16_385).read_line(&mut request)?;
     if request.len() > 16_384 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -519,6 +550,9 @@ fn run_owner(
     validate_image(&start.image)?;
     if start.command.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty command"));
+    }
+    if start.workspace_snapshot {
+        await_snapshot_ready(&mut reader)?;
     }
     let id = create_owned_container(state_dir, name, &start, stopping, lock)?;
     stream.write_all(b"READY\n")?;
@@ -554,6 +588,21 @@ fn run_owner(
                 .take()
                 .ok_or_else(|| io::Error::other("missing container exit status"))?;
             return Ok((stream, read_container_exit(&mut stdout)?));
+        }
+    }
+}
+
+fn await_snapshot_ready(reader: &mut BufReader<UnixStream>) -> io::Result<()> {
+    loop {
+        let mut line = String::new();
+        let count = (&mut *reader).take(32).read_line(&mut line)?;
+        if count == 0 {
+            return Err(io::Error::other("launcher exited during snapshot"));
+        }
+        match line.as_str() {
+            "PROGRESS\n" => {}
+            "SNAPSHOT_READY\n" => return Ok(()),
+            _ => return Err(io::Error::other("invalid snapshot progress message")),
         }
     }
 }
@@ -639,6 +688,9 @@ fn create_owned_container(
         "--memory=512m",
         "--cpus=1",
     ]);
+    if request.workspace_snapshot {
+        create.args(["--workdir", "/workspace"]);
+    }
     create
         .arg(format!("--name={name}"))
         .arg(format!("--label=io.reef.owner={name}"))
@@ -659,6 +711,20 @@ fn create_owned_container(
     persist_container_id(state_dir, &id)?;
     reject_effective_mounts(state_dir, &id)?;
     ensure_active(stopping, state_dir)?;
+    if request.workspace_snapshot {
+        let source = state_dir.join("workspace-snapshot/source");
+        if !source.is_dir() {
+            return Err(io::Error::other("missing workspace snapshot"));
+        }
+        let mut copy = podman_command(state_dir)?;
+        copy.arg("cp")
+            .arg(format!("{}/.", source.display()))
+            .arg(format!("{id}:/workspace"));
+        if !bounded_status_with_lock(&mut copy, PODMAN_TIMEOUT, lock)?.success() {
+            return Err(io::Error::other("podman snapshot copy failed"));
+        }
+        ensure_active(stopping, state_dir)?;
+    }
     let mut start = podman_command(state_dir)?;
     start.args(["start", &id]);
     if !bounded_status_with_lock(&mut start, PODMAN_TIMEOUT, lock)?.success() {
@@ -995,11 +1061,11 @@ fn validate_state_dir(state_dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PodmanStore, STORE_MAX_BYTES, ensure_podman_wait_succeeded, parse_container_exit,
-        parse_done, read_container_exit, read_podman_store,
+        PodmanStore, STORE_MAX_BYTES, await_snapshot_ready, ensure_podman_wait_succeeded,
+        parse_container_exit, parse_done, read_container_exit, read_podman_store,
     };
     use std::fs;
-    use std::io::Write;
+    use std::io::{BufReader, Write};
     use std::os::unix::net::UnixStream;
     use std::os::unix::process::ExitStatusExt;
     use std::path::PathBuf;
@@ -1008,6 +1074,19 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn snapshot_progress_keeps_owner_waiting_until_ready() {
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        writer
+            .write_all(b"PROGRESS\nPROGRESS\nSNAPSHOT_READY\n")
+            .unwrap();
+        assert!(await_snapshot_ready(&mut BufReader::new(reader)).is_ok());
+
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        writer.write_all(b"PROGRESS\nINVALID\n").unwrap();
+        assert!(await_snapshot_ready(&mut BufReader::new(reader)).is_err());
+    }
 
     #[test]
     fn owner_reads_a_valid_store_larger_than_four_kib() {
