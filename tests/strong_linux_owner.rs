@@ -1,15 +1,181 @@
 #![cfg(target_os = "linux")]
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 fn started_probe() -> (std::process::Child, String) {
     started_probe_with_path(None)
+}
+
+#[test]
+fn contained_command_cannot_reach_host_control_planes() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_listener = Arc::clone(&stop);
+    let server = thread::spawn(move || {
+        while !stop_listener.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .unwrap();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("host canary failed: {error}"),
+            }
+        }
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner-probe",
+            "--image",
+            "docker.io/library/alpine:3.22",
+            "--",
+            "sh",
+            "-ec",
+            r#"
+                test ! -e /run/user
+                test ! -e /run/systemd/private
+                test ! -e /run/podman/podman.sock
+                test ! -e /var/run/docker.sock
+                test ! -e /dev/kvm
+                test -z "${DBUS_SESSION_BUS_ADDRESS:-}"
+                test -z "${CONTAINER_HOST:-}"
+                test -z "${DOCKER_HOST:-}"
+                command -v wget >/dev/null
+                test "$(wc -l < /proc/net/route)" -eq 1
+                test "$(awk '/^CapEff:/ { print $2 }' /proc/self/status)" = 0000000000000000
+                test "$(awk '/^NoNewPrivs:/ { print $2 }' /proc/self/status)" = 1
+                if wget -q -T 2 -O /dev/null "http://127.0.0.1:$1/" 2>/dev/null; then
+                    exit 1
+                fi
+                if mkdir /sys/fs/cgroup/reef-escape 2>/dev/null; then
+                    rmdir /sys/fs/cgroup/reef-escape
+                    exit 1
+                fi
+                printf 'sealed\n'
+            "#,
+            "reef-isolation-test",
+        ])
+        .arg(port)
+        .output()
+        .unwrap();
+
+    stop.store(true, Ordering::Relaxed);
+    server.join().unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).ends_with("sealed\n"));
+}
+
+#[test]
+fn image_healthcheck_is_disabled_before_command_start() {
+    struct Fixture {
+        image: String,
+        context: std::path::PathBuf,
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = Command::new("podman")
+                .args(["image", "rm", "-f", &self.image])
+                .status();
+            let _ = std::fs::remove_dir_all(&self.context);
+        }
+    }
+
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let image = format!(
+        "localhost/reef-healthcheck-{}-{nonce}:test",
+        std::process::id()
+    );
+    let context = std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap())
+        .join(format!("reef-healthcheck-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&context).unwrap();
+    std::fs::write(
+        context.join("Containerfile"),
+        "FROM docker.io/library/alpine:3.22\nHEALTHCHECK --interval=1s CMD true\n",
+    )
+    .unwrap();
+
+    let fixture = Fixture { image, context };
+
+    let build = Command::new("podman")
+        .args([
+            "build",
+            "--format=docker",
+            "--pull=never",
+            "-t",
+            &fixture.image,
+        ])
+        .arg(&fixture.context)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let image_healthcheck = Command::new("podman")
+        .args([
+            "image",
+            "inspect",
+            "--format",
+            "{{json .Config.Healthcheck}}",
+            &fixture.image,
+        ])
+        .output()
+        .unwrap();
+    assert!(image_healthcheck.status.success());
+    assert_ne!(image_healthcheck.stdout, b"null\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner-probe",
+            "--image",
+            &fixture.image,
+            "--",
+            "sh",
+            "-c",
+            "sleep 2; echo healthcheck-disabled",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).ends_with("healthcheck-disabled\n"));
 }
 
 #[test]
