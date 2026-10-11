@@ -1461,6 +1461,13 @@ fn reject_unsafe_effective_config(state_dir: &Path, id: &str) -> io::Result<()> 
     inspect.args(["inspect", "--format", "{{json .HostConfig}}", id]);
     let output = bounded_output(&mut inspect, PODMAN_TIMEOUT, 16_384)?;
     let config: serde_json::Value = serde_json::from_slice(&output)?;
+    if !effective_config_is_safe(&config) {
+        return Err(io::Error::other("effective container isolation is unsafe"));
+    }
+    Ok(())
+}
+
+fn effective_config_is_safe(config: &serde_json::Value) -> bool {
     let is = |field: &str, expected: &str| config[field].as_str() == Some(expected);
     let empty = |field: &str| config[field].as_array().is_some_and(Vec::is_empty);
     let security = config["SecurityOpt"]
@@ -1492,29 +1499,30 @@ fn reject_unsafe_effective_config(state_dir: &Path, id: &str) -> io::Result<()> 
             .as_array()
             .is_some_and(|mappings| !mappings.is_empty())
     });
-    if !is("NetworkMode", "none")
-        || !is("PidMode", "private")
-        || !is("IpcMode", "private")
-        || !is("CgroupMode", "private")
-        || !is("UTSMode", "private")
-        || config["Annotations"]["io.podman.annotations.userns"] != "auto"
-        || !is("Cgroups", "default")
-        || config["RestartPolicy"]["Name"] != "no"
-        || !security
-        || !dropped
-        || !mappings
-        || !empty("CapAdd")
-        || !empty("Binds")
-        || !empty("Devices")
-        || config["Privileged"] != false
-        || config["ReadonlyRootfs"] != true
-        || config["LogConfig"]["Type"] != "none"
-        || config["Memory"].as_u64() != Some(536_870_912)
-        || config["PidsLimit"].as_u64() != Some(64)
-    {
-        return Err(io::Error::other("effective container isolation is unsafe"));
-    }
-    Ok(())
+    let one_cpu = matches!(
+        (config["CpuQuota"].as_u64(), config["CpuPeriod"].as_u64()),
+        (Some(quota), Some(period)) if period > 0 && quota == period
+    ) && config["NanoCpus"].as_u64() == Some(1_000_000_000);
+    is("NetworkMode", "none")
+        && is("PidMode", "private")
+        && is("IpcMode", "private")
+        && is("CgroupMode", "private")
+        && is("UTSMode", "private")
+        && config["Annotations"]["io.podman.annotations.userns"] == "auto"
+        && is("Cgroups", "default")
+        && config["RestartPolicy"]["Name"] == "no"
+        && security
+        && dropped
+        && mappings
+        && one_cpu
+        && empty("CapAdd")
+        && empty("Binds")
+        && empty("Devices")
+        && config["Privileged"] == false
+        && config["ReadonlyRootfs"] == true
+        && config["LogConfig"]["Type"] == "none"
+        && config["Memory"].as_u64() == Some(536_870_912)
+        && config["PidsLimit"].as_u64() == Some(64)
 }
 
 fn cleanup_until_absent(state_dir: &Path) {
@@ -1831,9 +1839,11 @@ fn validate_state_dir(state_dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PodmanStore, STORE_MAX_BYTES, await_snapshot_ready, ensure_podman_wait_succeeded,
-        parse_container_exit, parse_done, parse_io_stat, read_container_exit, read_podman_store,
+        PodmanStore, STORE_MAX_BYTES, await_snapshot_ready, effective_config_is_safe,
+        ensure_podman_wait_succeeded, parse_container_exit, parse_done, parse_io_stat,
+        read_container_exit, read_podman_store,
     };
+    use serde_json::json;
     use std::fs;
     use std::io::{BufReader, Write};
     use std::os::unix::net::UnixStream;
@@ -1844,6 +1854,55 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn unsafe_effective_container_settings_fail_closed() {
+        let safe = json!({
+            "NetworkMode": "none",
+            "PidMode": "private",
+            "IpcMode": "private",
+            "CgroupMode": "private",
+            "UTSMode": "private",
+            "Annotations": {"io.podman.annotations.userns": "auto"},
+            "Cgroups": "default",
+            "RestartPolicy": {"Name": "no"},
+            "SecurityOpt": ["no-new-privileges"],
+            "CapDrop": [
+                "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FOWNER", "CAP_FSETID",
+                "CAP_KILL", "CAP_NET_BIND_SERVICE", "CAP_SETFCAP", "CAP_SETGID",
+                "CAP_SETPCAP", "CAP_SETUID", "CAP_SYS_CHROOT"
+            ],
+            "IDMappings": {"UidMap": ["0:1:1024"], "GidMap": ["0:1:1024"]},
+            "CpuPeriod": 100_000,
+            "CpuQuota": 100_000,
+            "NanoCpus": 1_000_000_000,
+            "CapAdd": [],
+            "Binds": [],
+            "Devices": [],
+            "Privileged": false,
+            "ReadonlyRootfs": true,
+            "LogConfig": {"Type": "none"},
+            "Memory": 536_870_912,
+            "PidsLimit": 64
+        });
+        assert!(effective_config_is_safe(&safe));
+
+        let mut unsafe_config = safe.clone();
+        unsafe_config["CpuQuota"] = json!(0);
+        assert!(!effective_config_is_safe(&unsafe_config));
+
+        let mut unsafe_config = safe.clone();
+        unsafe_config["CapDrop"] = json!([]);
+        assert!(!effective_config_is_safe(&unsafe_config));
+
+        let mut unsafe_config = safe.clone();
+        unsafe_config["NetworkMode"] = json!("host");
+        assert!(!effective_config_is_safe(&unsafe_config));
+
+        let mut unsafe_config = safe;
+        unsafe_config["SecurityOpt"] = json!([]);
+        assert!(!effective_config_is_safe(&unsafe_config));
+    }
 
     #[test]
     fn snapshot_progress_keeps_owner_waiting_until_ready() {

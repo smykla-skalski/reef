@@ -27,8 +27,7 @@ fn contained_command_cannot_reach_host_control_planes() {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_listener = Arc::clone(&stop);
     let server = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while !stop_listener.load(Ordering::Relaxed) && Instant::now() < deadline {
+        while !stop_listener.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     stream
@@ -60,6 +59,7 @@ fn contained_command_cannot_reach_host_control_planes() {
                 test -z "${DBUS_SESSION_BUS_ADDRESS:-}"
                 test -z "${CONTAINER_HOST:-}"
                 test -z "${DOCKER_HOST:-}"
+                command -v wget >/dev/null
                 test "$(wc -l < /proc/net/route)" -eq 1
                 test "$(awk '/^CapEff:/ { print $2 }' /proc/self/status)" = 0000000000000000
                 test "$(awk '/^NoNewPrivs:/ { print $2 }' /proc/self/status)" = 1
