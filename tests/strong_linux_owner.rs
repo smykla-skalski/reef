@@ -1,6 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use std::io::{BufRead, BufReader};
+use std::os::unix::ffi::OsStringExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -81,6 +82,17 @@ fn assert_owner_state_gone(name: &str) {
         assert!(Instant::now() < deadline, "owner left runtime state behind");
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn assert_no_state_for_launcher(pid: u32) {
+    let prefix = format!("reef-strong-{pid}-");
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").unwrap();
+    let residue: Vec<_> = std::fs::read_dir(runtime)
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+        .collect();
+    assert!(residue.is_empty(), "probe left runtime state");
 }
 
 fn owner_pid(name: &str) -> i32 {
@@ -303,4 +315,53 @@ fn existing_owner_state_does_not_remove_a_name_collision() {
     assert!(still_exists.success(), "owner removed a name collision");
     assert!(removed.success());
     assert_owner_state_gone(&name);
+}
+
+#[test]
+fn failed_probe_removes_podman_created_cache_and_tombstone() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    for _ in 0..2 {
+        let image = format!("reef-test-image-missing-{}", std::process::id());
+        let child = Command::new(env!("CARGO_BIN_EXE_reef"))
+            .args(["strong-owner-probe", "--image", &image, "--", "true"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert!(!child.wait_with_output().unwrap().status.success());
+        assert_no_state_for_launcher(pid);
+    }
+}
+
+#[test]
+fn non_utf8_image_store_is_rejected_before_owner_start() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let child = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner-probe",
+            "--image",
+            "docker.io/library/alpine:3.22",
+            "--",
+            "true",
+        ])
+        .env(
+            "XDG_DATA_HOME",
+            std::ffi::OsString::from_vec(b"/tmp/reef-nonutf8-\xff".to_vec()),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("image store path must be UTF-8"));
+    assert_no_state_for_launcher(pid);
 }

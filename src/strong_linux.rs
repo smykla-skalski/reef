@@ -1,6 +1,7 @@
 //! Experimental Linux owner proof. Public strong mode remains fail-closed.
 
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -35,6 +36,9 @@ pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .ok_or_else(|| io::Error::other("XDG_RUNTIME_DIR is required"))?;
     let runtime = Path::new(&runtime);
+    if runtime.to_str().is_none() {
+        return Err(io::Error::other("user runtime path must be UTF-8"));
+    }
     let data_home = podman_data_home()?;
     let metadata = fs::symlink_metadata(runtime)?;
     if !metadata.is_dir()
@@ -60,6 +64,10 @@ pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
     let executable = std::env::current_exe().inspect_err(|_| {
         cleanup_state_dir(&state_dir);
     })?;
+    let mut data_home_env = OsString::from("--setenv=XDG_DATA_HOME=");
+    data_home_env.push(data_home.as_os_str());
+    let mut runtime_env = OsString::from("--setenv=XDG_RUNTIME_DIR=");
+    runtime_env.push(runtime.as_os_str());
     let output = Command::new("systemd-run")
         .args([
             "--user",
@@ -72,8 +80,8 @@ pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
             "--property=TimeoutStopSec=2s",
         ])
         .arg(format!("--unit={name}"))
-        .arg(format!("--setenv=XDG_DATA_HOME={}", data_home.display()))
-        .arg(format!("--setenv=XDG_RUNTIME_DIR={}", runtime.display()))
+        .arg(data_home_env)
+        .arg(runtime_env)
         .arg("--")
         .arg(executable)
         .arg("strong-owner")
@@ -227,17 +235,9 @@ fn cleanup_state_dir(state_dir: &Path) {
     if fs::rename(state_dir, &tombstone).is_err() {
         return;
     }
-    let _ = fs::remove_file(tombstone.join("attempted"));
-    let _ = fs::remove_file(tombstone.join("owner.sock"));
-    let home = tombstone.join("podman-home");
-    let config = home.join(".config/containers");
-    let _ = fs::remove_file(config.join("mounts.conf"));
-    let _ = fs::remove_file(config.join("containers.conf"));
-    let _ = fs::remove_dir(config);
-    let _ = fs::remove_dir(home.join(".config"));
-    let _ = fs::remove_dir(home);
-    let _ = fs::remove_dir(tombstone.join("hooks"));
-    let _ = fs::remove_dir(tombstone);
+    // Podman writes private cache entries beneath this task-owned tree. Do
+    // not assume the directory contains only the files Reef created.
+    let _ = fs::remove_dir_all(tombstone);
 }
 
 fn prepare_podman_home(state_dir: &Path) -> io::Result<()> {
@@ -469,6 +469,9 @@ fn podman_data_home() -> io::Result<std::path::PathBuf> {
     let data_home = std::path::PathBuf::from(data_home);
     if !data_home.is_absolute() {
         return Err(io::Error::other("Podman image store path must be absolute"));
+    }
+    if data_home.to_str().is_none() {
+        return Err(io::Error::other("Podman image store path must be UTF-8"));
     }
     Ok(data_home)
 }
