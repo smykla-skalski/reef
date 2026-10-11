@@ -21,7 +21,7 @@ webbrowser = "=1.2.4"
 [target.'cfg(unix)'.dependencies]
 blake3 = "1"
 nix = { version = "0.31.3", features = ["fs", "process", "signal", "term", "user"] }
-signal-hook = "=0.4.4"
+signal-hook = "=0.4.5"
 wait4 = "0.2.0"
 
 [lints.rust]
