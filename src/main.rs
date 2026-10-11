@@ -66,6 +66,9 @@ enum Command {
     /// Run a command and measure its resource cost.
     #[cfg(unix)]
     Run {
+        /// Require a verified command isolation boundary; never fall back to host execution.
+        #[arg(long, value_enum, default_value_t = Isolation::Host)]
+        isolation: Isolation,
         /// Workload category saved in the measurement record.
         #[arg(long, value_enum, default_value_t = Category::Other)]
         category: Category,
@@ -98,6 +101,9 @@ enum Command {
     /// Queue a command under the shared CPU and memory budget.
     #[cfg(unix)]
     Schedule {
+        /// Require a verified command isolation boundary; never fall back to host execution.
+        #[arg(long, value_enum, default_value_t = Isolation::Host)]
+        isolation: Isolation,
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         cpu: u32,
         #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u64).range(1..))]
@@ -303,6 +309,26 @@ enum Category {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum Isolation {
+    Host,
+    Strong,
+}
+
+#[cfg(unix)]
+impl Isolation {
+    fn preflight(self) -> std::io::Result<()> {
+        match self {
+            Self::Host => Ok(()),
+            Self::Strong => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "strong isolation is not available; command was not started",
+            )),
+        }
+    }
+}
+
+#[cfg(unix)]
 impl Category {
     fn as_str(self) -> &'static str {
         match self {
@@ -420,17 +446,20 @@ fn main() -> std::process::ExitCode {
         Command::Agents { command } => agent_command(command),
         #[cfg(unix)]
         Command::Run {
+            isolation,
             category,
             identity,
             record,
             no_record,
             command,
-        } => command_result(run::run(
-            &command,
-            category.as_str(),
-            &identity,
-            record_mode(record.as_deref(), no_record),
-        )),
+        } => command_result(isolation.preflight().and_then(|()| {
+            run::run(
+                &command,
+                category.as_str(),
+                &identity,
+                record_mode(record.as_deref(), no_record),
+            )
+        })),
         #[cfg(unix)]
         Command::Serve {
             cpu,
@@ -447,6 +476,7 @@ fn main() -> std::process::ExitCode {
         )),
         #[cfg(unix)]
         Command::Schedule {
+            isolation,
             cpu,
             memory_mib,
             category,
@@ -456,15 +486,17 @@ fn main() -> std::process::ExitCode {
             state_dir,
             limits,
             command,
-        } => command_result(schedule::schedule(schedule::RunOptions {
-            command: &command,
-            category: category.as_str(),
-            identity: &identity,
-            record: record_mode(record.as_deref(), no_record),
-            cpu,
-            memory_mib,
-            state_dir: state_dir.as_deref(),
-            limits: &limits,
+        } => command_result(isolation.preflight().and_then(|()| {
+            schedule::schedule(schedule::RunOptions {
+                command: &command,
+                category: category.as_str(),
+                identity: &identity,
+                record: record_mode(record.as_deref(), no_record),
+                cpu,
+                memory_mib,
+                state_dir: state_dir.as_deref(),
+                limits: &limits,
+            })
         })),
         #[cfg(unix)]
         Command::Queue { state_dir } => result(schedule::queue(state_dir.as_deref())),
