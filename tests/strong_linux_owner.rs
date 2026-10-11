@@ -338,6 +338,64 @@ fn failed_probe_removes_podman_created_cache_and_tombstone() {
 }
 
 #[test]
+fn probe_uses_the_launchers_selected_storage_configuration() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").unwrap();
+    let fixture = std::path::Path::new(&runtime)
+        .join(format!("reef-storage-selector-test-{}", std::process::id()));
+    std::fs::create_dir(&fixture).unwrap();
+    let store = fixture.join("image-store");
+    let config = fixture.join("storage.conf");
+    std::fs::write(
+        &config,
+        format!(
+            "[storage]\ndriver = \"overlay\"\nrootless_storage_path = \"{}\"\n",
+            store.display()
+        ),
+    )
+    .unwrap();
+
+    let info = Command::new("podman")
+        .env("CONTAINERS_STORAGE_CONF", &config)
+        .args(["info", "--format", "{{.Store.GraphRoot}}"])
+        .output()
+        .unwrap();
+    assert!(
+        info.status.success(),
+        "Podman rejected the test storage config"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&info.stdout).trim(),
+        store.to_str().unwrap()
+    );
+
+    let child = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner-probe",
+            "--image",
+            "docker.io/library/alpine:3.22",
+            "--",
+            "true",
+        ])
+        .env("CONTAINERS_STORAGE_CONF", &config)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "probe used an image outside the selected store"
+    );
+    assert_no_state_for_launcher(pid);
+    std::fs::remove_dir_all(&fixture).unwrap();
+}
+
+#[test]
 fn non_utf8_image_store_is_rejected_before_owner_start() {
     if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
         return;

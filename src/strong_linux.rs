@@ -32,10 +32,10 @@ struct PodmanStore {
     run_root: std::path::PathBuf,
     #[serde(rename = "graphDriverName")]
     driver: String,
+    #[serde(rename = "graphOptions", default)]
+    graph_options: serde_json::Value,
     #[serde(rename = "configFile", default)]
     config_file: std::path::PathBuf,
-    #[serde(default)]
-    explicit_roots: bool,
 }
 
 pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
@@ -292,8 +292,7 @@ fn pin_podman_store(state_dir: &Path) -> io::Result<()> {
     // Query with the launcher's real HOME before Podman is given its private
     // HOME. A system storage.conf may expand $HOME in rootless_storage_path.
     let mut info = Command::new("podman");
-    info.env_remove("CONTAINERS_STORAGE_CONF")
-        .env_remove("STORAGE_DRIVER")
+    info.env_remove("STORAGE_DRIVER")
         .env_remove("STORAGE_OPTS")
         .env_remove("CONTAINER_HOST")
         .env_remove("CONTAINER_CONNECTION")
@@ -307,9 +306,15 @@ fn pin_podman_store(state_dir: &Path) -> io::Result<()> {
     private_info.args(["info", "--format", "{{json .Store}}"]);
     let private_output = bounded_output(&mut private_info, PODMAN_TIMEOUT, 65_536)?;
     let private_store: PodmanStore = serde_json::from_slice(&private_output)?;
-    store.explicit_roots = private_store.graph_root != store.graph_root
+    if private_store.graph_root != store.graph_root
         || private_store.run_root != store.run_root
-        || private_store.driver != store.driver;
+        || private_store.driver != store.driver
+        || private_store.graph_options != store.graph_options
+    {
+        return Err(io::Error::other(
+            "private Podman storage differs from the launcher store",
+        ));
+    }
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -660,12 +665,6 @@ fn podman_status(state_dir: &Path, args: &[&str]) -> io::Result<ExitStatus> {
 fn podman_command(state_dir: &Path) -> io::Result<Command> {
     let store = read_podman_store(state_dir)?;
     let mut command = private_podman_command(state_dir, &store)?;
-    if store.explicit_roots {
-        command
-            .arg(format!("--root={}", store.graph_root.display()))
-            .arg(format!("--runroot={}", store.run_root.display()))
-            .arg(format!("--storage-driver={}", store.driver));
-    }
     command.arg(format!("--hooks-dir={}", state_dir.join("hooks").display()));
     Ok(command)
 }
