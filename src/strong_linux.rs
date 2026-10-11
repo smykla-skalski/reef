@@ -76,7 +76,10 @@ pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
         .read(true)
         .write(true)
         .create_new(true)
-        .open(state_dir.join("owner.lock"))?;
+        .open(state_dir.join("owner.lock"))
+        .inspect_err(|_| {
+            let _ = cleanup_state_dir(&state_dir);
+        })?;
     prepare_podman_home(&state_dir).inspect_err(|_| {
         let _ = cleanup_state_dir(&state_dir);
     })?;
@@ -540,9 +543,18 @@ fn run_owner(
                 ) => {}
             Err(error) => return Err(error),
         }
-        if waiter.try_wait()?.is_some() {
+        if let Some(status) = waiter.try_wait()? {
+            ensure_podman_wait_succeeded(status)?;
             return Ok(stream);
         }
+    }
+}
+
+fn ensure_podman_wait_succeeded(status: ExitStatus) -> io::Result<()> {
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("podman wait failed"))
     }
 }
 
@@ -937,9 +949,11 @@ fn validate_state_dir(state_dir: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PodmanStore, STORE_MAX_BYTES, read_podman_store};
+    use super::{PodmanStore, STORE_MAX_BYTES, ensure_podman_wait_succeeded, read_podman_store};
     use std::fs;
+    use std::os::unix::process::ExitStatusExt;
     use std::path::PathBuf;
+    use std::process::ExitStatus;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -964,5 +978,11 @@ mod tests {
         let loaded = read_podman_store(&state).unwrap();
         assert_eq!(loaded.graph_options, store.graph_options);
         fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn failed_podman_wait_is_not_command_completion() {
+        assert!(ensure_podman_wait_succeeded(ExitStatus::from_raw(0)).is_ok());
+        assert!(ensure_podman_wait_succeeded(ExitStatus::from_raw(256)).is_err());
     }
 }
