@@ -411,6 +411,12 @@ fn recovery_does_not_remove_a_replacement_with_the_same_name_and_label() {
     );
     let replacement_id = create();
     std::fs::write(state_dir.join("owned.id"), original_id).unwrap();
+    let store = Command::new("podman")
+        .args(["info", "--format", "{{json .Store}}"])
+        .output()
+        .unwrap();
+    assert!(store.status.success());
+    std::fs::write(state_dir.join("podman-store.json"), store.stdout).unwrap();
 
     let owner = Command::new(env!("CARGO_BIN_EXE_reef"))
         .args([
@@ -470,4 +476,71 @@ fn recovery_removes_a_tombstone_after_the_original_state_is_gone() {
 
     assert!(owner.success());
     assert!(!tombstone.exists(), "recovery left its tombstone");
+}
+
+#[test]
+fn recovery_finds_its_container_before_podman_writes_the_cid_file() {
+    if std::env::var_os("REEF_STRONG_LINUX_NATIVE_TEST").is_none() {
+        return;
+    }
+
+    let name = format!("reef-strong-cid-gap-{}", std::process::id());
+    let token = "1234567890abcdef1234567890abcdef";
+    let state_dir = std::path::Path::new(&std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join(&name);
+    let config = state_dir.join("podman-home/.config/containers");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::set_permissions(
+        &state_dir,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    std::fs::create_dir(state_dir.join("hooks")).unwrap();
+    std::fs::File::create(config.join("mounts.conf")).unwrap();
+    std::fs::File::create(config.join("containers.conf")).unwrap();
+    std::fs::File::create(state_dir.join("attempted")).unwrap();
+    std::fs::write(state_dir.join("owner.token"), token).unwrap();
+    let store = Command::new("podman")
+        .args(["info", "--format", "{{json .Store}}"])
+        .output()
+        .unwrap();
+    assert!(store.status.success());
+    std::fs::write(state_dir.join("podman-store.json"), store.stdout).unwrap();
+
+    let created = Command::new("podman")
+        .args([
+            "create",
+            "--pull=never",
+            &format!("--name={name}"),
+            &format!("--label=io.reef.owner={name}"),
+            &format!("--label=io.reef.token={token}"),
+            "docker.io/library/alpine:3.22",
+            "true",
+        ])
+        .status()
+        .unwrap();
+    assert!(created.success());
+    assert!(!state_dir.join("container.cid").exists());
+
+    let owner = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args([
+            "strong-owner",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--name",
+            &name,
+        ])
+        .status()
+        .unwrap();
+    let exists = Command::new("podman")
+        .args(["container", "exists", &name])
+        .status()
+        .unwrap();
+
+    assert!(owner.success());
+    assert_eq!(
+        exists.code(),
+        Some(1),
+        "CID-gap container survived recovery"
+    );
+    assert_owner_state_gone(&name);
 }

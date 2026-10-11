@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
-use std::fs::{self, DirBuilder, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -16,11 +16,22 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const START_TIMEOUT: Duration = Duration::from_secs(90);
 const PODMAN_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const HEX: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Deserialize, Serialize)]
 struct Start {
     image: String,
     command: Vec<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct PodmanStore {
+    #[serde(rename = "graphRoot")]
+    graph_root: std::path::PathBuf,
+    #[serde(rename = "runRoot")]
+    run_root: std::path::PathBuf,
+    #[serde(rename = "graphDriverName")]
+    driver: String,
 }
 
 pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
@@ -55,6 +66,12 @@ pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
     let state_dir = runtime.join(&name);
     DirBuilder::new().mode(0o700).create(&state_dir)?;
     prepare_podman_home(&state_dir).inspect_err(|_| {
+        let _ = cleanup_state_dir(&state_dir);
+    })?;
+    pin_podman_store(&state_dir).inspect_err(|_| {
+        let _ = cleanup_state_dir(&state_dir);
+    })?;
+    write_owner_token(&state_dir).inspect_err(|_| {
         let _ = cleanup_state_dir(&state_dir);
     })?;
     let listener = UnixListener::bind(state_dir.join("owner.sock")).inspect_err(|_| {
@@ -267,6 +284,83 @@ fn prepare_podman_home(state_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn pin_podman_store(state_dir: &Path) -> io::Result<()> {
+    // Query with the launcher's real HOME before Podman is given its private
+    // HOME. A system storage.conf may expand $HOME in rootless_storage_path.
+    let mut info = Command::new("podman");
+    info.env_remove("CONTAINERS_STORAGE_CONF")
+        .env_remove("STORAGE_DRIVER")
+        .env_remove("STORAGE_OPTS")
+        .env_remove("CONTAINER_HOST")
+        .env_remove("CONTAINER_CONNECTION")
+        .arg("--remote=false")
+        .args(["info", "--format", "{{json .Store}}"]);
+    let output = bounded_output(&mut info, PODMAN_TIMEOUT, 65_536)?;
+    let store: PodmanStore = serde_json::from_slice(&output)?;
+    validate_store(&store)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(state_dir.join("podman-store.json"))?;
+    serde_json::to_writer(&mut file, &store)?;
+    file.sync_all()
+}
+
+fn validate_store(store: &PodmanStore) -> io::Result<()> {
+    if !store.graph_root.is_absolute()
+        || !store.run_root.is_absolute()
+        || store.driver.is_empty()
+        || !store
+            .driver
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(io::Error::other("invalid Podman storage configuration"));
+    }
+    Ok(())
+}
+
+fn read_podman_store(state_dir: &Path) -> io::Result<PodmanStore> {
+    let bytes = fs::read(state_dir.join("podman-store.json"))?;
+    if bytes.len() > 4096 {
+        return Err(io::Error::other(
+            "Podman storage configuration is too large",
+        ));
+    }
+    let store: PodmanStore = serde_json::from_slice(&bytes)?;
+    validate_store(&store)?;
+    Ok(store)
+}
+
+fn write_owner_token(state_dir: &Path) -> io::Result<()> {
+    let mut bytes = [0_u8; 16];
+    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let mut token = String::with_capacity(32);
+    for byte in bytes {
+        token.push(HEX[(byte >> 4) as usize] as char);
+        token.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(state_dir.join("owner.token"))?;
+    file.write_all(token.as_bytes())?;
+    file.sync_all()
+}
+
+fn read_owner_token(state_dir: &Path) -> io::Result<Option<String>> {
+    let bytes = match fs::read(state_dir.join("owner.token")) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let token = std::str::from_utf8(&bytes).map_err(io::Error::other)?;
+    if token.len() != 32 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::other("invalid owner token"));
+    }
+    Ok(Some(token.to_owned()))
+}
+
 fn run_owner(state_dir: &Path, name: &str, stopping: &AtomicBool) -> io::Result<UnixStream> {
     ensure_active(stopping)?;
     let mut stream = UnixStream::connect(state_dir.join("owner.sock"))?;
@@ -291,6 +385,8 @@ fn run_owner(state_dir: &Path, name: &str, stopping: &AtomicBool) -> io::Result<
         return Err(io::Error::other("container image is not available locally"));
     }
     ensure_active(stopping)?;
+    let token =
+        read_owner_token(state_dir)?.ok_or_else(|| io::Error::other("missing owner token"))?;
 
     let mut create = podman_command(state_dir)?;
     create.args([
@@ -316,6 +412,7 @@ fn run_owner(state_dir: &Path, name: &str, stopping: &AtomicBool) -> io::Result<
     create
         .arg(format!("--name={name}"))
         .arg(format!("--label=io.reef.owner={name}"))
+        .arg(format!("--label=io.reef.token={token}"))
         .arg(format!(
             "--cidfile={}",
             state_dir.join("container.cid").display()
@@ -328,7 +425,7 @@ fn run_owner(state_dir: &Path, name: &str, stopping: &AtomicBool) -> io::Result<
     ensure_active(stopping)?;
     let id = read_container_id(state_dir)?
         .ok_or_else(|| io::Error::other("podman did not record the created container ID"))?;
-    verify_container_label(state_dir, &id, name)?;
+    verify_container_label(state_dir, &id, name, &token)?;
     persist_container_id(state_dir, &id)?;
     reject_effective_mounts(state_dir, &id)?;
     ensure_active(stopping)?;
@@ -390,8 +487,11 @@ fn reject_effective_mounts(state_dir: &Path, id: &str) -> io::Result<()> {
 }
 
 fn cleanup_until_absent(state_dir: &Path) {
+    let Some(name) = state_dir.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
     let id = loop {
-        match read_container_id(state_dir) {
+        match recover_container_id(state_dir, name) {
             Ok(Some(id)) => break id,
             Ok(None) => return,
             Err(_) => thread::sleep(Duration::from_secs(1)),
@@ -416,20 +516,56 @@ fn cleanup_until_absent(state_dir: &Path) {
     }
 }
 
-fn verify_container_label(state_dir: &Path, id: &str, name: &str) -> io::Result<()> {
+fn verify_container_label(state_dir: &Path, id: &str, name: &str, token: &str) -> io::Result<()> {
     let mut inspect = podman_command(state_dir)?;
     inspect.args([
         "container",
         "inspect",
         "--format",
-        "{{index .Config.Labels \"io.reef.owner\"}}",
+        "{{index .Config.Labels \"io.reef.owner\"}}|{{index .Config.Labels \"io.reef.token\"}}",
         id,
     ]);
     let output = bounded_output(&mut inspect, PODMAN_TIMEOUT, 128)?;
-    if output != format!("{name}\n").as_bytes() {
+    if output != format!("{name}|{token}\n").as_bytes() {
         return Err(io::Error::other("created container is not owned by Reef"));
     }
     Ok(())
+}
+
+fn recover_container_id(state_dir: &Path, name: &str) -> io::Result<Option<String>> {
+    if let Some(id) = read_container_id(state_dir)? {
+        return Ok(Some(id));
+    }
+    let Some(token) = read_owner_token(state_dir)? else {
+        return Ok(None);
+    };
+    let exists = podman_status(state_dir, &["container", "exists", name])?;
+    if exists.code() == Some(1) {
+        return Ok(None);
+    }
+    if !exists.success() {
+        return Err(io::Error::other("cannot verify container existence"));
+    }
+    let mut inspect = podman_command(state_dir)?;
+    inspect.args([
+        "container",
+        "inspect",
+        "--format",
+        "{{.Id}}|{{index .Config.Labels \"io.reef.owner\"}}|{{index .Config.Labels \"io.reef.token\"}}",
+        name,
+    ]);
+    let output = bounded_output(&mut inspect, PODMAN_TIMEOUT, 256)?;
+    let output = std::str::from_utf8(&output).map_err(io::Error::other)?;
+    let expected_suffix = format!("|{name}|{token}");
+    let output = output.trim_end();
+    let Some(id) = output.strip_suffix(&expected_suffix) else {
+        return Ok(None);
+    };
+    if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::other("invalid recovered container ID"));
+    }
+    persist_container_id(state_dir, id)?;
+    Ok(Some(id.to_owned()))
 }
 
 fn read_container_id(state_dir: &Path) -> io::Result<Option<String>> {
@@ -452,6 +588,10 @@ fn read_container_id(state_dir: &Path) -> io::Result<Option<String>> {
 
 fn persist_container_id(state_dir: &Path, id: &str) -> io::Result<()> {
     let pending = state_dir.join("owned.id.pending");
+    if pending.exists() {
+        // Recovery may find a partial write from the previous owner.
+        fs::remove_file(&pending)?;
+    }
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -469,6 +609,7 @@ fn podman_status(state_dir: &Path, args: &[&str]) -> io::Result<ExitStatus> {
 
 fn podman_command(state_dir: &Path) -> io::Result<Command> {
     let data_home = podman_data_home()?;
+    let store = read_podman_store(state_dir)?;
     let home = state_dir.join("podman-home");
     let runtime = state_dir
         .parent()
@@ -490,6 +631,9 @@ fn podman_command(state_dir: &Path) -> io::Result<Command> {
         .env_remove("CONTAINER_HOST")
         .env_remove("CONTAINER_CONNECTION")
         .arg("--remote=false")
+        .arg(format!("--root={}", store.graph_root.display()))
+        .arg(format!("--runroot={}", store.run_root.display()))
+        .arg(format!("--storage-driver={}", store.driver))
         .arg(format!("--hooks-dir={}", state_dir.join("hooks").display()));
     Ok(command)
 }
