@@ -18,6 +18,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(90);
 const PODMAN_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const OWNER_LOCK_TIMEOUT: Duration = Duration::from_secs(90);
+const STORE_MAX_BYTES: usize = 65_536;
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Deserialize, Serialize)]
@@ -131,7 +132,7 @@ pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
 
     let outcome = probe_connected(&listener, image, command, &name);
     if outcome.is_err() {
-        mark_cancelled(&state_dir)?;
+        let cancellation = mark_cancelled(&state_dir);
         // The launcher is still alive here. If the service was explicitly
         // stopped, systemd will not restart it. Stop any remaining owner
         // first. The lock also covers an in-flight Podman create/start when
@@ -140,6 +141,7 @@ pub fn probe(image: &str, command: &[String]) -> io::Result<u8> {
         let _lock = lock_state_until(&state_dir, OWNER_LOCK_TIMEOUT)?;
         cleanup_until_absent(&state_dir);
         cleanup_state_dir(&state_dir)?;
+        cancellation?;
     }
     outcome
 }
@@ -375,11 +377,15 @@ fn pin_podman_store(state_dir: &Path) -> io::Result<()> {
             "private Podman storage differs from the launcher store",
         ));
     }
+    let bytes = serde_json::to_vec(&store)?;
+    if bytes.len() > STORE_MAX_BYTES {
+        return Err(io::Error::other("Podman storage state is too large"));
+    }
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(state_dir.join("podman-store.json"))?;
-    serde_json::to_writer(&mut file, &store)?;
+    file.write_all(&bytes)?;
     file.sync_all()
 }
 
@@ -444,7 +450,7 @@ fn validate_store(store: &PodmanStore) -> io::Result<()> {
 
 fn read_podman_store(state_dir: &Path) -> io::Result<PodmanStore> {
     let bytes = fs::read(state_dir.join("podman-store.json"))?;
-    if bytes.len() > 4096 {
+    if bytes.len() > STORE_MAX_BYTES {
         return Err(io::Error::other(
             "Podman storage configuration is too large",
         ));
@@ -927,4 +933,36 @@ fn validate_state_dir(state_dir: &Path) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PodmanStore, STORE_MAX_BYTES, read_podman_store};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn owner_reads_a_valid_store_larger_than_four_kib() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state =
+            std::env::temp_dir().join(format!("reef-store-test-{}-{nonce}", std::process::id()));
+        fs::create_dir(&state).unwrap();
+        let store = PodmanStore {
+            graph_root: PathBuf::from("/tmp/reef-graph"),
+            run_root: PathBuf::from("/tmp/reef-run"),
+            driver: "overlay".to_owned(),
+            graph_options: serde_json::json!({"overlay.imagestore": "a".repeat(5000)}),
+            config_file: PathBuf::new(),
+        };
+        let bytes = serde_json::to_vec(&store).unwrap();
+        assert!(bytes.len() > 4096 && bytes.len() <= STORE_MAX_BYTES);
+        fs::write(state.join("podman-store.json"), bytes).unwrap();
+        let loaded = read_podman_store(&state).unwrap();
+        assert_eq!(loaded.graph_options, store.graph_options);
+        fs::remove_dir_all(&state).unwrap();
+    }
 }
