@@ -49,6 +49,7 @@ reef serve --cpu 6 --memory-mib 12288 --max-running 4
 ```
 
 The scheduler runs in the foreground. Without explicit limits its static budget reserves one logical CPU and 30% of physical memory for other work; `--max-running` defaults to the CPU budget. Its private Unix socket lives in `~/.local/state/reef/schedule/reef.sock`. Only one server can bind that path. Use `--state-dir` on every command to select another private directory.
+Use `reef schedule --max-wait-ms <milliseconds> -- command` to bound time spent waiting for admission. The scheduler removes an expired request before replying; the command is not started or retried. This is a pre-admission control, not a deadline for a running command. The option does not enable the selective canary or strong isolation.
 
 Queue a measured command with its estimated peak resource cost:
 

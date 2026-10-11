@@ -804,6 +804,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "signal-hook",
+ "socket2",
  "sysinfo",
  "wait4",
  "webbrowser",

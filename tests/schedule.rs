@@ -2,8 +2,9 @@
 
 use serde_json::Value;
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -431,6 +432,83 @@ fn shared_budget_queues_exposes_and_cancels_a_request() {
     Fixture::wait_until(|| fixture.jobs().is_empty());
     let third = fixture.schedule(&["sh", "-c", "exit 7"]).output().unwrap();
     assert_eq!(third.status.code(), Some(7));
+}
+
+#[test]
+fn pre_admission_deadline_removes_queue_without_starting_command() {
+    let fixture = Fixture::new();
+    let ready = fixture.path.join("first-started");
+    let second = fixture.path.join("second-started");
+    let mut first = fixture
+        .schedule(&["sh", "-c", "touch \"$REEF_READY\"; sleep 30"])
+        .env("REEF_READY", &ready)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    Fixture::wait_until(|| ready.exists());
+    let output = reef()
+        .args(["schedule", "--max-wait-ms", "120", "--state-dir"])
+        .arg(&fixture.path)
+        .args(["--", "sh", "-c", "touch \"$REEF_SECOND\""])
+        .env("REEF_SECOND", &second)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("pre-admission wait expired"),
+        "{output:?}"
+    );
+    assert!(!second.exists());
+    Fixture::wait_until(|| fixture.jobs().len() == 1);
+    assert!(has_job(&fixture.jobs(), "running"));
+    first.kill().unwrap();
+    first.wait().unwrap();
+    Fixture::wait_until(|| fixture.jobs().is_empty());
+}
+
+#[test]
+fn delayed_scheduler_replies_cannot_start_after_client_deadline() {
+    for delay_queued in [true, false] {
+        let path = std::env::temp_dir().join(format!(
+            "reef-deadline-reply-test-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let listener = UnixListener::bind(path.join("reef.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(&stream).read_line(&mut request).unwrap();
+            assert!(request.contains("\"op\":\"acquire\""));
+            if delay_queued {
+                std::thread::sleep(Duration::from_millis(800));
+            }
+            let _ = stream
+                .write_all(b"{\"kind\":\"queued\",\"id\":1,\"position\":1,\"reason\":\"test\"}\n");
+            if !delay_queued {
+                std::thread::sleep(Duration::from_millis(800));
+                let _ = stream.write_all(b"{\"kind\":\"granted\",\"id\":1}\n");
+            }
+        });
+        let marker = path.join("started");
+        let started = Instant::now();
+        let output = reef()
+            .args(["schedule", "--max-wait-ms", "50", "--state-dir"])
+            .arg(&path)
+            .args(["--", "sh", "-c", "touch \"$REEF_MARKER\""])
+            .env("REEF_MARKER", &marker)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(started.elapsed() < Duration::from_millis(600), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("pre-admission wait expired"));
+        assert!(!marker.exists());
+        server.join().unwrap();
+        fs::remove_dir_all(path).unwrap();
+    }
 }
 
 #[test]

@@ -218,22 +218,27 @@ pub fn submit(options: &Options) -> io::Result<u8> {
             return Ok(130);
         }
         if policy.local_fallback {
-            eprintln!("reef: requesting fresh local scheduler admission");
-            let limits = crate::contain::Limits::default();
-            return schedule::schedule(schedule::RunOptions {
-                command: &options.command,
-                category: &options.category,
-                identity: &options.identity,
-                record: RecordMode::Default,
-                cpu: options.cpu,
-                memory_mib: options.memory_mib,
-                state_dir: options.state_dir.as_deref(),
-                limits: &limits,
-            });
+            return local_fallback(options);
         }
         return Err(error);
     }
     execute_remote(&policy, &job)
+}
+
+fn local_fallback(options: &Options) -> io::Result<u8> {
+    eprintln!("reef: requesting fresh local scheduler admission");
+    let limits = crate::contain::Limits::default();
+    schedule::schedule(schedule::RunOptions {
+        command: &options.command,
+        category: &options.category,
+        identity: &options.identity,
+        record: RecordMode::Default,
+        cpu: options.cpu,
+        memory_mib: options.memory_mib,
+        state_dir: options.state_dir.as_deref(),
+        max_wait: None,
+        limits: &limits,
+    })
 }
 
 fn execute_remote(policy: &Policy, job: &str) -> io::Result<u8> {
