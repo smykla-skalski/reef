@@ -898,7 +898,10 @@ fn enforce_budget(
         status.cap_unmet = false;
     }
     if previous.as_ref() != Some(&status)
-        && (status.early_compacted_files > 0 || status.evicted_files > 0 || status.cap_unmet)
+        && (previous.is_some()
+            || status.early_compacted_files > 0
+            || status.evicted_files > 0
+            || status.cap_unmet)
     {
         write_status(dir, &status)?;
     }
@@ -1232,6 +1235,27 @@ mod tests {
 
         assert!(sources.iter().all(|source| source.exists()));
         assert!(read_status(&dir).unwrap().unwrap().cap_unmet);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn resolved_storage_pressure_clears_persisted_cap_warning() {
+        let dir = fixture();
+        write_status(
+            &dir,
+            &RetentionStatus {
+                last_early_eviction_unix_ms: 0,
+                evicted_files: 0,
+                last_early_compaction_unix_ms: 0,
+                early_compacted_files: 0,
+                cap_unmet: true,
+            },
+        )
+        .unwrap();
+
+        maintain(&dir, 20 * DAY_MS, policy()).unwrap();
+
+        assert!(!read_status(&dir).unwrap().unwrap().cap_unmet);
         fs::remove_dir_all(dir).unwrap();
     }
 
