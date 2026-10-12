@@ -28,11 +28,12 @@ pub fn shim_name() -> Option<String> {
 
 pub fn launch(
     agent: &str,
+    executable: Option<&Path>,
     state_dir: Option<&Path>,
     control_mode: bool,
     canary_percent: Option<u8>,
     max_wait_ms: u64,
-    args: &[String],
+    args: &[OsString],
 ) -> io::Result<u8> {
     // Agent shells can change directory or HOME; pin every path before launch.
     let (state_root, scheduler_dir) = if let Some(path) = state_dir {
@@ -58,7 +59,7 @@ pub fn launch(
     let original_path = env::var_os("REEF_AGENT_ORIGINAL_PATH")
         .or_else(|| env::var_os("PATH"))
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "PATH is not set"))?;
-    let agent_binary = find_binary(agent, &original_path)?;
+    let agent_binary = launch_binary(agent, executable, &original_path)?;
     let reef_binary = env::current_exe()?.canonicalize()?;
     let root = state_root.join("agent-shims");
     private_dir(&root)?;
@@ -130,6 +131,21 @@ pub fn launch(
     }
     process.env("REEF_AGENT_STATE_DIR", scheduler_dir);
     Err(process.exec())
+}
+
+fn launch_binary(
+    agent: &str,
+    executable: Option<&Path>,
+    original_path: &OsStr,
+) -> io::Result<PathBuf> {
+    match executable {
+        Some(path) if path.is_absolute() => Ok(path.to_path_buf()),
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "agent executable override must be absolute",
+        )),
+        None => find_binary(agent, original_path),
+    }
 }
 
 pub fn shim(tool: &str) -> io::Result<u8> {

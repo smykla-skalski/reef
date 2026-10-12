@@ -84,6 +84,16 @@ impl Fixture {
     }
 
     fn launch_canary(&self, agent: &str, percent: u8, args: &[&str]) -> Command {
+        self.launch_canary_with_exec(agent, percent, None, args)
+    }
+
+    fn launch_canary_with_exec(
+        &self,
+        agent: &str,
+        percent: u8,
+        executable: Option<&Path>,
+        args: &[&str],
+    ) -> Command {
         let mut replacement = reef();
         let path = std::env::join_paths(
             std::iter::once(self.path.join("bin"))
@@ -94,7 +104,11 @@ impl Fixture {
             .args(["agents", "launch", agent, "--state-dir"])
             .arg(&self.path)
             .arg("--canary-percent")
-            .arg(percent.to_string())
+            .arg(percent.to_string());
+        if let Some(executable) = executable {
+            replacement.arg("--exec").arg(executable);
+        }
+        replacement
             .arg("--")
             .args(args)
             .env("PATH", path)
@@ -416,6 +430,42 @@ fn canary_hundred_percent_queues_and_measures_treatment() {
             .unwrap()
             .contains("private-argument")
     );
+}
+
+#[test]
+fn canary_launches_explicit_adapter_without_agent_cli() {
+    for agent in ["codex", "claude", "opencode"] {
+        let fixture = Fixture::new(true);
+        fs::remove_file(fixture.path.join("bin").join(agent)).unwrap();
+        let adapter = fixture.path.join("bin/acp-adapter");
+        write_script(
+            &adapter,
+            "#!/bin/sh\nprintf 'adapter:%s\\n' \"$REEF_AGENT_KIND\"\nexec \"$@\"\n",
+        );
+        let output = fixture
+            .launch_canary_with_exec(agent, 100, Some(&adapter), &["go", "test"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(7), "{output:?}");
+        assert_eq!(output.stdout, format!("adapter:{agent}\n").as_bytes());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("queued request"));
+        let report = fixture.control_report();
+        assert_eq!(report["control"]["groups"][0]["agent"], agent);
+        assert_eq!(report["control"]["groups"][0]["arm"], "treatment");
+        assert_eq!(report["control"]["groups"][0]["measured"], 1);
+    }
+}
+
+#[test]
+fn canary_rejects_relative_adapter_path_before_launch() {
+    let fixture = Fixture::new(false);
+    let output = fixture
+        .launch_canary_with_exec("codex", 100, Some(Path::new("bin/codex")), &["go", "test"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("override must be absolute"));
+    assert!(!fixture.path.join("output").exists());
 }
 
 #[test]
