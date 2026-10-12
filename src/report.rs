@@ -3,6 +3,7 @@ use crate::cache_impact;
 #[cfg(unix)]
 use crate::control;
 use crate::history;
+use crate::retention;
 use crate::schedule_events;
 use chrono::{DateTime, Duration, Utc};
 use clap::ValueEnum;
@@ -83,15 +84,77 @@ fn parse_date(value: &str) -> Result<DateTime<Utc>, String> {
 pub(crate) struct Observation {
     pub(crate) at_unix_ms: u64,
     pub(crate) working_ms: u64,
+    #[serde(default)]
+    pub(crate) resolution_ms: u64,
+    #[serde(default)]
+    source_samples: u64,
     pub(crate) cpu_percent: Option<f64>,
+    #[serde(default)]
+    peak_cpu_percent: Option<f64>,
     pub(crate) memory_used_bytes: Option<u64>,
+    #[serde(default)]
+    peak_memory_used_bytes: Option<u64>,
     pub(crate) memory_total_bytes: Option<u64>,
     swap_used_bytes: Option<u64>,
     swap_total_bytes: Option<u64>,
     root_disk_available_bytes: Option<u64>,
+    #[serde(default)]
+    minimum_root_disk_available_bytes: Option<u64>,
     root_disk_total_bytes: Option<u64>,
     pub(crate) agents: Option<Vec<AgentSample>>,
     memory_consumers: Option<Vec<MemoryConsumerSample>>,
+    #[serde(skip)]
+    source_pid: Option<u32>,
+}
+
+impl Observation {
+    fn from_rollup(rollup: retention::HostSummary) -> Self {
+        let end_unix_ms = rollup.end_unix_ms();
+        let memory_consumers = rollup
+            .memory_consumers
+            .into_iter()
+            .map(|(family, summary)| MemoryConsumerSample {
+                family,
+                process_count: usize::try_from(summary.process_count.peak().unwrap_or_default())
+                    .unwrap_or(usize::MAX),
+                rss_bytes: summary.rss_bytes.mean().unwrap_or_default(),
+                observed_working_ms: Some(summary.rss_bytes.weight_ms()),
+                peak_rss_bytes: summary.rss_bytes.peak(),
+                largest_process_rss_bytes: summary.peak_largest_process_rss_bytes,
+            })
+            .collect();
+        Self {
+            at_unix_ms: end_unix_ms,
+            working_ms: rollup.observed_working_ms,
+            resolution_ms: rollup.resolution_ms,
+            source_samples: rollup.source_samples,
+            cpu_percent: rollup.cpu_percent.mean(),
+            peak_cpu_percent: rollup.cpu_percent.peak(),
+            memory_used_bytes: rollup.memory_used_bytes.mean(),
+            peak_memory_used_bytes: rollup.memory_used_bytes.peak(),
+            memory_total_bytes: rollup.memory_total_bytes.mean(),
+            swap_used_bytes: rollup.swap_used_bytes.mean(),
+            swap_total_bytes: rollup.swap_total_bytes.mean(),
+            root_disk_available_bytes: rollup.root_disk_available_bytes.mean(),
+            minimum_root_disk_available_bytes: rollup.root_disk_available_bytes.minimum(),
+            root_disk_total_bytes: rollup.root_disk_total_bytes.mean(),
+            agents: None,
+            memory_consumers: Some(memory_consumers),
+            source_pid: None,
+        }
+    }
+
+    pub(crate) fn interval_start_unix_ms(&self) -> u64 {
+        self.at_unix_ms.saturating_sub(if self.resolution_ms == 0 {
+            self.working_ms
+        } else {
+            self.resolution_ms
+        })
+    }
+
+    fn source_samples(&self) -> u64 {
+        self.source_samples.max(1)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +162,10 @@ struct MemoryConsumerSample {
     family: String,
     process_count: usize,
     rss_bytes: u64,
+    #[serde(default)]
+    observed_working_ms: Option<u64>,
+    #[serde(default)]
+    peak_rss_bytes: Option<u64>,
     largest_process_rss_bytes: u64,
 }
 
@@ -132,6 +199,8 @@ struct AgentTick {
     working_ms: u64,
     agents: Vec<AgentSample>,
     commands: Option<Vec<PassiveCommandSample>>,
+    #[serde(skip)]
+    source_suffix: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,6 +231,8 @@ struct PassiveCommandRollup {
 #[derive(Debug, Deserialize)]
 struct AgentRollup {
     minute_unix_ms: u64,
+    #[serde(default = "minute_resolution")]
+    resolution_ms: u64,
     kind: String,
     active_samples: usize,
     observed_working_ms: u128,
@@ -173,6 +244,14 @@ struct AgentRollup {
     peak_processes: usize,
     peak_roots: usize,
     commands: Option<BTreeMap<String, PassiveCommandRollup>>,
+    #[serde(default)]
+    covered_minutes: BTreeSet<u16>,
+    #[serde(skip)]
+    source_suffix: String,
+}
+
+fn minute_resolution() -> u64 {
+    60_000
 }
 
 #[derive(Default)]
@@ -199,6 +278,9 @@ struct Report {
     to: String,
     empty: bool,
     observation_count: usize,
+    observation_resolutions: BTreeMap<String, u64>,
+    coarse_history_approximate: bool,
+    retention_status: Option<retention::RetentionStatus>,
     host_observations_with_agents: usize,
     agent_observation_count: usize,
     agent_rollup_count: usize,
@@ -208,6 +290,7 @@ struct Report {
     categories: Option<Vec<CategoryReport>>,
     agent_commands: Option<Vec<AgentCategoryReport>>,
     passive_commands: Option<Vec<PassiveCommandLoad>>,
+    peak_host_cpu_percent: Option<f64>,
     peak_host_memory_bytes: Option<u64>,
     peak_root_disk_used_percent: Option<f64>,
     swap_growth_bytes: Option<i128>,
@@ -426,10 +509,20 @@ pub(crate) fn observations(dir: &Path) -> io::Result<Vec<Observation>> {
     paths.sort();
     let mut samples: Vec<Observation> = Vec::new();
     for path in paths {
-        samples.extend(read_jsonl(&path)?);
+        let source_pid = segment_pid(&segment_suffix(&path, "samples-")?);
+        for mut sample in read_jsonl::<Observation>(&path)? {
+            sample.source_pid = source_pid;
+            samples.push(sample);
+        }
     }
     samples.sort_by_key(|sample| sample.at_unix_ms);
     samples.dedup_by_key(|sample| sample.at_unix_ms);
+    samples.extend(
+        retention::host_rollups(dir)?
+            .into_iter()
+            .map(Observation::from_rollup),
+    );
+    samples.sort_by_key(|sample| (sample.at_unix_ms, sample.resolution_ms));
     Ok(samples)
 }
 
@@ -455,7 +548,11 @@ fn agent_ticks(dir: &Path) -> io::Result<Vec<AgentTick>> {
     paths.sort();
     let mut ticks = Vec::new();
     for path in paths {
-        ticks.extend(read_jsonl(&path)?);
+        let suffix = segment_suffix(&path, "agent-samples-")?;
+        for mut tick in read_jsonl::<AgentTick>(&path)? {
+            tick.source_suffix.clone_from(&suffix);
+            ticks.push(tick);
+        }
     }
     ticks.sort_by_key(|tick: &AgentTick| tick.at_unix_ms);
     ticks.dedup_by_key(|tick| tick.at_unix_ms);
@@ -466,27 +563,58 @@ fn agent_rollups(dir: &Path) -> io::Result<Vec<AgentRollup>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
-    let mut paths = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name
-            .to_str()
-            .is_some_and(|name| name.starts_with("agent-rollups-"))
-            && Path::new(&name)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
-            && entry.file_type()?.is_file()
-        {
-            paths.push(entry.path());
-        }
-    }
+    let mut paths = retention::agent_rollup_paths(dir)?;
     paths.sort();
     let mut rollups = Vec::new();
     for path in paths {
-        rollups.extend(read_jsonl(&path)?);
+        let (prefix, expected) = match path.file_name().and_then(|name| name.to_str()) {
+            Some(name) if name.starts_with("agent-rollups-") => ("agent-rollups-", 60_000),
+            Some(name) if name.starts_with("agent-history-5m-") => {
+                ("agent-history-5m-", retention::FIVE_MINUTES_MS)
+            }
+            Some(name) if name.starts_with("agent-history-1h-") => {
+                ("agent-history-1h-", retention::ONE_HOUR_MS)
+            }
+            Some(name) if name.starts_with("agent-history-1d-") => {
+                ("agent-history-1d-", retention::ONE_DAY_MS)
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unknown agent rollup",
+                ));
+            }
+        };
+        let suffix = segment_suffix(&path, prefix)?;
+        for mut rollup in read_jsonl::<AgentRollup>(&path)? {
+            if rollup.resolution_ms != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid agent rollup resolution: {}", path.display()),
+                ));
+            }
+            rollup.source_suffix.clone_from(&suffix);
+            rollups.push(rollup);
+        }
     }
     Ok(rollups)
+}
+
+fn segment_suffix(path: &Path, prefix: &str) -> io::Result<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(prefix))
+        .map(str::to_owned)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid agent segment name"))
+}
+
+fn segment_pid(suffix: &str) -> Option<u32> {
+    suffix
+        .strip_suffix(".jsonl")?
+        .rsplit_once('-')?
+        .1
+        .parse()
+        .ok()
 }
 
 fn category(value: &str) -> &'static str {
@@ -568,6 +696,9 @@ fn add_duration(
 }
 
 fn pressure_flags(sample: &Observation, thresholds: (u8, u8, u8)) -> [Option<bool>; 3] {
+    if sample.resolution_ms > 0 {
+        return [None; 3];
+    }
     [
         sample
             .cpu_percent
@@ -883,6 +1014,15 @@ fn accumulate_agents(
     agents: &[AgentSample],
     duration: u128,
 ) {
+    let agents: Vec<_> = agents.iter().collect();
+    accumulate_agent_refs(load, &agents, duration);
+}
+
+fn accumulate_agent_refs(
+    load: &mut BTreeMap<String, AgentLoad>,
+    agents: &[&AgentSample],
+    duration: u128,
+) {
     let mut by_kind: BTreeMap<&str, Vec<&AgentSample>> = BTreeMap::new();
     for agent in agents {
         by_kind
@@ -949,20 +1089,46 @@ fn accumulate_agent_ticks(
     }
 }
 
-fn accumulate_agent_rollups(load: &mut BTreeMap<String, AgentLoad>, rollups: &[AgentRollup]) {
+fn rollup_fraction(rollup: &AgentRollup, from_ms: u128, to_ms: u128) -> (u128, f64) {
+    let start = u128::from(rollup.minute_unix_ms);
+    let end = start.saturating_add(u128::from(rollup.resolution_ms));
+    let overlap = end.min(to_ms).saturating_sub(start.max(from_ms));
+    let fraction = f64::from(u32::try_from(overlap).unwrap_or(u32::MAX))
+        / f64::from(u32::try_from(rollup.resolution_ms).unwrap_or(u32::MAX));
+    (overlap, fraction)
+}
+
+fn scaled_u64(value: u64, overlap_ms: u128, resolution_ms: u64) -> u64 {
+    u64::try_from(u128::from(value).saturating_mul(overlap_ms) / u128::from(resolution_ms.max(1)))
+        .unwrap_or(u64::MAX)
+}
+
+fn accumulate_agent_rollups(
+    load: &mut BTreeMap<String, AgentLoad>,
+    rollups: &[AgentRollup],
+    from_ms: u128,
+    to_ms: u128,
+) {
     for rollup in rollups {
+        let (overlap, fraction) = rollup_fraction(rollup, from_ms, to_ms);
         let kind = agent_kind(&rollup.kind).to_owned();
         let group = load.entry(kind.clone()).or_insert_with(|| AgentLoad {
             kind,
             ..AgentLoad::default()
         });
-        group.active_samples += rollup.active_samples;
-        group.observed_working_ms += rollup.observed_working_ms;
-        group.cpu_core_ms_estimate += rollup.cpu_core_ms_estimate;
+        group.active_samples += usize::try_from(scaled_u64(
+            u64::try_from(rollup.active_samples).unwrap_or(u64::MAX),
+            overlap,
+            rollup.resolution_ms,
+        ))
+        .unwrap_or(usize::MAX);
+        group.observed_working_ms += rollup.observed_working_ms.saturating_mul(overlap)
+            / u128::from(rollup.resolution_ms.max(1));
+        group.cpu_core_ms_estimate += rollup.cpu_core_ms_estimate * fraction;
         group.peak_cpu_percent = group.peak_cpu_percent.max(rollup.peak_cpu_percent);
         group.peak_memory_bytes = group.peak_memory_bytes.max(rollup.peak_memory_bytes);
-        group.read_bytes += rollup.read_bytes;
-        group.written_bytes += rollup.written_bytes;
+        group.read_bytes += scaled_u64(rollup.read_bytes, overlap, rollup.resolution_ms);
+        group.written_bytes += scaled_u64(rollup.written_bytes, overlap, rollup.resolution_ms);
         group.peak_processes = group.peak_processes.max(rollup.peak_processes);
         group.peak_roots = group.peak_roots.max(rollup.peak_roots);
     }
@@ -1031,19 +1197,28 @@ fn accumulate_passive_ticks(
 fn accumulate_passive_rollups(
     load: &mut BTreeMap<(String, String), PassiveCommandLoad>,
     rollups: &[AgentRollup],
+    from_ms: u128,
+    to_ms: u128,
 ) {
     for rollup in rollups {
+        let (overlap, fraction) = rollup_fraction(rollup, from_ms, to_ms);
         for (family, command) in rollup.commands.iter().flatten() {
             let Some(group) = passive_group(load, &rollup.kind, family, &command.category) else {
                 continue;
             };
-            group.active_samples += command.active_samples;
-            group.observed_working_ms += command.observed_working_ms;
-            group.cpu_core_ms_estimate += command.cpu_core_ms_estimate;
+            group.active_samples += usize::try_from(scaled_u64(
+                u64::try_from(command.active_samples).unwrap_or(u64::MAX),
+                overlap,
+                rollup.resolution_ms,
+            ))
+            .unwrap_or(usize::MAX);
+            group.observed_working_ms += command.observed_working_ms.saturating_mul(overlap)
+                / u128::from(rollup.resolution_ms.max(1));
+            group.cpu_core_ms_estimate += command.cpu_core_ms_estimate * fraction;
             group.peak_cpu_percent = group.peak_cpu_percent.max(command.peak_cpu_percent);
             group.peak_memory_bytes = group.peak_memory_bytes.max(command.peak_memory_bytes);
-            group.read_bytes += command.read_bytes;
-            group.written_bytes += command.written_bytes;
+            group.read_bytes += scaled_u64(command.read_bytes, overlap, rollup.resolution_ms);
+            group.written_bytes += scaled_u64(command.written_bytes, overlap, rollup.resolution_ms);
             group.peak_processes = group.peak_processes.max(command.peak_processes);
         }
     }
@@ -1062,7 +1237,7 @@ fn passive_command_reports(
     }
     let mut load = BTreeMap::new();
     accumulate_passive_ticks(&mut load, ticks, from_ms, to_ms);
-    accumulate_passive_rollups(&mut load, rollups);
+    accumulate_passive_rollups(&mut load, rollups, from_ms, to_ms);
     let mut reports: Vec<_> = load.into_values().collect();
     reports.sort_by(|left, right| {
         right
@@ -1075,6 +1250,9 @@ fn passive_command_reports(
 }
 
 fn swap_growth(samples: &[Observation]) -> Option<i128> {
+    if samples.iter().any(|sample| sample.resolution_ms > 0) {
+        return None;
+    }
     let mut values = samples.iter().filter_map(|sample| sample.swap_used_bytes);
     let first = values.next()?;
     let last = values.next_back()?;
@@ -1086,13 +1264,69 @@ fn rollups_in_range(rollups: Vec<AgentRollup>, from_ms: u128, to_ms: u128) -> Ve
         .into_iter()
         .filter(|rollup| {
             let start = u128::from(rollup.minute_unix_ms);
-            start < to_ms && start + 60_000 > from_ms
+            start < to_ms && start + u128::from(rollup.resolution_ms) > from_ms
         })
         .collect()
 }
 
-fn rolled_minutes(rollups: &[AgentRollup]) -> BTreeSet<u64> {
-    rollups.iter().map(|rollup| rollup.minute_unix_ms).collect()
+fn covered_by_rollup(rollups: &[AgentRollup], sample: &Observation, agent: &AgentSample) -> bool {
+    rollups.iter().any(|rollup| {
+        let at_unix_ms = sample.at_unix_ms;
+        if agent_kind(&rollup.kind) != agent_kind(&agent.kind)
+            || !same_source_pid(sample.source_pid, segment_pid(&rollup.source_suffix))
+        {
+            return false;
+        }
+        if at_unix_ms < rollup.minute_unix_ms
+            || at_unix_ms >= rollup.minute_unix_ms.saturating_add(rollup.resolution_ms)
+        {
+            return false;
+        }
+        rollup.covered_minutes.is_empty()
+            || u16::try_from((at_unix_ms - rollup.minute_unix_ms) / 60_000)
+                .is_ok_and(|minute| rollup.covered_minutes.contains(&minute))
+    })
+}
+
+fn same_source_pid(left: Option<u32>, right: Option<u32>) -> bool {
+    left.zip(right).is_none_or(|(left, right)| left == right)
+}
+
+fn covered_by_tick(ticks: &[AgentTick], sample: &Observation, agent: &AgentSample) -> bool {
+    ticks.iter().any(|tick| {
+        tick.at_unix_ms == sample.at_unix_ms
+            && same_source_pid(sample.source_pid, segment_pid(&tick.source_suffix))
+            && tick
+                .agents
+                .iter()
+                .any(|tick_agent| agent_kind(&tick_agent.kind) == agent_kind(&agent.kind))
+    })
+}
+
+fn accumulate_host_agent_fallback(
+    load: &mut BTreeMap<String, AgentLoad>,
+    sample: &Observation,
+    ticks: &[AgentTick],
+    rollups: &[AgentRollup],
+    duration: u128,
+) {
+    if let Some(agent_samples) = &sample.agents {
+        let fallback: Vec<_> = agent_samples
+            .iter()
+            .filter(|agent| {
+                !covered_by_tick(ticks, sample, agent) && !covered_by_rollup(rollups, sample, agent)
+            })
+            .collect();
+        accumulate_agent_refs(load, &fallback, duration);
+    }
+}
+
+fn tick_covered_by_rollup(rollups: &[AgentRollup], tick: &AgentTick) -> bool {
+    rollups.iter().any(|rollup| {
+        rollup.source_suffix == tick.source_suffix
+            && tick.at_unix_ms >= rollup.minute_unix_ms
+            && tick.at_unix_ms < rollup.minute_unix_ms.saturating_add(rollup.resolution_ms)
+    })
 }
 
 fn ticks_in_range(ticks: Vec<AgentTick>, from_ms: u128, to_ms: u128) -> Vec<AgentTick> {
@@ -1114,7 +1348,7 @@ fn observations_in_range(
         .into_iter()
         .filter(|sample| {
             let at = u128::from(sample.at_unix_ms);
-            at > from_ms && at.saturating_sub(u128::from(sample.working_ms)) < to_ms
+            at > from_ms && u128::from(sample.interval_start_unix_ms()) < to_ms
         })
         .collect()
 }
@@ -1130,6 +1364,76 @@ fn records_in_range(
             .filter(|record| record.started_at_unix_ms < to_ms && record.ended_at_unix_ms > from_ms)
             .collect()
     })
+}
+
+fn observation_resolutions(samples: &[Observation]) -> BTreeMap<String, u64> {
+    let mut resolutions = BTreeMap::new();
+    for sample in samples {
+        let label = match sample.resolution_ms {
+            0 => "raw",
+            retention::FIVE_MINUTES_MS => "5m",
+            retention::ONE_HOUR_MS => "1h",
+            retention::ONE_DAY_MS => "1d",
+            _ => "other",
+        };
+        *resolutions.entry(label.to_owned()).or_insert(0) += sample.source_samples();
+    }
+    resolutions
+}
+
+fn clipped_sample_duration(sample: &Observation, start: u128, end: u128) -> u128 {
+    let overlap = end.saturating_sub(start);
+    if sample.resolution_ms == 0 {
+        overlap
+    } else {
+        overlap.min(
+            overlap.saturating_mul(u128::from(sample.working_ms))
+                / u128::from(sample.resolution_ms),
+        )
+    }
+}
+
+fn peak_host_cpu(samples: &[Observation]) -> Option<f64> {
+    samples
+        .iter()
+        .filter_map(|sample| sample.peak_cpu_percent.or(sample.cpu_percent))
+        .max_by(f64::total_cmp)
+}
+
+fn pressure_report(thresholds: (u8, u8, u8)) -> PressureReport {
+    PressureReport {
+        cpu_threshold_percent: thresholds.0,
+        memory_threshold_percent: thresholds.1,
+        swap_threshold_percent: thresholds.2,
+        ..PressureReport::default()
+    }
+}
+
+fn report_is_empty(
+    samples: &[Observation],
+    ticks: &[AgentTick],
+    rollups: &[AgentRollup],
+    command_count: Option<usize>,
+    scheduler: Option<&schedule_events::Summary>,
+) -> bool {
+    samples.is_empty()
+        && ticks.is_empty()
+        && rollups.is_empty()
+        && command_count.unwrap_or_default() == 0
+        && scheduler.is_none_or(|summary| summary.submitted == 0 && summary.rejected == 0)
+}
+
+fn agent_data_available(
+    samples: &[Observation],
+    ticks: &[AgentTick],
+    rollups: &[AgentRollup],
+) -> bool {
+    !ticks.is_empty() || !rollups.is_empty() || samples.iter().any(|sample| sample.agents.is_some())
+}
+
+fn has_coarse_history(samples: &[Observation], rollups: &[AgentRollup]) -> bool {
+    samples.iter().any(|sample| sample.resolution_ms > 0)
+        || rollups.iter().any(|rollup| rollup.resolution_ms > 60_000)
 }
 
 #[cfg(test)]
@@ -1163,18 +1467,13 @@ fn build_report_with_ticks(
 ) -> Report {
     let (from_ms, to_ms) = range_millis(from, to);
     let samples = observations_in_range(samples, from_ms, to_ms);
+    let observation_resolutions = observation_resolutions(&samples);
     let mut agent_ticks = ticks_in_range(agent_data.ticks, from_ms, to_ms);
     let agent_rollups = rollups_in_range(agent_data.rollups, from_ms, to_ms);
-    let rolled_minutes = rolled_minutes(&agent_rollups);
-    agent_ticks.retain(|tick| !rolled_minutes.contains(&(tick.at_unix_ms / 60_000 * 60_000)));
-    let tick_times: BTreeSet<_> = agent_ticks.iter().map(|tick| tick.at_unix_ms).collect();
+    let coarse_history_approximate = has_coarse_history(&samples, &agent_rollups);
+    agent_ticks.retain(|tick| !tick_covered_by_rollup(&agent_rollups, tick));
     let records = records_in_range(records, from_ms, to_ms);
-    let mut pressure = PressureReport {
-        cpu_threshold_percent: thresholds.0,
-        memory_threshold_percent: thresholds.1,
-        swap_threshold_percent: thresholds.2,
-        ..PressureReport::default()
-    };
+    let mut pressure = pressure_report(thresholds);
     let agent_sample_coverage = samples.iter().any(|sample| sample.agents.is_some());
     let host_observations_with_agents = count_host_observations_with_agents(&samples);
     let mut pressure_overlap =
@@ -1183,25 +1482,22 @@ fn build_report_with_ticks(
     let mut observed_working_ms = 0_u128;
     let mut covered_until = from_ms;
     let mut missing = [false; 4];
-    let agents_available = !agent_ticks.is_empty()
-        || !agent_rollups.is_empty()
-        || samples.iter().any(|sample| sample.agents.is_some());
+    let agents_available = agent_data_available(&samples, &agent_ticks, &agent_rollups);
     let mut agent_load: BTreeMap<String, AgentLoad> = BTreeMap::new();
     for sample in &samples {
         let at = u128::from(sample.at_unix_ms);
         let end = at.min(to_ms);
-        let start = at
-            .saturating_sub(u128::from(sample.working_ms))
-            .max(covered_until);
-        let duration = end.saturating_sub(start);
+        let start = u128::from(sample.interval_start_unix_ms()).max(covered_until);
+        let duration = clipped_sample_duration(sample, start, end);
         covered_until = covered_until.max(end);
         observed_working_ms += duration;
-        if !tick_times.contains(&sample.at_unix_ms)
-            && !rolled_minutes.contains(&(sample.at_unix_ms / 60_000 * 60_000))
-            && let Some(agent_samples) = &sample.agents
-        {
-            accumulate_agents(&mut agent_load, agent_samples, duration);
-        }
+        accumulate_host_agent_fallback(
+            &mut agent_load,
+            sample,
+            &agent_ticks,
+            &agent_rollups,
+            duration,
+        );
         let triggers =
             add_pressure_sample(&mut pressure, &mut missing, sample, thresholds, duration);
         if !triggers.is_empty() && duration > 0 {
@@ -1216,20 +1512,23 @@ fn build_report_with_ticks(
         }
     }
     accumulate_agent_ticks(&mut agent_load, &agent_ticks, from_ms, to_ms);
-    accumulate_agent_rollups(&mut agent_load, &agent_rollups);
+    accumulate_agent_rollups(&mut agent_load, &agent_rollups, from_ms, to_ms);
     let passive_commands = passive_command_reports(&agent_ticks, &agent_rollups, from_ms, to_ms);
     let command_count = records.as_ref().map(Vec::len);
     Report {
         from: from.to_rfc3339(),
         to: to.to_rfc3339(),
-        empty: samples.is_empty()
-            && agent_ticks.is_empty()
-            && agent_rollups.is_empty()
-            && command_count.unwrap_or_default() == 0
-            && scheduler
-                .as_ref()
-                .is_none_or(|summary| summary.submitted == 0 && summary.rejected == 0),
+        empty: report_is_empty(
+            &samples,
+            &agent_ticks,
+            &agent_rollups,
+            command_count,
+            scheduler.as_ref(),
+        ),
         observation_count: samples.len(),
+        observation_resolutions,
+        coarse_history_approximate,
+        retention_status: None,
         host_observations_with_agents,
         agent_observation_count: agent_ticks.len(),
         agent_rollup_count: agent_rollups.len(),
@@ -1244,7 +1543,11 @@ fn build_report_with_ticks(
             .then(|| compare_agents(&agent_load, passive_commands.as_deref())),
         agent_activity_comparison: passive_commands.as_deref().map(compare_agent_activities),
         passive_commands,
-        peak_host_memory_bytes: samples.iter().filter_map(|s| s.memory_used_bytes).max(),
+        peak_host_cpu_percent: peak_host_cpu(&samples),
+        peak_host_memory_bytes: samples
+            .iter()
+            .filter_map(|s| s.peak_memory_used_bytes.or(s.memory_used_bytes))
+            .max(),
         peak_root_disk_used_percent: peak_disk_used_percent(&samples),
         swap_growth_bytes: swap_growth(&samples),
         memory_consumers: memory_consumer_reports(&samples),
@@ -1404,7 +1707,8 @@ fn memory_consumer_reports(samples: &[Observation]) -> Option<Vec<MemoryConsumer
     let observed = samples
         .iter()
         .filter(|sample| sample.memory_consumers.is_some())
-        .count();
+        .map(|sample| u128::from(sample.working_ms))
+        .sum::<u128>();
     if observed == 0 {
         return None;
     }
@@ -1414,9 +1718,16 @@ fn memory_consumer_reports(samples: &[Observation]) -> Option<Vec<MemoryConsumer
             let group = groups
                 .entry(safe_memory_family(&consumer.family))
                 .or_default();
-            group.0 += 1;
-            group.1 = group.1.saturating_add(u128::from(consumer.rss_bytes));
-            group.2 = group.2.max(consumer.rss_bytes);
+            group.0 = group
+                .0
+                .saturating_add(usize::try_from(sample.source_samples()).unwrap_or(usize::MAX));
+            group.1 = group.1.saturating_add(
+                u128::from(consumer.rss_bytes)
+                    * u128::from(consumer.observed_working_ms.unwrap_or(sample.working_ms)),
+            );
+            group.2 = group
+                .2
+                .max(consumer.peak_rss_bytes.unwrap_or(consumer.rss_bytes));
             group.3 = group.3.max(consumer.largest_process_rss_bytes);
             group.4 = group.4.max(consumer.process_count);
         }
@@ -1427,8 +1738,7 @@ fn memory_consumer_reports(samples: &[Observation]) -> Option<Vec<MemoryConsumer
             |(family, (samples, total_rss, peak_rss, largest, processes))| MemoryConsumerLoad {
                 family: family.to_owned(),
                 samples,
-                mean_rss_bytes: u64::try_from(total_rss / u128::try_from(observed).unwrap_or(1))
-                    .unwrap_or(u64::MAX),
+                mean_rss_bytes: u64::try_from(total_rss / observed).unwrap_or(u64::MAX),
                 peak_rss_bytes: peak_rss,
                 peak_largest_process_rss_bytes: largest,
                 peak_process_count: processes,
@@ -1449,7 +1759,8 @@ fn peak_disk_used_percent(samples: &[Observation]) -> Option<f64> {
         .iter()
         .filter_map(|sample| {
             sample
-                .root_disk_available_bytes
+                .minimum_root_disk_available_bytes
+                .or(sample.root_disk_available_bytes)
                 .zip(sample.root_disk_total_bytes)
                 .filter(|(available, total)| *total > 0 && available <= total)
                 .map(|(available, total)| (1.0 - float_u64(available) / float_u64(total)) * 100.0)
@@ -1847,13 +2158,16 @@ fn control_markdown(control: &control::Summary) -> String {
 
 fn markdown_with_timeline(report: &Report, include_timeline: bool) -> String {
     let mut out = format!(
-        "# Reef workload report\n\n- Range: {} to {} (end exclusive)\n- Empty: {}\n- Host observations: {}\n- Host observations with agents: {}\n- Observed working time: {}\n- Peak host memory: {}\n- Peak root disk used: {}\n- Swap growth: {}\n- Peak command concurrency: {}\n\n",
+        "# Reef workload report\n\n- Range: {} to {} (end exclusive)\n- Empty: {}\n- Host observations: {}\n- Host observations with agents: {}\n- Observed working time: {}\n- Peak host CPU: {}\n- Peak host memory: {}\n- Peak root disk used: {}\n- Swap growth: {}\n- Peak command concurrency: {}\n\n",
         report.from,
         report.to,
         report.empty,
         report.observation_count,
         report.host_observations_with_agents,
         readable_duration(Some(report.observed_working_ms)),
+        report
+            .peak_host_cpu_percent
+            .map_or_else(|| "unavailable".to_owned(), |value| format!("{value:.1}%")),
         readable_optional_bytes(report.peak_host_memory_bytes.map(i128::from)),
         report
             .peak_root_disk_used_percent
@@ -1861,6 +2175,30 @@ fn markdown_with_timeline(report: &Report, include_timeline: bool) -> String {
         readable_optional_bytes(report.swap_growth_bytes),
         printable(report.peak_command_concurrency),
     );
+    let resolutions = report
+        .observation_resolutions
+        .iter()
+        .map(|(resolution, count)| format!("{resolution}: {count} source samples"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = writeln!(out, "- Observation resolution: {resolutions}");
+    if report.coarse_history_approximate {
+        out.push_str("\nOlder intervals use bucket averages and retained peaks. Partial-bucket coverage is approximate; arbitrary-threshold pressure and precise swap growth are unavailable when coarse history is included.\n");
+    }
+    if let Some(status) = &report.retention_status {
+        let _ = writeln!(
+            out,
+            "\nStorage cap compacted {} segments early and evicted {} retained segments; latest early compaction at Unix ms {}, latest eviction at Unix ms {}.",
+            status.early_compacted_files,
+            status.evicted_files,
+            status.last_early_compaction_unix_ms,
+            status.last_early_eviction_unix_ms
+        );
+        if status.cap_unmet {
+            out.push_str("Storage cap remains unmet because protected history could not be compacted or removed.\n");
+        }
+    }
+    out.push('\n');
     #[cfg(unix)]
     out.push_str(&control_markdown(&report.control));
     out.push_str("## Commands\n\n");
@@ -2071,6 +2409,8 @@ pub fn run(options: &Options) -> io::Result<()> {
         report.empty = report.empty && report.cache.hits == 0 && report.cache.misses == 0;
         report
     };
+    let mut report = report;
+    report.retention_status = retention::read_status(&dir)?;
     write_report(&report, &host_series, options)
 }
 
@@ -2216,15 +2556,21 @@ mod tests {
         Observation {
             at_unix_ms: at,
             working_ms: 100,
+            resolution_ms: 0,
+            source_samples: 1,
             cpu_percent: cpu,
+            peak_cpu_percent: None,
             memory_used_bytes: Some(900),
+            peak_memory_used_bytes: None,
             memory_total_bytes: Some(1000),
             swap_used_bytes: swap,
             swap_total_bytes: Some(1000),
             root_disk_available_bytes: None,
+            minimum_root_disk_available_bytes: None,
             root_disk_total_bytes: None,
             agents: None,
             memory_consumers: None,
+            source_pid: None,
         }
     }
 
@@ -2505,15 +2851,21 @@ mod tests {
             vec![Observation {
                 at_unix_ms: 200,
                 working_ms: 100,
+                resolution_ms: 0,
+                source_samples: 1,
                 cpu_percent: Some(10.0),
+                peak_cpu_percent: None,
                 memory_used_bytes: None,
+                peak_memory_used_bytes: None,
                 memory_total_bytes: None,
                 swap_used_bytes: None,
                 swap_total_bytes: None,
                 root_disk_available_bytes: None,
+                minimum_root_disk_available_bytes: None,
                 root_disk_total_bytes: None,
                 agents: None,
                 memory_consumers: None,
+                source_pid: None,
             }],
             None,
             (90, 90, 1),
@@ -2590,6 +2942,7 @@ mod tests {
             AgentData {
                 ticks: vec![AgentTick {
                     at_unix_ms: 3_000,
+                    source_suffix: String::new(),
                     working_ms: 1_000,
                     commands: None,
                     agents: vec![AgentSample {
@@ -2627,6 +2980,7 @@ mod tests {
             AgentData {
                 ticks: vec![AgentTick {
                     at_unix_ms: 1_500,
+                    source_suffix: String::new(),
                     working_ms: 1_000,
                     commands: None,
                     agents: vec![AgentSample {
@@ -2660,6 +3014,7 @@ mod tests {
             AgentData {
                 ticks: vec![AgentTick {
                     at_unix_ms: 61_000,
+                    source_suffix: String::new(),
                     working_ms: 1_000,
                     commands: None,
                     agents: vec![AgentSample {
@@ -2674,6 +3029,9 @@ mod tests {
                 }],
                 rollups: vec![AgentRollup {
                     minute_unix_ms: 60_000,
+                    source_suffix: String::new(),
+                    covered_minutes: BTreeSet::new(),
+                    resolution_ms: 60_000,
                     kind: "claude".to_owned(),
                     active_samples: 2,
                     observed_working_ms: 2_000,
@@ -2704,6 +3062,7 @@ mod tests {
     fn passive_command_report_uses_rollup_once_and_sanitizes_names() {
         let ticks = vec![AgentTick {
             at_unix_ms: 61_000,
+            source_suffix: String::new(),
             working_ms: 1_000,
             agents: vec![],
             commands: Some(vec![PassiveCommandSample {
@@ -2719,6 +3078,9 @@ mod tests {
         }];
         let rollups = vec![AgentRollup {
             minute_unix_ms: 60_000,
+            source_suffix: String::new(),
+            covered_minutes: BTreeSet::new(),
+            resolution_ms: 60_000,
             kind: "claude".to_owned(),
             active_samples: 2,
             observed_working_ms: 2_000,

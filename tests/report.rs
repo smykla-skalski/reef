@@ -33,6 +33,267 @@ fn reef() -> Command {
 }
 
 #[test]
+fn long_term_rollups_keep_agent_cost_and_mark_coarse_host_metrics() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.join("host-5m-1767225600000-1.jsonl"),
+        concat!(
+            "{\"bucket_start_unix_ms\":1767225600000,\"resolution_ms\":300000,\"source_samples\":2,\"observed_working_ms\":120000,",
+            "\"cpu_percent\":{\"weighted_sum\":6000000.0,\"weight_ms\":120000,\"peak\":95.0},",
+            "\"memory_used_bytes\":{\"weighted_sum\":108000000,\"weight_ms\":120000,\"peak\":900},",
+            "\"memory_total_bytes\":{\"weighted_sum\":120000000,\"weight_ms\":120000,\"peak\":1000}}\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        fixture.0.join("agent-history-5m-1767225600000-1.jsonl"),
+        concat!(
+            "{\"minute_unix_ms\":1767225600000,\"resolution_ms\":300000,\"kind\":\"codex\",",
+            "\"active_samples\":2,\"observed_working_ms\":2000,\"cpu_core_ms_estimate\":1000.0,",
+            "\"peak_cpu_percent\":50.0,\"peak_memory_bytes\":400,\"read_bytes\":10,",
+            "\"written_bytes\":20,\"peak_processes\":2,\"peak_roots\":1,",
+            "\"commands\":{\"go test\":{\"category\":\"test\",\"active_samples\":2,",
+            "\"observed_working_ms\":2000,\"cpu_core_ms_estimate\":500.0,",
+            "\"peak_cpu_percent\":25.0,\"peak_memory_bytes\":300,\"read_bytes\":5,",
+            "\"written_bytes\":7,\"peak_processes\":1}}}\n",
+        ),
+    )
+    .unwrap();
+
+    let output = reef()
+        .args([
+            "report",
+            "--from",
+            "2026-01-01T00:00:00Z",
+            "--to",
+            "2026-01-01T00:05:01Z",
+            "--state-dir",
+        ])
+        .arg(&fixture.0)
+        .args(["--format", "json"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["observation_resolutions"]["5m"], 2);
+    assert_eq!(report["coarse_history_approximate"], true);
+    assert_eq!(report["peak_host_cpu_percent"], 95.0);
+    assert!(report["pressure"]["any_above_ms"].is_null());
+    assert_eq!(report["agents"][0]["cpu_core_ms_estimate"], 1000.0);
+    assert_eq!(report["passive_commands"][0]["family"], "go test");
+    assert_eq!(report["passive_commands"][0]["cpu_core_ms_estimate"], 500.0);
+
+    let html = reef()
+        .args([
+            "report",
+            "--from",
+            "2026-01-01T00:00:00Z",
+            "--to",
+            "2026-01-01T00:05:01Z",
+            "--state-dir",
+        ])
+        .arg(&fixture.0)
+        .args(["--format", "html"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+    assert!(html.status.success(), "{html:?}");
+    let page = String::from_utf8(html.stdout).unwrap();
+    assert!(page.contains("5m: 2 source samples"));
+    assert!(page.contains("(5-minute)"));
+    assert!(page.contains("bucket averages"));
+}
+
+#[test]
+fn malformed_coarse_resolution_is_rejected() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.join("agent-history-5m-1767225600000-1.jsonl"),
+        "{\"minute_unix_ms\":1767225600000,\"resolution_ms\":0,\"kind\":\"codex\",\"active_samples\":0,\"observed_working_ms\":0,\"cpu_core_ms_estimate\":0,\"peak_cpu_percent\":0,\"peak_memory_bytes\":0,\"read_bytes\":0,\"written_bytes\":0,\"peak_processes\":0,\"peak_roots\":0}\n",
+    )
+    .unwrap();
+
+    let output = reef()
+        .args([
+            "report",
+            "--from",
+            "2026-01-01T00:00:00Z",
+            "--to",
+            "2026-01-01T00:05:01Z",
+            "--state-dir",
+        ])
+        .arg(&fixture.0)
+        .args(["--format", "json"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid agent rollup resolution"));
+}
+
+#[test]
+fn coarse_agent_rollup_does_not_hide_another_segments_raw_tick() {
+    let fixture = Fixture::new();
+    let minute = 1_767_225_600_000_u64;
+    fs::write(
+        fixture.0.join(format!("agent-history-5m-{minute}-1.jsonl")),
+        format!(
+            "{{\"minute_unix_ms\":{minute},\"resolution_ms\":300000,\"kind\":\"codex\",\"active_samples\":1,\"observed_working_ms\":1000,\"cpu_core_ms_estimate\":500.0,\"peak_cpu_percent\":50.0,\"peak_memory_bytes\":400,\"read_bytes\":0,\"written_bytes\":0,\"peak_processes\":1,\"peak_roots\":1}}\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        fixture.0.join(format!("agent-samples-{}-2.jsonl", minute + 120_000)),
+        format!(
+            "{{\"at_unix_ms\":{},\"working_ms\":1000,\"agents\":[{{\"kind\":\"codex\",\"root_pid\":42,\"process_count\":1,\"cpu_percent\":50.0,\"memory_bytes\":400,\"read_bytes\":0,\"written_bytes\":0}}],\"commands\":[]}}\n",
+            minute + 120_000
+        ),
+    )
+    .unwrap();
+
+    let output = reef()
+        .args([
+            "report",
+            "--from",
+            "2026-01-01T00:00:00Z",
+            "--to",
+            "2026-01-01T00:05:01Z",
+            "--state-dir",
+        ])
+        .arg(&fixture.0)
+        .args(["--format", "json"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["agent_observation_count"], 1);
+    assert_eq!(report["agent_rollup_count"], 1);
+    assert_eq!(report["agents"][0]["active_samples"], 2);
+}
+
+#[test]
+fn coarse_agent_rollup_does_not_hide_an_uncovered_host_agent_minute() {
+    let fixture = Fixture::new();
+    let minute = 1_767_225_600_000_u64;
+    fs::write(
+        fixture.0.join(format!("agent-history-5m-{minute}-1.jsonl")),
+        format!(
+            "{{\"minute_unix_ms\":{minute},\"resolution_ms\":300000,\"kind\":\"codex\",\"active_samples\":1,\"observed_working_ms\":1000,\"cpu_core_ms_estimate\":500.0,\"peak_cpu_percent\":50.0,\"peak_memory_bytes\":400,\"read_bytes\":0,\"written_bytes\":0,\"peak_processes\":1,\"peak_roots\":1,\"covered_minutes\":[0]}}\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        fixture.0.join(format!("samples-{}-2.jsonl", minute + 120_000)),
+        format!(
+            "{{\"at_unix_ms\":{},\"working_ms\":1000,\"agents\":[{{\"kind\":\"codex\",\"root_pid\":42,\"process_count\":1,\"cpu_percent\":50.0,\"memory_bytes\":400,\"read_bytes\":0,\"written_bytes\":0}}]}}\n",
+            minute + 120_000
+        ),
+    )
+    .unwrap();
+
+    let output = reef()
+        .args([
+            "report",
+            "--from",
+            "2026-01-01T00:00:00Z",
+            "--to",
+            "2026-01-01T00:05:01Z",
+            "--state-dir",
+        ])
+        .arg(&fixture.0)
+        .args(["--format", "json"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["agents"][0]["active_samples"], 2);
+}
+
+#[test]
+fn coarse_agent_rollup_does_not_hide_another_sources_agent_in_same_minute() {
+    let fixture = Fixture::new();
+    let minute = 1_767_225_600_000_u64;
+    fs::write(
+        fixture.0.join(format!("agent-history-5m-{minute}-1.jsonl")),
+        format!(
+            "{{\"minute_unix_ms\":{minute},\"resolution_ms\":300000,\"kind\":\"codex\",\"active_samples\":1,\"observed_working_ms\":1000,\"cpu_core_ms_estimate\":500.0,\"peak_cpu_percent\":50.0,\"peak_memory_bytes\":400,\"read_bytes\":0,\"written_bytes\":0,\"peak_processes\":1,\"peak_roots\":1,\"covered_minutes\":[2]}}\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        fixture.0.join(format!("samples-{}-2.jsonl", minute + 120_000)),
+        format!(
+            "{{\"at_unix_ms\":{},\"working_ms\":1000,\"agents\":[{{\"kind\":\"claude\",\"root_pid\":42,\"process_count\":1,\"cpu_percent\":20.0,\"memory_bytes\":200,\"read_bytes\":0,\"written_bytes\":0}},{{\"kind\":\"codex\",\"root_pid\":43,\"process_count\":1,\"cpu_percent\":30.0,\"memory_bytes\":300,\"read_bytes\":0,\"written_bytes\":0}}]}}\n",
+            minute + 120_000
+        ),
+    )
+    .unwrap();
+
+    let output = reef()
+        .args([
+            "report",
+            "--from",
+            "2026-01-01T00:00:00Z",
+            "--to",
+            "2026-01-01T00:05:01Z",
+            "--state-dir",
+        ])
+        .arg(&fixture.0)
+        .args(["--format", "json"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["agents"].as_array().unwrap().len(), 2);
+    assert_eq!(report["agents"][0]["kind"], "claude");
+    assert_eq!(report["agents"][0]["active_samples"], 1);
+    assert_eq!(report["agents"][1]["kind"], "codex");
+    assert_eq!(report["agents"][1]["active_samples"], 2);
+}
+
+#[test]
+fn compacted_memory_family_reports_its_retained_peak_process_count() {
+    let fixture = Fixture::new();
+    let minute = 1_767_225_600_000_u64;
+    fs::write(
+        fixture.0.join(format!("host-5m-{minute}-1.jsonl")),
+        format!(
+            "{{\"bucket_start_unix_ms\":{minute},\"resolution_ms\":300000,\"source_samples\":2,\"observed_working_ms\":120000,\"memory_consumers\":{{\"compiler/build\":{{\"rss_bytes\":{{\"weighted_sum\":600000,\"weight_ms\":60000,\"peak\":10}},\"process_count\":{{\"weighted_sum\":300000,\"weight_ms\":60000,\"peak\":9}},\"peak_largest_process_rss_bytes\":10}}}}}}\n"
+        ),
+    )
+    .unwrap();
+
+    let output = reef()
+        .args([
+            "report",
+            "--from",
+            "2026-01-01T00:00:00Z",
+            "--to",
+            "2026-01-01T00:05:01Z",
+            "--state-dir",
+        ])
+        .arg(&fixture.0)
+        .args(["--format", "json"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["memory_consumers"][0]["peak_process_count"], 9);
+    assert_eq!(report["memory_consumers"][0]["mean_rss_bytes"], 5);
+}
+
+#[test]
 fn reports_empty_range_with_unavailable_command_measurements() {
     let fixture = Fixture::new();
     let output = reef()

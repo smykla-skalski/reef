@@ -38,6 +38,104 @@ fn recorder_at_interval(dir: &Path, interval: &str) -> Recorder {
 }
 
 #[test]
+fn recorder_compacts_existing_history_before_its_first_new_sample() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let now = u64::try_from(nonce / 1_000_000).unwrap();
+    let at = now - 3 * 86_400_000;
+    let dir = std::env::temp_dir().join(format!(
+        "reef-observe-compact-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&dir).unwrap();
+    let raw = dir.join(format!("samples-{at}-1.jsonl"));
+    fs::write(
+        &raw,
+        format!(
+            "{{\"at_unix_ms\":{at},\"working_ms\":1000,\"cpu_percent\":50.0,\"memory_used_bytes\":100,\"memory_total_bytes\":1000}}\n"
+        ),
+    )
+    .unwrap();
+    let mut running = recorder_at_interval(&dir, "60");
+
+    assert!(
+        wait_until(|| {
+            !raw.exists()
+                && fs::read_dir(&dir).is_ok_and(|entries| {
+                    entries
+                        .flatten()
+                        .any(|entry| entry.file_name().to_string_lossy().starts_with("host-5m-"))
+                })
+        }),
+        "{}",
+        child_failure(&mut running)
+    );
+    let stopped = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args(["observe", "stop", "--state-dir"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(stopped.status.success(), "{stopped:?}");
+    assert!(wait_until(|| running.0.try_wait().unwrap().is_some()));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn recorder_folds_previous_hour_agent_ticks_before_enforcing_cap() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let now = u64::try_from(nonce / 1_000_000).unwrap();
+    let at = now - 3 * 3_600_000;
+    let dir = std::env::temp_dir().join(format!(
+        "reef-agent-fold-startup-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&dir).unwrap();
+    let raw = dir.join(format!("agent-samples-{at}-1.jsonl"));
+    let rollup = dir.join(format!("agent-rollups-{at}-1.jsonl"));
+    let line = format!(
+        "{{\"at_unix_ms\":{at},\"working_ms\":1000,\"agents\":[{{\"kind\":\"codex\",\"root_pid\":1,\"process_count\":1,\"cpu_percent\":25.0,\"memory_bytes\":1000,\"read_bytes\":0,\"written_bytes\":0}}],\"commands\":[]}}\n"
+    );
+    fs::write(&raw, line.repeat(7_000)).unwrap();
+    let mut running = Recorder(
+        Command::new(env!("CARGO_BIN_EXE_reef"))
+            .args([
+                "observe",
+                "run",
+                "--interval-seconds",
+                "60",
+                "--max-storage-mib",
+                "1",
+                "--state-dir",
+            ])
+            .arg(&dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+
+    assert!(
+        wait_until(|| !raw.exists() && rollup.exists()),
+        "{}",
+        child_failure(&mut running)
+    );
+    let stopped = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args(["observe", "stop", "--state-dir"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(stopped.status.success(), "{stopped:?}");
+    assert!(wait_until(|| running.0.try_wait().unwrap().is_some()));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn short_registered_session_is_visible_before_first_host_snapshot() {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)

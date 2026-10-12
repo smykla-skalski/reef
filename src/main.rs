@@ -17,6 +17,7 @@ mod pressure;
 #[cfg(unix)]
 mod remote;
 mod report;
+mod retention;
 #[cfg(unix)]
 mod run;
 #[cfg(unix)]
@@ -327,11 +328,23 @@ struct ObserveOptions {
     /// Seconds between samples.
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
     interval_seconds: u64,
-    /// Number of days to retain samples.
-    #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u64).range(1..))]
-    retention_days: u64,
+    /// Legacy raw-sample horizon, accepted for existing launchd installations.
+    #[arg(long, hide = true, value_parser = clap::value_parser!(u64).range(1..))]
+    retention_days: Option<u64>,
+    /// Hours to retain full-resolution host and agent samples.
+    #[arg(long, default_value_t = 48, value_parser = clap::value_parser!(u64).range(1..))]
+    raw_retention_hours: u64,
+    /// Days to retain five-minute trends.
+    #[arg(long, default_value_t = 14, value_parser = clap::value_parser!(u64).range(1..))]
+    five_minute_retention_days: u64,
+    /// Days to retain hourly trends.
+    #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u64).range(1..))]
+    hourly_retention_days: u64,
+    /// Days to retain daily trends.
+    #[arg(long, default_value_t = 365, value_parser = clap::value_parser!(u64).range(1..))]
+    daily_retention_days: u64,
     /// Maximum storage in MiB.
-    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u64).range(1..))]
     max_storage_mib: u64,
     /// Private directory for observations.
     #[arg(long)]
