@@ -547,7 +547,7 @@ fn host_charts(report: &Report, series: &HostSeries) -> String {
 
 #[cfg(unix)]
 fn control_html(control: &crate::control::Summary) -> String {
-    let mut out = String::from("<section><h2>Opt-in control attempts</h2>");
+    let mut out = String::from("<section><h2>Opt-in measured agent attempts</h2>");
     if !control.available {
         out.push_str("<p class=\"note\">Warning: private control telemetry is missing, unreadable, or invalid. Counts are unavailable.</p></section>");
         return out;
@@ -564,13 +564,14 @@ fn control_html(control: &crate::control::Summary) -> String {
         let _ = write!(out, "<p class=\"note\">Warning: {}.</p>", escape(warning));
     }
     if !control.groups.is_empty() {
-        out.push_str("<p class=\"note\">Costs include only completed attempts with valid measurements. Pending and unavailable attempts are excluded.</p><div class=\"table-wrap\"><table><thead><tr><th>Agent</th><th>Category</th><th>Assigned</th><th>Measured</th><th>Pending</th><th>Unavailable</th><th>Success</th><th>Failed</th><th>Cancelled</th><th>Measured wall</th><th>Measured CPU</th><th>Peak memory</th></tr></thead><tbody>");
+        out.push_str("<p class=\"note\">Costs include only completed attempts with valid measurements. Pending and unavailable attempts are excluded.</p><div class=\"table-wrap\"><table><thead><tr><th>Agent</th><th>Category</th><th>Arm</th><th>Assigned</th><th>Measured</th><th>Pending</th><th>Unavailable</th><th>Success</th><th>Failed</th><th>Cancelled</th><th>Measured wall</th><th>Measured CPU</th><th>Peak memory</th></tr></thead><tbody>");
         for group in &control.groups {
             let _ = write!(
                 out,
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 escape(&group.agent),
                 escape(&group.category),
+                escape(&group.arm),
                 group.assigned,
                 group.measured,
                 group.pending,

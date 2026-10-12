@@ -30,22 +30,37 @@ pub fn launch(
     agent: &str,
     state_dir: Option<&Path>,
     control_mode: bool,
+    canary_percent: Option<u8>,
     max_wait_ms: u64,
     args: &[String],
 ) -> io::Result<u8> {
+    // Agent shells can change directory or HOME; pin every path before launch.
+    let (state_root, scheduler_dir) = if let Some(path) = state_dir {
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            env::current_dir()?.join(path)
+        };
+        (path.clone(), path)
+    } else {
+        let home = env::var_os("HOME").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "HOME is not set; pass --state-dir")
+        })?;
+        let home = PathBuf::from(home);
+        let home = if home.is_absolute() {
+            home
+        } else {
+            env::current_dir()?.join(home)
+        };
+        let state_root = home.join(".local/state/reef");
+        (state_root.clone(), state_root.join("schedule"))
+    };
     let original_path = env::var_os("REEF_AGENT_ORIGINAL_PATH")
         .or_else(|| env::var_os("PATH"))
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "PATH is not set"))?;
     let agent_binary = find_binary(agent, &original_path)?;
     let reef_binary = env::current_exe()?.canonicalize()?;
-    let root = if let Some(path) = state_dir {
-        path.join("agent-shims")
-    } else {
-        let home = env::var_os("HOME").ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "HOME is not set; pass --state-dir")
-        })?;
-        PathBuf::from(home).join(".local/state/reef/agent-shims")
-    };
+    let root = state_root.join("agent-shims");
     private_dir(&root)?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     reef_binary.hash(&mut hasher);
@@ -99,15 +114,21 @@ pub fn launch(
         .env("REEF_AGENT_MAX_WAIT_MS", max_wait_ms.to_string())
         .env_remove("REEF_CONTROL_ATTEMPT")
         .env_remove("REEF_ADMITTED");
-    if control_mode {
-        let control_dir = control::prepare(state_dir)?;
+    if control_mode || canary_percent.is_some() {
+        let control_dir = control::prepare(Some(&state_root))?;
         process.env("REEF_AGENT_CONTROL_DIR", control_dir);
     } else {
         process.env_remove("REEF_AGENT_CONTROL_DIR");
     }
-    if let Some(path) = state_dir {
-        process.env("REEF_AGENT_STATE_DIR", path);
+    if let Some(percent) = canary_percent {
+        eprintln!(
+            "reef: best-effort host canary at {percent}% treatment; detached descendants may survive launcher failure; strong isolation remains off"
+        );
+        process.env("REEF_AGENT_CANARY_PERCENT", percent.to_string());
+    } else {
+        process.env_remove("REEF_AGENT_CANARY_PERCENT");
     }
+    process.env("REEF_AGENT_STATE_DIR", scheduler_dir);
     Err(process.exec())
 }
 
