@@ -254,6 +254,9 @@ enum AgentCommand {
         /// Measure eligible commands without scheduler admission.
         #[arg(long)]
         control: bool,
+        /// Maximum time a heavy command waits for scheduler admission.
+        #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u64).range(1..=agents::MAX_WAIT_MS))]
+        max_wait_ms: u64,
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -444,11 +447,13 @@ fn agent_command(command: AgentCommand) -> std::process::ExitCode {
             agent,
             state_dir,
             control,
+            max_wait_ms,
             args,
         } => command_result(agents::launch(
             agent.as_str(),
             state_dir.as_deref(),
             control,
+            max_wait_ms,
             &args,
         )),
         AgentCommand::Observe {

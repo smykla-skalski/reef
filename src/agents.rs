@@ -12,6 +12,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const TOOLS: &[&str] = &["go", "cargo", "golangci-lint", "mise", "make"];
+pub(crate) const MAX_WAIT_MS: u64 = 24 * 60 * 60 * 1000;
 
 pub fn shim_name() -> Option<String> {
     let name = env::args_os()
@@ -29,6 +30,7 @@ pub fn launch(
     agent: &str,
     state_dir: Option<&Path>,
     control_mode: bool,
+    max_wait_ms: u64,
     args: &[String],
 ) -> io::Result<u8> {
     let original_path = env::var_os("REEF_AGENT_ORIGINAL_PATH")
@@ -94,6 +96,7 @@ pub fn launch(
         .env("REEF_AGENT_ORIGINAL_PATH", original_path)
         .env("REEF_AGENT_KIND", agent)
         .env("REEF_AGENT_SESSION", session)
+        .env("REEF_AGENT_MAX_WAIT_MS", max_wait_ms.to_string())
         .env_remove("REEF_CONTROL_ATTEMPT")
         .env_remove("REEF_ADMITTED");
     if control_mode {
@@ -150,8 +153,20 @@ pub fn shim(tool: &str) -> io::Result<u8> {
     }
     let identity = format!("{agent}-{session}-{:016x}", hasher.finish());
     let mut process = Command::new(env::current_exe()?.canonicalize()?);
+    let max_wait_ms = env::var("REEF_AGENT_MAX_WAIT_MS")
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "agent wait limit is missing"))?
+        .parse::<u64>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid agent wait limit"))?;
+    if max_wait_ms == 0 || max_wait_ms > MAX_WAIT_MS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "agent wait limit must be between 1 ms and 24 hours",
+        ));
+    }
     process
         .arg("schedule")
+        .arg("--max-wait-ms")
+        .arg(max_wait_ms.to_string())
         .arg("--category")
         .arg(category)
         .arg("--identity")
