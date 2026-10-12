@@ -34,6 +34,8 @@ mod tool_classification;
 use clap::Args;
 use clap::ValueEnum;
 use clap::{Parser, Subcommand};
+#[cfg(unix)]
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -250,6 +252,9 @@ enum AgentCommand {
     Launch {
         #[arg(value_enum)]
         agent: AgentName,
+        /// Run an absolute adapter executable instead of the agent CLI.
+        #[arg(long, value_name = "ABSOLUTE_PATH")]
+        exec: Option<PathBuf>,
         #[arg(long)]
         state_dir: Option<PathBuf>,
         /// Measure eligible commands without scheduler admission.
@@ -262,7 +267,7 @@ enum AgentCommand {
         #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u64).range(1..=agents::MAX_WAIT_MS))]
         max_wait_ms: u64,
         #[arg(last = true)]
-        args: Vec<String>,
+        args: Vec<OsString>,
     },
     /// Stop or resume new best-effort canary treatment assignments.
     #[cfg(unix)]
@@ -477,6 +482,7 @@ fn agent_command(command: AgentCommand) -> std::process::ExitCode {
         #[cfg(unix)]
         AgentCommand::Launch {
             agent,
+            exec,
             state_dir,
             control,
             canary_percent,
@@ -484,6 +490,7 @@ fn agent_command(command: AgentCommand) -> std::process::ExitCode {
             args,
         } => command_result(agents::launch(
             agent.as_str(),
+            exec.as_deref(),
             state_dir.as_deref(),
             control,
             canary_percent,
