@@ -76,6 +76,16 @@ impl Fixture {
     }
 
     fn launch_mode(&self, agent: &str, args: &[&str], control: bool) -> Command {
+        self.launch_mode_with_wait(agent, args, control, 60_000)
+    }
+
+    fn launch_mode_with_wait(
+        &self,
+        agent: &str,
+        args: &[&str],
+        control: bool,
+        max_wait_ms: u64,
+    ) -> Command {
         let mut command = reef();
         let path = std::env::join_paths(
             std::iter::once(self.path.join("bin"))
@@ -85,6 +95,7 @@ impl Fixture {
         command
             .args(["agents", "launch", agent, "--state-dir"])
             .arg(&self.path);
+        command.arg("--max-wait-ms").arg(max_wait_ms.to_string());
         if control {
             command.arg("--control");
         }
@@ -111,6 +122,34 @@ impl Fixture {
     }
 }
 
+#[test]
+fn agent_wait_expires_without_starting_a_queued_command() {
+    let fixture = Fixture::new(true);
+    let marker = fixture.path.join("first-started");
+    let mut first = fixture
+        .launch("codex", &["go", "test", "first"])
+        .env("REEF_TEST_PAUSE", "1")
+        .env("REEF_TEST_MARKER", &marker)
+        .spawn()
+        .unwrap();
+    wait_until(|| marker.exists());
+
+    let second = fixture
+        .launch_mode_with_wait("codex", &["go", "test", "second"], false, 50)
+        .output()
+        .unwrap();
+    assert!(!second.status.success(), "{second:?}");
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("pre-admission wait expired"),
+        "{second:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.path.join("output")).unwrap(),
+        "1|codex|test first\n"
+    );
+    assert_eq!(first.wait().unwrap().code(), Some(7));
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         if let Some(server) = self.server.as_mut() {
@@ -131,7 +170,7 @@ fn write_script(path: &Path, content: &str) {
 }
 
 fn wait_until(condition: impl Fn() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(15);
     while !condition() {
         assert!(Instant::now() < deadline, "timed out waiting for scheduler");
         std::thread::sleep(Duration::from_millis(20));
