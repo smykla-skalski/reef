@@ -1,5 +1,6 @@
 use crate::ObserveOptions;
 use crate::agent_observe;
+use crate::retention;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -86,7 +87,7 @@ struct CommandObservation {
     written_bytes: Option<u64>,
 }
 
-#[derive(Default, Serialize)]
+#[derive(Default, Deserialize, PartialEq, Serialize)]
 struct CommandRollup {
     category: String,
     active_samples: u64,
@@ -99,7 +100,7 @@ struct CommandRollup {
     peak_processes: usize,
 }
 
-#[derive(Default, Serialize)]
+#[derive(Default, Deserialize, PartialEq, Serialize)]
 struct AgentRollup {
     minute_unix_ms: u64,
     kind: String,
@@ -356,24 +357,21 @@ fn segments_with_prefix(dir: &Path, prefix: &str) -> io::Result<Vec<(u64, PathBu
     Ok(files)
 }
 
+#[cfg(test)]
 fn segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf, u64)>> {
     segments_with_prefix(dir, "samples-")
 }
 
-fn prune(dir: &Path, now: u64, retention_days: u64, max_bytes: u64) -> io::Result<()> {
-    let cutoff = now.saturating_sub(retention_days.saturating_mul(86_400_000));
-    let mut files = segments(dir)?;
-    files.extend(segments_with_prefix(dir, "agent-samples-")?);
-    files.extend(segments_with_prefix(dir, "agent-rollups-")?);
-    files.sort_by_key(|(timestamp, _, _)| *timestamp);
-    let mut total: u64 = files.iter().map(|(_, _, size)| size).sum();
-    for (timestamp, path, size) in files {
-        if timestamp < cutoff || total > max_bytes {
-            fs::remove_file(path)?;
-            total = total.saturating_sub(size);
-        }
+fn retention_policy(options: &ObserveOptions) -> retention::Policy {
+    retention::Policy {
+        raw_hours: options
+            .retention_days
+            .map_or(options.raw_retention_hours, |days| days.saturating_mul(24)),
+        five_minute_days: options.five_minute_retention_days,
+        hourly_days: options.hourly_retention_days,
+        daily_days: options.daily_retention_days,
+        max_storage_mib: options.max_storage_mib,
     }
-    Ok(())
 }
 
 fn append_line(
@@ -385,7 +383,11 @@ fn append_line(
 ) -> io::Result<()> {
     let max_bytes = options.max_storage_mib.saturating_mul(SEGMENT_BYTES);
     let files = segments_with_prefix(dir, prefix)?;
-    let cutoff = at_unix_ms.saturating_sub(options.retention_days.saturating_mul(86_400_000));
+    let cutoff = at_unix_ms.saturating_sub(
+        retention_policy(options)
+            .raw_hours
+            .saturating_mul(3_600_000),
+    );
     let latest = files.last().filter(|(timestamp, _, size)| {
         *timestamp >= cutoff
             && *size + (line.len() as u64) < SEGMENT_BYTES.min(max_bytes / 2)
@@ -406,7 +408,7 @@ fn append_line(
     file.write_all(line)?;
     file.write_all(b"\n")?;
     file.sync_data()?;
-    prune(dir, at_unix_ms, options.retention_days, max_bytes)
+    Ok(())
 }
 
 fn append(dir: &Path, observation: &Observation, options: &ObserveOptions) -> io::Result<()> {
@@ -480,7 +482,7 @@ fn fold_tick(rollups: &mut BTreeMap<(u64, String), AgentRollup>, tick: &AgentTic
     }
 }
 
-fn fold_agent_segments(dir: &Path, now: u64, options: &ObserveOptions) -> io::Result<()> {
+fn fold_agent_segments(dir: &Path, now: u64, _options: &ObserveOptions) -> io::Result<()> {
     let current_hour = now / 3_600_000;
     for (timestamp, path, _) in segments_with_prefix(dir, "agent-samples-")? {
         if timestamp / 3_600_000 >= current_hour {
@@ -492,40 +494,16 @@ fn fold_agent_segments(dir: &Path, now: u64, options: &ObserveOptions) -> io::Re
             .and_then(|name| name.strip_prefix("agent-samples-"))
             .ok_or_else(|| io::Error::other("invalid agent sample segment"))?;
         let target = dir.join(format!("agent-rollups-{name}"));
-        match fs::symlink_metadata(&target) {
-            Ok(metadata) if metadata.file_type().is_file() => {
-                fs::remove_file(path)?;
-                continue;
-            }
-            Ok(_) => return Err(io::Error::other("rollup target must be a regular file")),
-            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
-            Err(_) => {}
-        }
         let mut rollups = BTreeMap::new();
         for line in BufReader::new(File::open(&path)?).lines() {
             let tick: AgentTick = serde_json::from_str(&line?).map_err(io::Error::other)?;
             fold_tick(&mut rollups, &tick);
         }
-        let temporary = dir.join(format!(
-            "agent-rollups-{timestamp}-{}-{}.tmp",
-            std::process::id(),
-            now_ms()?
-        ));
-        let mut file = private_file(&temporary, true, false)?;
-        for rollup in rollups.values() {
-            serde_json::to_writer(&mut file, rollup)?;
-            file.write_all(b"\n")?;
-        }
-        file.sync_data()?;
-        fs::rename(temporary, target)?;
+        let records: Vec<_> = rollups.into_values().collect();
+        retention::publish(dir, &target, &records)?;
         fs::remove_file(path)?;
     }
-    prune(
-        dir,
-        now,
-        options.retention_days,
-        options.max_storage_mib.saturating_mul(SEGMENT_BYTES),
-    )
+    Ok(())
 }
 
 fn working_ms(elapsed: Duration, interval: Duration) -> u64 {
@@ -554,6 +532,7 @@ fn active_recorder_pid(path: &Path) -> io::Result<Option<u32>> {
 }
 
 pub fn run(options: &ObserveOptions) -> io::Result<()> {
+    retention_policy(options).validate()?;
     let dir = state_dir(options.state_dir.as_deref())?;
     private_dir(&dir)?;
     let lock = private_file(&dir.join("recorder.lock"), false, false)
@@ -593,6 +572,13 @@ pub fn run(options: &ObserveOptions) -> io::Result<()> {
             .ok_or_else(|| io::Error::other("cannot identify recorder process"))?
             .start_time();
         writeln!(pid_file, "{} {started}", std::process::id())?;
+    }
+    let now = now_ms()?;
+    if let Err(error) = fold_agent_segments(&dir, now, options) {
+        eprintln!("reef observer could not fold agent history: {error}");
+    }
+    if let Err(error) = retention::maintain(&dir, now, retention_policy(options)) {
+        eprintln!("reef observer could not compact history: {error}");
     }
     let result = record_loop(&dir, &stop_path, options);
     pid_file.set_len(0)?;
@@ -635,7 +621,9 @@ fn record_loop(dir: &Path, stop_path: &Path, options: &ObserveOptions) -> io::Re
                 dir,
                 working_ms(host_elapsed, interval),
             )?;
-            fold_agent_segments(dir, observation.at_unix_ms, options)?;
+            if let Err(error) = fold_agent_segments(dir, observation.at_unix_ms, options) {
+                eprintln!("reef observer could not fold agent history: {error}");
+            }
             if !observation.agents.is_empty() {
                 append_agent_tick(
                     dir,
@@ -649,6 +637,11 @@ fn record_loop(dir: &Path, stop_path: &Path, options: &ObserveOptions) -> io::Re
                 )?;
             }
             append(dir, &observation, options)?;
+            if let Err(error) =
+                retention::maintain(dir, observation.at_unix_ms, retention_policy(options))
+            {
+                eprintln!("reef observer could not compact history: {error}");
+            }
             #[cfg(unix)]
             if let Some(executable) = &executable
                 && let Err(error) = executable.reload_if_changed()
@@ -662,6 +655,7 @@ fn record_loop(dir: &Path, stop_path: &Path, options: &ObserveOptions) -> io::Re
 }
 
 pub fn start(options: &ObserveOptions) -> io::Result<()> {
+    retention_policy(options).validate()?;
     let dir = state_dir(options.state_dir.as_deref())?;
     private_dir(&dir)?;
     let lock_path = dir.join("recorder.pid");
@@ -712,7 +706,11 @@ mod tests {
     fn options(dir: &Path) -> ObserveOptions {
         ObserveOptions {
             interval_seconds: 1,
-            retention_days: 1,
+            retention_days: Some(1),
+            raw_retention_hours: 48,
+            five_minute_retention_days: 14,
+            hourly_retention_days: 90,
+            daily_retention_days: 365,
             max_storage_mib: 1,
             state_dir: Some(dir.to_path_buf()),
         }
@@ -764,36 +762,22 @@ mod tests {
     }
 
     #[test]
-    fn old_observations_expire_at_retention_boundary() {
+    fn older_observations_are_compacted_before_source_removal() {
         let dir = std::env::temp_dir().join(format!("reef-retention-test-{}", std::process::id()));
         private_dir(&dir).unwrap();
         let old = dir.join("samples-1-1.jsonl");
-        fs::write(&old, b"old\n").unwrap();
+        fs::write(
+            &old,
+            format!("{}\n", serde_json::to_string(&observation(1)).unwrap()),
+        )
+        .unwrap();
 
         append(&dir, &observation(100_000_000), &options(&dir)).unwrap();
+        retention::maintain(&dir, 100_000_000, retention_policy(&options(&dir))).unwrap();
 
         assert!(!old.exists());
         assert_eq!(segments(&dir).unwrap().len(), 1);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn storage_limit_removes_oldest_segments() {
-        let dir = std::env::temp_dir().join(format!("reef-storage-test-{}", std::process::id()));
-        private_dir(&dir).unwrap();
-        fs::write(dir.join("samples-99999999-1.jsonl"), vec![b'x'; 800_000]).unwrap();
-
-        append(&dir, &observation(100_000_000), &options(&dir)).unwrap();
-        prune(&dir, 100_000_000, 1, 100).unwrap();
-
-        assert!(
-            segments(&dir)
-                .unwrap()
-                .iter()
-                .map(|(_, _, size)| size)
-                .sum::<u64>()
-                <= 100
-        );
+        assert_eq!(retention::host_rollups(&dir).unwrap().len(), 1);
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -30,8 +30,19 @@ pub fn spawn_detached(options: &ObserveOptions, dir: &Path) -> io::Result<Child>
         .arg("run")
         .arg("--interval-seconds")
         .arg(options.interval_seconds.to_string())
-        .arg("--retention-days")
-        .arg(options.retention_days.to_string())
+        .arg("--raw-retention-hours")
+        .arg(
+            options
+                .retention_days
+                .map_or(options.raw_retention_hours, |days| days.saturating_mul(24))
+                .to_string(),
+        )
+        .arg("--five-minute-retention-days")
+        .arg(options.five_minute_retention_days.to_string())
+        .arg("--hourly-retention-days")
+        .arg(options.hourly_retention_days.to_string())
+        .arg("--daily-retention-days")
+        .arg(options.daily_retention_days.to_string())
         .arg("--max-storage-mib")
         .arg(options.max_storage_mib.to_string())
         .arg("--state-dir")

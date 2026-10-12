@@ -30,6 +30,7 @@ fn number(value: u64) -> f64 {
 struct Point {
     at_ms: u64,
     value: f64,
+    resolution_ms: u64,
 }
 
 pub(super) struct HostSeries {
@@ -59,15 +60,16 @@ impl HostSeries {
             disk: Vec::new(),
             memory_families: BTreeMap::new(),
         };
-        for sample in samples.iter().filter(|sample| {
-            sample.at_unix_ms > from_ms
-                && sample.at_unix_ms.saturating_sub(sample.working_ms) < to_ms
-        }) {
+        for sample in samples
+            .iter()
+            .filter(|sample| sample.at_unix_ms > from_ms && sample.interval_start_unix_ms() < to_ms)
+        {
             let at_ms = sample.at_unix_ms.min(to_ms);
             if let Some(cpu) = sample.cpu_percent.filter(|value| value.is_finite()) {
                 series.cpu.push(Point {
                     at_ms,
                     value: cpu.clamp(0.0, 100.0),
+                    resolution_ms: sample.resolution_ms,
                 });
             }
             if let Some((used, total)) = sample
@@ -78,12 +80,14 @@ impl HostSeries {
                 series.memory.push(Point {
                     at_ms,
                     value: (number(used) / number(total) * 100.0).clamp(0.0, 100.0),
+                    resolution_ms: sample.resolution_ms,
                 });
             }
             if let Some(used) = sample.swap_used_bytes {
                 series.swap.push(Point {
                     at_ms,
                     value: number(used) / 1_073_741_824.0,
+                    resolution_ms: sample.resolution_ms,
                 });
             }
             if let Some((available, total)) = sample
@@ -94,6 +98,7 @@ impl HostSeries {
                 series.disk.push(Point {
                     at_ms,
                     value: (1.0 - number(available) / number(total)) * 100.0,
+                    resolution_ms: sample.resolution_ms,
                 });
             }
             if let Some(consumers) = &sample.memory_consumers {
@@ -112,6 +117,7 @@ impl HostSeries {
                             at_ms,
                             value: number(by_family.get(family).copied().unwrap_or_default())
                                 / 1_073_741_824.0,
+                            resolution_ms: sample.resolution_ms,
                         });
                 }
             }
@@ -212,6 +218,25 @@ struct ChartSpec<'a> {
     threshold: Option<f64>,
 }
 
+fn point_tooltip(point: &Point, x: f64, y: f64, unit: &str) -> String {
+    let resolution = match point.resolution_ms {
+        0 => "raw",
+        300_000 => "5-minute",
+        3_600_000 => "hourly",
+        86_400_000 => "daily",
+        _ => "coarse",
+    };
+    let when =
+        DateTime::<Utc>::from_timestamp_millis(i64::try_from(point.at_ms).unwrap_or_default())
+            .map_or_else(|| point.at_ms.to_string(), |at| at.to_rfc3339());
+    format!(
+        "<circle cx=\"{x:.1}\" cy=\"{y:.1}\" r=\"2\"><title>{}: {:.2} {} ({resolution})</title></circle>",
+        escape(&when),
+        point.value,
+        escape(unit),
+    )
+}
+
 fn chart(spec: ChartSpec<'_>) -> String {
     let ChartSpec {
         id,
@@ -237,6 +262,7 @@ fn chart(spec: ChartSpec<'_>) -> String {
     let gaps = gap_boundaries(points);
     let mut next_gap = 0;
     let mut path = String::new();
+    let mut point_titles = String::new();
     let mut previous = None;
     for point in &visible {
         let x = PLOT_LEFT
@@ -253,6 +279,7 @@ fn chart(spec: ChartSpec<'_>) -> String {
             'M'
         };
         let _ = write!(path, "{command}{x:.1},{y:.1} ");
+        point_titles.push_str(&point_tooltip(point, x, y, unit));
         previous = Some(point.at_ms);
     }
     let peak = points
@@ -298,7 +325,7 @@ fn chart(spec: ChartSpec<'_>) -> String {
     }
     let _ = write!(
         out,
-        "<path class=\"series\" d=\"{path}\"/><text class=\"axis\" x=\"{PLOT_LEFT}\" y=\"213\">{}</text><text class=\"axis\" x=\"{PLOT_RIGHT}\" y=\"213\" text-anchor=\"end\">{}</text></svg>",
+        "<path class=\"series\" d=\"{path}\"/>{point_titles}<text class=\"axis\" x=\"{PLOT_LEFT}\" y=\"213\">{}</text><text class=\"axis\" x=\"{PLOT_RIGHT}\" y=\"213\" text-anchor=\"end\">{}</text></svg>",
         escape(&from_label),
         escape(&to_label)
     );
@@ -583,6 +610,12 @@ pub(super) fn render(report: &Report, series: &HostSeries, include_timeline: boo
             readable_duration(Some(report.observed_working_ms)),
         ),
         (
+            "Peak host CPU",
+            report
+                .peak_host_cpu_percent
+                .map_or_else(|| "Unavailable".to_owned(), |value| format!("{value:.1}%")),
+        ),
+        (
             "Peak host memory",
             readable_optional_bytes(report.peak_host_memory_bytes.map(i128::from)),
         ),
@@ -616,6 +649,33 @@ pub(super) fn render(report: &Report, series: &HostSeries, include_timeline: boo
         );
     }
     out.push_str("</div>");
+    let resolutions = report
+        .observation_resolutions
+        .iter()
+        .map(|(resolution, count)| format!("{resolution}: {count} source samples"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = write!(
+        out,
+        "<p class=\"muted\">Observation resolution: {}.</p>",
+        escape(&resolutions)
+    );
+    if report.coarse_history_approximate {
+        out.push_str("<p class=\"note\">Older charts show bucket averages, not individual samples. Peaks use retained bucket peaks. Arbitrary-threshold pressure, precise swap growth, and partial-bucket comparisons are unavailable or approximate.</p>");
+    }
+    if let Some(status) = &report.retention_status {
+        let _ = write!(
+            out,
+            "<p class=\"note\">Storage cap compacted {} segments early and evicted {} retained segments; latest early compaction at Unix ms {}, latest eviction at Unix ms {}.</p>",
+            status.early_compacted_files,
+            status.evicted_files,
+            status.last_early_compaction_unix_ms,
+            status.last_early_eviction_unix_ms
+        );
+        if status.cap_unmet {
+            out.push_str("<p class=\"note\">Storage cap remains unmet because protected history could not be compacted or removed.</p>");
+        }
+    }
     #[cfg(unix)]
     out.push_str(&control_html(&report.control));
     out.push_str(&host_charts(report, series));
@@ -740,7 +800,11 @@ mod tests {
     #[test]
     fn downsampling_preserves_extremes_and_stays_bounded() {
         let mut points: Vec<_> = (0..10_000)
-            .map(|at_ms| Point { at_ms, value: 10.0 })
+            .map(|at_ms| Point {
+                at_ms,
+                value: 10.0,
+                resolution_ms: 0,
+            })
             .collect();
         points[5_123].value = 99.0;
         let reduced = compact_points(&points);
@@ -760,6 +824,7 @@ mod tests {
             .map(|index| Point {
                 at_ms: index * 1_000 + u64::from(index >= 500) * 120_000,
                 value: 50.0,
+                resolution_ms: 0,
             })
             .collect();
         let output = chart(ChartSpec {

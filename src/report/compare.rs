@@ -54,6 +54,8 @@ struct Period {
     from: String,
     to: String,
     observation_count: usize,
+    observation_resolutions: BTreeMap<String, u64>,
+    coarse_history_approximate: bool,
     observed_working_ms: Option<u128>,
     pressure_ms_per_observed_hour: PressureRates,
     swap_growth_bytes: Option<i128>,
@@ -84,6 +86,28 @@ fn rate(duration: Option<u128>, observed: u128) -> Option<u128> {
     duration
         .filter(|_| observed > 0)
         .map(|value| value.saturating_mul(HOUR_MS) / observed)
+}
+
+fn record_resolution(resolutions: &mut BTreeMap<String, u64>, sample: &Observation) {
+    let label = match sample.resolution_ms {
+        0 => "raw",
+        retention::FIVE_MINUTES_MS => "5m",
+        retention::ONE_HOUR_MS => "1h",
+        retention::ONE_DAY_MS => "1d",
+        _ => "other",
+    };
+    *resolutions.entry(label.to_owned()).or_default() += sample.source_samples();
+}
+
+fn resolution_text(resolutions: &BTreeMap<String, u64>) -> String {
+    if resolutions.is_empty() {
+        return "unavailable".to_owned();
+    }
+    resolutions
+        .iter()
+        .map(|(label, count)| format!("{label}: {count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn command_intervals(records: &[Measurement], from: u128, to: u128) -> Vec<(u128, u128)> {
@@ -152,6 +176,7 @@ fn period(
     let to_ms = u128::try_from(to.timestamp_millis()).unwrap_or_default();
     let mut covered_until = from_ms;
     let mut count = 0;
+    let mut observation_resolutions = BTreeMap::new();
     let mut observed = 0_u128;
     let mut pressure = [None; 4];
     let mut missing = [false; 4];
@@ -159,6 +184,11 @@ fn period(
     let mut first_swap = None;
     let mut last_swap = None;
     let mut swap_samples = 0;
+    let coarse_history_approximate = samples.iter().any(|sample| {
+        sample.resolution_ms > 0
+            && u128::from(sample.at_unix_ms) > from_ms
+            && u128::from(sample.interval_start_unix_ms()) < to_ms
+    });
     let intervals = records.map(|records| command_intervals(records, from_ms, to_ms));
     for sample in samples {
         let at = u128::from(sample.at_unix_ms);
@@ -173,16 +203,16 @@ fn period(
     }
     for sample in samples {
         let at = u128::from(sample.at_unix_ms);
-        if at <= from_ms || at.saturating_sub(u128::from(sample.working_ms)) >= to_ms {
+        if at <= from_ms || u128::from(sample.interval_start_unix_ms()) >= to_ms {
             continue;
         }
         count += 1;
+        record_resolution(&mut observation_resolutions, sample);
         let end = at.min(to_ms);
-        let start = at
-            .saturating_sub(u128::from(sample.working_ms))
+        let start = u128::from(sample.interval_start_unix_ms())
             .max(covered_until)
             .max(from_ms);
-        let duration = end.saturating_sub(start);
+        let duration = super::clipped_sample_duration(sample, start, end);
         covered_until = covered_until.max(end);
         observed += duration;
         let [cpu, memory, swap] = pressure_flags(sample, thresholds);
@@ -217,6 +247,8 @@ fn period(
         from: from.to_rfc3339(),
         to: to.to_rfc3339(),
         observation_count: count,
+        observation_resolutions,
+        coarse_history_approximate,
         observed_working_ms: (observed > 0).then_some(observed),
         pressure_ms_per_observed_hour: PressureRates {
             cpu: rate(pressure[0], observed),
@@ -224,10 +256,12 @@ fn period(
             swap: rate(pressure[2], observed),
             any: rate(any_above, observed),
         },
-        swap_growth_bytes: first_swap
-            .zip(last_swap)
-            .filter(|_| swap_samples >= 2)
-            .map(|(first, last)| i128::from(last) - i128::from(first)),
+        swap_growth_bytes: (!coarse_history_approximate).then_some(()).and(
+            first_swap
+                .zip(last_swap)
+                .filter(|_| swap_samples >= 2)
+                .map(|(first, last)| i128::from(last) - i128::from(first)),
+        ),
         command_history_available: records.is_some(),
         completed_command_count,
         command_categories,
@@ -253,6 +287,16 @@ fn markdown(comparison: &ComparisonReport) -> String {
             "Observations",
             baseline.observation_count.to_string(),
             later.observation_count.to_string(),
+        ),
+        (
+            "Observation resolutions (source samples)",
+            resolution_text(&baseline.observation_resolutions),
+            resolution_text(&later.observation_resolutions),
+        ),
+        (
+            "Coarse history (partial buckets approximate)",
+            baseline.coarse_history_approximate.to_string(),
+            later.coarse_history_approximate.to_string(),
         ),
         (
             "Observed working ms",
@@ -306,6 +350,11 @@ fn markdown(comparison: &ComparisonReport) -> String {
         let _ = writeln!(out, "| {label} | {left} | {right} |");
     }
     out.push_str("\nCommand durations count whole commands that finished in each period. Concurrent wall times can exceed elapsed time. A missing observation or command history is unavailable, not zero.\n\n");
+    command_categories_markdown(&mut out, baseline, later);
+    out
+}
+
+fn command_categories_markdown(out: &mut String, baseline: &Period, later: &Period) {
     out.push_str("| Period | Category | Completed | Wall ms | CPU ms |\n| --- | --- | ---: | ---: | ---: |\n");
     for (label, period) in [("Baseline", baseline), ("Comparison", later)] {
         match &period.command_categories {
@@ -329,7 +378,6 @@ fn markdown(comparison: &ComparisonReport) -> String {
             }
         }
     }
-    out
 }
 
 pub fn run_compare(options: &CompareOptions) -> io::Result<()> {

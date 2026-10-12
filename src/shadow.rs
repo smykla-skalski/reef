@@ -103,6 +103,18 @@ fn analyze(
     cpu_cores: u32,
     pressure: pressure::Options,
 ) -> io::Result<Replay> {
+    let from_ms = u64::try_from(range.0.timestamp_millis()).unwrap_or_default();
+    let to_ms = u64::try_from(range.1.timestamp_millis()).unwrap_or_default();
+    if samples.iter().any(|sample| {
+        sample.resolution_ms > 0
+            && sample.at_unix_ms > from_ms
+            && sample.interval_start_unix_ms() < to_ms
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "shadow replay requires raw host observations; coarse history is not exact admission input",
+        ));
+    }
     let first = samples
         .iter()
         .find(|sample| {
@@ -139,8 +151,6 @@ fn analyze(
         by_agent: BTreeMap::new(),
         interpretation: "Snapshot-only hypothetical admission at each host sample. No command interception, delay, queue simulation, recovery-dwell inference, or causal attribution. Samples are not job arrivals; overlap with agents is not ownership of host pressure.",
     };
-    let from_ms = u64::try_from(range.0.timestamp_millis()).unwrap_or_default();
-    let to_ms = u64::try_from(range.1.timestamp_millis()).unwrap_or_default();
     for sample in samples
         .iter()
         .filter(|sample| sample.at_unix_ms >= from_ms && sample.at_unix_ms < to_ms)

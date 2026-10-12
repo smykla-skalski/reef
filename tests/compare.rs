@@ -82,6 +82,11 @@ fn comparison_normalizes_pressure_and_counts_completed_commands() {
     let comparison: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(comparison["interpretation"], "observational_not_causal");
     assert_eq!(comparison["baseline"]["observed_working_ms"], 3_600_000);
+    assert_eq!(comparison["baseline"]["observation_resolutions"]["raw"], 2);
+    assert_eq!(
+        comparison["comparison"]["observation_resolutions"]["raw"],
+        2
+    );
     assert_eq!(
         comparison["baseline"]["pressure_ms_per_observed_hour"]["cpu"],
         1_800_000
@@ -106,6 +111,42 @@ fn comparison_normalizes_pressure_and_counts_completed_commands() {
         comparison["comparison"]["pressure_without_measured_command_overlap_percent"].is_null()
     );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("private-project"));
+}
+
+#[test]
+fn comparison_labels_coarse_history_and_unavailable_pressure() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.join("host-5m-1767225600000-1.jsonl"),
+        "{\"bucket_start_unix_ms\":1767225600000,\"resolution_ms\":300000,\"source_samples\":3,\"observed_working_ms\":180000,\"cpu_percent\":{\"weighted_sum\":17100000.0,\"weight_ms\":180000,\"peak\":99.0}}\n",
+    )
+    .unwrap();
+    let output = reef()
+        .args(args())
+        .arg("--state-dir")
+        .arg(&fixture.0)
+        .args(["--format", "json"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let comparison: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(comparison["baseline"]["observation_resolutions"]["5m"], 3);
+    assert_eq!(comparison["baseline"]["coarse_history_approximate"], true);
+    assert!(comparison["baseline"]["pressure_ms_per_observed_hour"]["cpu"].is_null());
+
+    let markdown = reef()
+        .args(args())
+        .arg("--state-dir")
+        .arg(&fixture.0)
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+    assert!(markdown.status.success(), "{markdown:?}");
+    assert!(
+        String::from_utf8_lossy(&markdown.stdout)
+            .contains("Observation resolutions (source samples) | 5m: 3")
+    );
 }
 
 #[test]
