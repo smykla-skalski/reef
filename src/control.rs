@@ -1,4 +1,5 @@
 use crate::run::{self, RecordMode};
+use crate::{contain, schedule};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -14,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const EVENTS: &str = "attempts.jsonl";
 const MEASUREMENTS: &str = "measurements.jsonl";
 const ENROLLMENT_LOCK: &str = "enrollment.lock";
+const CANARY_OFF: &str = "canary.off";
 const TELEMETRY_WARNING: &str = "private control telemetry unavailable; control enrollment refused";
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -43,6 +45,7 @@ pub struct Summary {
 pub struct Group {
     pub agent: String,
     pub category: String,
+    pub arm: String,
     pub assigned: usize,
     pub measured: usize,
     pub pending: usize,
@@ -180,6 +183,95 @@ fn append(dir: &Path, event: &Event) -> io::Result<()> {
     Ok(())
 }
 
+fn disabled(dir: &Path) -> io::Result<bool> {
+    let path = dir.join(CANARY_OFF);
+    let mut file = match private_file(&path, false) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    if contents != "off\n" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "canary off switch is invalid",
+        ));
+    }
+    Ok(true)
+}
+
+pub fn canary_action(state_dir: Option<&Path>, action: &str) -> io::Result<()> {
+    let dir = if state_dir.is_some() {
+        prepare(state_dir)?
+    } else if let Some(pinned) = env::var_os("REEF_AGENT_CONTROL_DIR") {
+        let pinned = PathBuf::from(pinned);
+        if !pinned.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pinned agent control directory must be absolute",
+            ));
+        }
+        prepare_inner(&pinned).map_err(|_| io::Error::other(TELEMETRY_WARNING))?;
+        pinned
+    } else {
+        prepare(None)?
+    };
+    let lock = private_file(&dir.join(ENROLLMENT_LOCK), true)?;
+    lock.lock_exclusive()?;
+    let was_off = disabled(&dir)?;
+    match action {
+        "off" if !was_off => {
+            let mut file = private_file(&dir.join(CANARY_OFF), true)?;
+            file.write_all(b"off\n")?;
+            file.sync_all()?;
+        }
+        "on" if was_off => fs::remove_file(dir.join(CANARY_OFF))?,
+        "on" | "off" | "status" => {}
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid canary action",
+            ));
+        }
+    }
+    eprintln!(
+        "reef: new best-effort canary treatment assignments are {}",
+        if action == "off" || (action == "status" && was_off) {
+            "off"
+        } else {
+            "on"
+        }
+    );
+    Ok(())
+}
+
+fn assignment(dir: &Path, event: &mut Event, percent: Option<u8>) -> io::Result<bool> {
+    if let Some(percent) = percent {
+        let lock = private_file(&dir.join(ENROLLMENT_LOCK), true)?;
+        lock.lock_exclusive()?;
+        let paused = disabled(dir)?;
+        let treatment = !paused
+            && u32::from_str_radix(&event.attempt_id[..8], 16).map_err(io::Error::other)? % 100
+                < u32::from(percent);
+        event.assignment = Some(
+            if paused {
+                "paused"
+            } else if treatment {
+                "treatment"
+            } else {
+                "control"
+            }
+            .to_owned(),
+        );
+        append(dir, event)?;
+        Ok(treatment)
+    } else {
+        append(dir, event)?;
+        Ok(false)
+    }
+}
+
 pub fn run(original: Option<&Path>, args: &[OsString], category: &str) -> io::Result<u8> {
     let dir =
         env::var_os("REEF_AGENT_CONTROL_DIR").ok_or_else(|| io::Error::other(TELEMETRY_WARNING))?;
@@ -198,7 +290,16 @@ pub fn run(original: Option<&Path>, args: &[OsString], category: &str) -> io::Re
         category: category.to_owned(),
         assignment: Some("control".to_owned()),
     };
-    append(&dir, &event).map_err(|_| io::Error::other(TELEMETRY_WARNING))?;
+    let percent = env::var("REEF_AGENT_CANARY_PERCENT")
+        .ok()
+        .map(|value| value.parse::<u8>())
+        .transpose()
+        .map_err(|_| io::Error::other("invalid canary percentage"))?;
+    if percent.is_some_and(|value| value > 100) {
+        return Err(io::Error::other("invalid canary percentage"));
+    }
+    let treatment =
+        assignment(&dir, &mut event, percent).map_err(|_| io::Error::other(TELEMETRY_WARNING))?;
     let result = match original {
         Some(original) => {
             let command = std::iter::once(original.as_os_str().to_os_string())
@@ -206,12 +307,32 @@ pub fn run(original: Option<&Path>, args: &[OsString], category: &str) -> io::Re
                 .map(OsString::into_string)
                 .collect::<Result<Vec<_>, _>>();
             match command {
-                Ok(command) => run::run(
-                    &command,
-                    category,
-                    &id,
-                    RecordMode::Control(&dir.join(MEASUREMENTS)),
-                ),
+                Ok(command) => {
+                    let record_path = dir.join(MEASUREMENTS);
+                    if treatment {
+                        let max_wait_ms = env::var("REEF_AGENT_MAX_WAIT_MS")
+                            .ok()
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .filter(|value| (1..=crate::agents::MAX_WAIT_MS).contains(value))
+                            .ok_or_else(|| io::Error::other("invalid agent wait limit"));
+                        max_wait_ms.and_then(|wait| {
+                            let state_dir = env::var_os("REEF_AGENT_STATE_DIR").map(PathBuf::from);
+                            schedule::schedule(schedule::RunOptions {
+                                command: &command,
+                                category,
+                                identity: &id,
+                                record: RecordMode::Control(&record_path),
+                                cpu: 1,
+                                memory_mib: 1024,
+                                state_dir: state_dir.as_deref(),
+                                max_wait: Some(std::time::Duration::from_millis(wait)),
+                                limits: &contain::Limits::default(),
+                            })
+                        })
+                    } else {
+                        run::run(&command, category, &id, RecordMode::Control(&record_path))
+                    }
+                }
                 Err(_) => Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "control command arguments must be UTF-8",
@@ -232,8 +353,12 @@ pub fn run(original: Option<&Path>, args: &[OsString], category: &str) -> io::Re
     event.at_unix_ms = now_ms();
     event.assignment = None;
     append(&dir, &event).map_err(|_| io::Error::other(TELEMETRY_WARNING))?;
-    result.map_err(|_| {
-        io::Error::other("control measurement unavailable; see private telemetry warning")
+    result.map_err(|error| {
+        if treatment {
+            io::Error::other(format!("canary treatment unavailable: {error}"))
+        } else {
+            io::Error::other("control measurement unavailable; see private telemetry warning")
+        }
     })
 }
 
@@ -266,6 +391,7 @@ struct Attempt {
     at_unix_ms: u128,
     agent: String,
     category: String,
+    arm: String,
     completed: bool,
     unavailable: bool,
 }
@@ -290,7 +416,12 @@ pub fn summary(dir: Option<&Path>, from_ms: u128, to_ms: u128) -> Summary {
             return Summary::unavailable();
         }
         match event.kind.as_str() {
-            "assigned" if event.assignment.as_deref() == Some("control") => {
+            "assigned"
+                if matches!(
+                    event.assignment.as_deref(),
+                    Some("control" | "treatment" | "paused")
+                ) =>
+            {
                 if attempts
                     .insert(
                         event.attempt_id,
@@ -298,6 +429,7 @@ pub fn summary(dir: Option<&Path>, from_ms: u128, to_ms: u128) -> Summary {
                             at_unix_ms: event.at_unix_ms,
                             agent: event.agent,
                             category: event.category,
+                            arm: event.assignment.unwrap_or_default(),
                             completed: false,
                             unavailable: false,
                         },
@@ -349,16 +481,21 @@ fn summarize_attempts(
     let mut unavailable = 0;
     let mut pending = 0;
     let mut gap = false;
-    let mut groups: BTreeMap<(String, String), Group> = BTreeMap::new();
+    let mut groups: BTreeMap<(String, String, String), Group> = BTreeMap::new();
     for (id, attempt) in attempts
         .iter()
         .filter(|(_, attempt)| attempt.at_unix_ms >= from_ms && attempt.at_unix_ms < to_ms)
     {
         let group = groups
-            .entry((attempt.agent.clone(), attempt.category.clone()))
+            .entry((
+                attempt.agent.clone(),
+                attempt.category.clone(),
+                attempt.arm.clone(),
+            ))
             .or_insert_with(|| Group {
                 agent: attempt.agent.clone(),
                 category: attempt.category.clone(),
+                arm: attempt.arm.clone(),
                 ..Group::default()
             });
         group.assigned += 1;

@@ -17,7 +17,11 @@ struct Fixture {
 
 impl Fixture {
     fn new(serve: bool) -> Self {
-        let path = std::env::temp_dir().join(format!(
+        Self::new_in(serve, &std::env::temp_dir())
+    }
+
+    fn new_in(serve: bool, root: &Path) -> Self {
+        let path = root.join(format!(
             "reef-agents-test-{}-{}",
             std::process::id(),
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
@@ -77,6 +81,26 @@ impl Fixture {
 
     fn launch_mode(&self, agent: &str, args: &[&str], control: bool) -> Command {
         self.launch_mode_with_wait(agent, args, control, 60_000)
+    }
+
+    fn launch_canary(&self, agent: &str, percent: u8, args: &[&str]) -> Command {
+        let mut replacement = reef();
+        let path = std::env::join_paths(
+            std::iter::once(self.path.join("bin"))
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        replacement
+            .args(["agents", "launch", agent, "--state-dir"])
+            .arg(&self.path)
+            .arg("--canary-percent")
+            .arg(percent.to_string())
+            .arg("--")
+            .args(args)
+            .env("PATH", path)
+            .env("HOME", &self.path)
+            .env("REEF_TEST_OUTPUT", self.path.join("output"));
+        replacement
     }
 
     fn launch_mode_with_wait(
@@ -345,6 +369,257 @@ fn missing_control_command_is_counted_as_unavailable() {
 }
 
 #[test]
+fn canary_zero_percent_runs_measured_control_without_scheduler() {
+    let fixture = Fixture::new(false);
+    let output = fixture
+        .launch_canary("codex", 0, &["go", "test", "private-argument"])
+        .env("REEF_TEST_NESTED_ENABLED", "1")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    assert_eq!(
+        fixture.control_report()["control"]["groups"][0]["arm"],
+        "control"
+    );
+    assert_eq!(fixture.control_report()["control"]["attempted"], 1);
+    assert_eq!(
+        fs::read_to_string(fixture.path.join("output"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("queued request"));
+    assert!(
+        !fs::read_to_string(fixture.path.join("control/attempts.jsonl"))
+            .unwrap()
+            .contains("private-argument")
+    );
+}
+
+#[test]
+fn canary_hundred_percent_queues_and_measures_treatment() {
+    let fixture = Fixture::new(true);
+    let output = fixture
+        .launch_canary("claude", 100, &["go", "test", "private-argument"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("queued request"));
+    let report = fixture.control_report();
+    assert_eq!(report["control"]["attempted"], 1);
+    assert_eq!(report["control"]["completed"], 1);
+    assert_eq!(report["control"]["groups"][0]["arm"], "treatment");
+    assert_eq!(report["control"]["groups"][0]["measured"], 1);
+    assert!(
+        !fs::read_to_string(fixture.path.join("control/attempts.jsonl"))
+            .unwrap()
+            .contains("private-argument")
+    );
+}
+
+#[test]
+fn canary_does_not_rerun_treatment_when_scheduler_is_unavailable() {
+    let fixture = Fixture::new(false);
+    let output = fixture
+        .launch_canary("opencode", 100, &["go", "test"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("scheduler unavailable"),
+        "{output:?}"
+    );
+    assert!(!fixture.path.join("output").exists());
+    let report = fixture.control_report();
+    assert_eq!(report["control"]["attempted"], 1);
+    assert_eq!(report["control"]["unavailable"], 1);
+    assert_eq!(report["control"]["groups"][0]["arm"], "treatment");
+}
+
+#[test]
+fn canary_keeps_relative_state_paths_after_agent_changes_directory() {
+    let fixture = Fixture::new(false);
+    write_script(
+        &fixture.path.join("bin/codex"),
+        "#!/bin/sh\ncd /\nexec \"$@\"\n",
+    );
+    let path = std::env::join_paths(
+        std::iter::once(fixture.path.join("bin"))
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let output = reef()
+        .args([
+            "agents",
+            "launch",
+            "codex",
+            "--state-dir",
+            "state",
+            "--canary-percent",
+            "100",
+            "--",
+            "go",
+            "test",
+        ])
+        .current_dir(&fixture.path)
+        .env("PATH", path)
+        .env("HOME", &fixture.path)
+        .env("REEF_TEST_OUTPUT", fixture.path.join("output"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("scheduler unavailable"),
+        "{output:?}"
+    );
+    assert!(!fixture.path.join("output").exists());
+    let events = fs::read_to_string(fixture.path.join("state/control/attempts.jsonl")).unwrap();
+    assert!(events.contains("\"assignment\":\"treatment\""));
+}
+
+#[test]
+fn canary_without_state_dir_ignores_inherited_scheduler_path() {
+    let mut fixture = Fixture::new_in(false, Path::new("/tmp"));
+    write_script(
+        &fixture.path.join("bin/codex"),
+        "#!/bin/sh\nHOME=\"$REEF_TEST_ALT_HOME\"\nexport HOME\nexec \"$@\"\n",
+    );
+    let server = reef()
+        .args([
+            "serve",
+            "--cpu",
+            "1",
+            "--memory-mib",
+            "1024",
+            "--no-pressure",
+        ])
+        .env("HOME", &fixture.path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    fixture.server = Some(server);
+    wait_until(|| {
+        reef()
+            .arg("queue")
+            .env("HOME", &fixture.path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    });
+    let path = std::env::join_paths(
+        std::iter::once(fixture.path.join("bin"))
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let output = reef()
+        .args([
+            "agents",
+            "launch",
+            "codex",
+            "--canary-percent",
+            "100",
+            "--",
+            "go",
+            "test",
+        ])
+        .env("PATH", path)
+        .env("HOME", &fixture.path)
+        .env("REEF_TEST_ALT_HOME", fixture.path.join("other-home"))
+        .env("REEF_AGENT_STATE_DIR", fixture.path.join("stale"))
+        .env("REEF_TEST_OUTPUT", fixture.path.join("output"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("queued request"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("stale"));
+    assert_eq!(
+        fs::read_to_string(fixture.path.join("output")).unwrap(),
+        "1|codex|test\n"
+    );
+    let events = fs::read_to_string(
+        fixture
+            .path
+            .join(".local/state/reef/control/attempts.jsonl"),
+    )
+    .unwrap();
+    assert!(events.contains("\"assignment\":\"treatment\""));
+}
+
+#[test]
+fn canary_off_inside_agent_uses_pinned_control_dir_after_home_changes() {
+    let fixture = Fixture::new(false);
+    write_script(
+        &fixture.path.join("bin/codex"),
+        "#!/bin/sh\nHOME=\"$REEF_TEST_ALT_HOME\"\nexport HOME\n\"$REEF_TEST_REEF\" agents canary off || exit 1\nexec \"$@\"\n",
+    );
+    let output = fixture
+        .launch_canary("codex", 100, &["go", "test"])
+        .env("REEF_TEST_ALT_HOME", fixture.path.join("other-home"))
+        .env("REEF_TEST_REEF", env!("CARGO_BIN_EXE_reef"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("assignments are off"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("scheduler unavailable"));
+    assert_eq!(
+        fixture.control_report()["control"]["groups"][0]["arm"],
+        "paused"
+    );
+    assert!(
+        !fixture
+            .path
+            .join("other-home/.local/state/reef/control")
+            .exists()
+    );
+    let status = reef()
+        .args(["agents", "canary", "status", "--state-dir"])
+        .arg(&fixture.path)
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "{status:?}");
+    assert!(String::from_utf8_lossy(&status.stderr).contains("assignments are off"));
+}
+
+#[test]
+fn canary_off_switch_prevents_new_treatment_assignments() {
+    let fixture = Fixture::new(false);
+    let off = reef()
+        .args(["agents", "canary", "off", "--state-dir"])
+        .arg(&fixture.path)
+        .env("HOME", &fixture.path)
+        .output()
+        .unwrap();
+    assert!(off.status.success(), "{off:?}");
+    let output = fixture
+        .launch_canary("codex", 100, &["go", "test"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    assert_eq!(
+        fixture.control_report()["control"]["groups"][0]["arm"],
+        "paused"
+    );
+    let on = reef()
+        .args(["agents", "canary", "on", "--state-dir"])
+        .arg(&fixture.path)
+        .env("HOME", &fixture.path)
+        .output()
+        .unwrap();
+    assert!(on.status.success(), "{on:?}");
+    let unavailable = fixture
+        .launch_canary("codex", 100, &["go", "test"])
+        .output()
+        .unwrap();
+    assert!(!unavailable.status.success(), "{unavailable:?}");
+    let report = fixture.control_report();
+    assert_eq!(report["control"]["groups"][0]["arm"], "paused");
+    assert_eq!(report["control"]["groups"][1]["arm"], "treatment");
+}
+
+#[test]
 fn control_counts_one_attempt_per_top_level_command_without_scheduler() {
     for agent in ["codex", "claude", "opencode"] {
         let fixture = Fixture::new(false);
@@ -400,8 +675,8 @@ fn control_counts_one_attempt_per_top_level_command_without_scheduler() {
             .unwrap();
         assert!(markdown.status.success(), "{markdown:?}");
         let markdown = String::from_utf8(markdown.stdout).unwrap();
-        assert!(markdown.contains("| Agent | Category | Assigned | Measured |"));
-        assert!(markdown.contains(&format!("| {agent} | test | 1 | 1 |")));
+        assert!(markdown.contains("| Agent | Category | Arm | Assigned | Measured |"));
+        assert!(markdown.contains(&format!("| {agent} | test | control | 1 | 1 |")));
         assert!(!markdown.contains("private-argument"));
         let html = reef()
             .args(["report", "--format", "html", "--state-dir"])
@@ -414,7 +689,7 @@ fn control_counts_one_attempt_per_top_level_command_without_scheduler() {
         assert!(html.status.success(), "{html:?}");
         let html = String::from_utf8(html.stdout).unwrap();
         assert!(html.contains("<th>Measured</th>"));
-        assert!(html.contains(&format!("<td>{agent}</td><td>test</td>")));
+        assert!(html.contains(&format!("<td>{agent}</td><td>test</td><td>control</td>")));
         assert!(!html.contains("private-argument"));
         assert_eq!(report["command_count"], 1);
         assert_eq!(report["agent_commands"][0]["agent"], agent);

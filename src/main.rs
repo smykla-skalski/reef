@@ -255,11 +255,22 @@ enum AgentCommand {
         /// Measure eligible commands without scheduler admission.
         #[arg(long)]
         control: bool,
+        /// Assign this percentage of eligible commands to host-only scheduler admission.
+        #[arg(long, conflicts_with = "control", value_parser = clap::value_parser!(u8).range(0..=100))]
+        canary_percent: Option<u8>,
         /// Maximum time a heavy command waits for scheduler admission.
         #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u64).range(1..=agents::MAX_WAIT_MS))]
         max_wait_ms: u64,
         #[arg(last = true)]
         args: Vec<String>,
+    },
+    /// Stop or resume new best-effort canary treatment assignments.
+    #[cfg(unix)]
+    Canary {
+        #[arg(value_enum)]
+        action: CanaryAction,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
     },
     /// Register a new agent process for passive observation.
     Observe {
@@ -297,6 +308,14 @@ enum AgentName {
     Codex,
     Claude,
     Opencode,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CanaryAction {
+    On,
+    Off,
+    Status,
 }
 
 #[cfg(unix)]
@@ -460,14 +479,25 @@ fn agent_command(command: AgentCommand) -> std::process::ExitCode {
             agent,
             state_dir,
             control,
+            canary_percent,
             max_wait_ms,
             args,
         } => command_result(agents::launch(
             agent.as_str(),
             state_dir.as_deref(),
             control,
+            canary_percent,
             max_wait_ms,
             &args,
+        )),
+        #[cfg(unix)]
+        AgentCommand::Canary { action, state_dir } => result(control::canary_action(
+            state_dir.as_deref(),
+            match action {
+                CanaryAction::On => "on",
+                CanaryAction::Off => "off",
+                CanaryAction::Status => "status",
+            },
         )),
         AgentCommand::Observe {
             agent,

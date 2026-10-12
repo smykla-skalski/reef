@@ -2114,7 +2114,7 @@ fn timeline_markdown(events: &[PressureEvent]) -> String {
 
 #[cfg(unix)]
 fn control_markdown(control: &control::Summary) -> String {
-    let mut out = String::from("## Opt-in control attempts\n\n");
+    let mut out = String::from("## Opt-in measured agent attempts\n\n");
     if !control.available {
         out.push_str("Warning: private control telemetry is missing, unreadable, or invalid. Counts are unavailable.\n\n");
         return out;
@@ -2132,13 +2132,14 @@ fn control_markdown(control: &control::Summary) -> String {
     }
     if !control.groups.is_empty() {
         out.push_str("Measured costs cover completed attempts with a valid command record; pending and unavailable attempts are excluded from cost totals.\n\n");
-        out.push_str("| Agent | Category | Assigned | Measured | Pending | Unavailable | Success | Failed | Cancelled | Measured wall | Measured CPU | Peak memory |\n| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+        out.push_str("| Agent | Category | Arm | Assigned | Measured | Pending | Unavailable | Success | Failed | Cancelled | Measured wall | Measured CPU | Peak memory |\n| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
         for group in &control.groups {
             let _ = writeln!(
                 out,
-                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                 group.agent,
                 group.category,
+                group.arm,
                 group.assigned,
                 group.measured,
                 group.pending,
