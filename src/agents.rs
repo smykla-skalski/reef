@@ -12,6 +12,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const TOOLS: &[&str] = &["go", "cargo", "golangci-lint", "mise", "make"];
+pub(crate) const MAX_WAIT_MS: u64 = 24 * 60 * 60 * 1000;
 
 pub fn shim_name() -> Option<String> {
     let name = env::args_os()
@@ -156,10 +157,10 @@ pub fn shim(tool: &str) -> io::Result<u8> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "agent wait limit is missing"))?
         .parse::<u64>()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid agent wait limit"))?;
-    if max_wait_ms == 0 {
+    if max_wait_ms == 0 || max_wait_ms > MAX_WAIT_MS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "agent wait limit must be positive",
+            "agent wait limit must be between 1 ms and 24 hours",
         ));
     }
     process

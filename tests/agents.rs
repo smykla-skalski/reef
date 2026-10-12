@@ -150,6 +150,21 @@ fn agent_wait_expires_without_starting_a_queued_command() {
     assert_eq!(first.wait().unwrap().code(), Some(7));
 }
 
+#[test]
+fn agent_launch_rejects_unrepresentable_wait_before_starting() {
+    let fixture = Fixture::new(false);
+    let output = fixture
+        .launch_mode_with_wait("codex", &["go", "test", "./..."], false, u64::MAX)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--max-wait-ms"),
+        "{output:?}"
+    );
+    assert!(!fixture.path.join("output").exists());
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         if let Some(server) = self.server.as_mut() {

@@ -255,7 +255,7 @@ enum AgentCommand {
         #[arg(long)]
         control: bool,
         /// Maximum time a heavy command waits for scheduler admission.
-        #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u64).range(1..))]
+        #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u64).range(1..=agents::MAX_WAIT_MS))]
         max_wait_ms: u64,
         #[arg(last = true)]
         args: Vec<String>,
