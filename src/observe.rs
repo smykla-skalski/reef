@@ -484,26 +484,55 @@ fn fold_tick(rollups: &mut BTreeMap<(u64, String), AgentRollup>, tick: &AgentTic
 
 fn fold_agent_segments(dir: &Path, now: u64, _options: &ObserveOptions) -> io::Result<()> {
     let current_hour = now / 3_600_000;
+    let mut first_error = None;
     for (timestamp, path, _) in segments_with_prefix(dir, "agent-samples-")? {
         if timestamp / 3_600_000 >= current_hour {
             continue;
         }
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.strip_prefix("agent-samples-"))
-            .ok_or_else(|| io::Error::other("invalid agent sample segment"))?;
-        let target = dir.join(format!("agent-rollups-{name}"));
-        let mut rollups = BTreeMap::new();
-        for line in BufReader::new(File::open(&path)?).lines() {
-            let tick: AgentTick = serde_json::from_str(&line?).map_err(io::Error::other)?;
-            fold_tick(&mut rollups, &tick);
+        let result = (|| {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("agent-samples-"))
+                .ok_or_else(|| io::Error::other("invalid agent sample segment"))?;
+            let target = dir.join(format!("agent-rollups-{name}"));
+            let mut rollups = BTreeMap::new();
+            for line in BufReader::new(File::open(&path)?).lines() {
+                let tick: AgentTick = serde_json::from_str(&line?).map_err(io::Error::other)?;
+                fold_tick(&mut rollups, &tick);
+            }
+            let records: Vec<_> = rollups.into_values().collect();
+            retention::publish(dir, &target, &records)?;
+            fs::remove_file(&path)
+        })();
+        if let Err(error) = result
+            && first_error.is_none()
+        {
+            first_error = Some(io::Error::new(
+                error.kind(),
+                format!("{}: {error}", path.display()),
+            ));
         }
-        let records: Vec<_> = rollups.into_values().collect();
-        retention::publish(dir, &target, &records)?;
-        fs::remove_file(path)?;
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
+}
+
+fn changed_error(previous: &mut Option<String>, result: io::Result<()>) -> Option<String> {
+    match result {
+        Ok(()) => {
+            *previous = None;
+            None
+        }
+        Err(error) => {
+            let message = error.to_string();
+            if previous.as_deref() == Some(&message) {
+                None
+            } else {
+                *previous = Some(message.clone());
+                Some(message)
+            }
+        }
+    }
 }
 
 fn working_ms(elapsed: Duration, interval: Duration) -> u64 {
@@ -603,6 +632,8 @@ fn record_loop(dir: &Path, stop_path: &Path, options: &ObserveOptions) -> io::Re
     );
     let mut previous_host = std::time::Instant::now();
     let mut previous_tick = std::time::Instant::now();
+    let mut previous_fold_error = None;
+    let mut previous_compaction_error = None;
     loop {
         thread::sleep(tick_interval);
         if stop_path.exists() {
@@ -621,7 +652,10 @@ fn record_loop(dir: &Path, stop_path: &Path, options: &ObserveOptions) -> io::Re
                 dir,
                 working_ms(host_elapsed, interval),
             )?;
-            if let Err(error) = fold_agent_segments(dir, observation.at_unix_ms, options) {
+            if let Some(error) = changed_error(
+                &mut previous_fold_error,
+                fold_agent_segments(dir, observation.at_unix_ms, options),
+            ) {
                 eprintln!("reef observer could not fold agent history: {error}");
             }
             if !observation.agents.is_empty() {
@@ -637,9 +671,10 @@ fn record_loop(dir: &Path, stop_path: &Path, options: &ObserveOptions) -> io::Re
                 )?;
             }
             append(dir, &observation, options)?;
-            if let Err(error) =
-                retention::maintain(dir, observation.at_unix_ms, retention_policy(options))
-            {
+            if let Some(error) = changed_error(
+                &mut previous_compaction_error,
+                retention::maintain(dir, observation.at_unix_ms, retention_policy(options)),
+            ) {
                 eprintln!("reef observer could not compact history: {error}");
             }
             #[cfg(unix)]
@@ -959,6 +994,76 @@ mod tests {
         assert_eq!(rollup["commands"]["go test"]["peak_memory_bytes"], 300);
         assert_eq!(rollup["commands"]["go test"]["read_bytes"], 10);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn conflicting_agent_rollup_preserves_source_and_allows_later_segments() {
+        let dir = std::env::temp_dir().join(format!(
+            "reef-agent-fold-conflict-test-{}",
+            std::process::id()
+        ));
+        private_dir(&dir).unwrap();
+        let tick = |at_unix_ms| AgentTick {
+            at_unix_ms,
+            working_ms: 1_000,
+            agents: vec![AgentObservation {
+                kind: "codex".to_owned(),
+                root_pid: 42,
+                process_count: 1,
+                cpu_percent: Some(50.0),
+                memory_bytes: 400,
+                read_bytes: None,
+                written_bytes: None,
+            }],
+            commands: vec![],
+        };
+        append_agent_tick(&dir, &tick(3_600_100), &options(&dir)).unwrap();
+        append_agent_tick(&dir, &tick(7_200_100), &options(&dir)).unwrap();
+        let sources = segments_with_prefix(&dir, "agent-samples-").unwrap();
+        assert_eq!(sources.len(), 2);
+        let first_name = sources[0]
+            .1
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .replacen("agent-samples-", "agent-rollups-", 1);
+        let conflicting_target = dir.join(first_name);
+        fs::write(&conflicting_target, b"{}\n").unwrap();
+
+        let error = fold_agent_segments(&dir, 10_800_000, &options(&dir)).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("existing compacted segment differs")
+        );
+        assert!(error.to_string().contains("agent-samples-"));
+        assert!(sources[0].1.exists());
+        assert!(!sources[1].1.exists());
+        assert_eq!(fs::read(&conflicting_target).unwrap(), b"{}\n");
+        assert_eq!(
+            segments_with_prefix(&dir, "agent-rollups-").unwrap().len(),
+            2
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recurring_compaction_error_is_reported_once_until_it_clears() {
+        let mut previous = None;
+        let failure = || Err(io::Error::other("conflicting segment"));
+
+        assert_eq!(
+            changed_error(&mut previous, failure()).as_deref(),
+            Some("conflicting segment")
+        );
+        assert_eq!(changed_error(&mut previous, failure()), None);
+        assert_eq!(changed_error(&mut previous, Ok(())), None);
+        assert_eq!(
+            changed_error(&mut previous, failure()).as_deref(),
+            Some("conflicting segment")
+        );
     }
 
     #[test]
