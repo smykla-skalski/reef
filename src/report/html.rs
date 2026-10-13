@@ -230,7 +230,7 @@ fn point_tooltip(point: &Point, x: f64, y: f64, unit: &str) -> String {
         DateTime::<Utc>::from_timestamp_millis(i64::try_from(point.at_ms).unwrap_or_default())
             .map_or_else(|| point.at_ms.to_string(), |at| at.to_rfc3339());
     format!(
-        "<circle cx=\"{x:.1}\" cy=\"{y:.1}\" r=\"2\"><title>{}: {:.2} {} ({resolution})</title></circle>",
+        "<circle cx=\"{x:.1}\" cy=\"{y:.1}\" r=\"4\" fill=\"none\" pointer-events=\"all\"><title>{}: {:.2} {} ({resolution})</title></circle>",
         escape(&when),
         point.value,
         escape(unit),
@@ -846,5 +846,19 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(path.matches('M').count(), 2);
+    }
+
+    #[test]
+    fn tooltip_hit_targets_do_not_paint_over_the_series() {
+        let point = Point {
+            at_ms: 1_000,
+            value: 42.0,
+            resolution_ms: 0,
+        };
+        let tooltip = point_tooltip(&point, 100.0, 120.0, "%");
+
+        assert!(tooltip.contains("r=\"4\" fill=\"none\" pointer-events=\"all\""));
+        assert!(tooltip.contains("<title>"));
+        assert!(tooltip.contains("42.00 % (raw)</title>"));
     }
 }
