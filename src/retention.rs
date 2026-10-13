@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write};
@@ -443,14 +443,26 @@ fn read_lines<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<Vec<T>> {
         .collect()
 }
 
-pub(crate) fn publish<T: Serialize + for<'de> Deserialize<'de> + PartialEq>(
+pub(crate) fn publish<T: Serialize + DeserializeOwned>(
     dir: &Path,
     target: &Path,
     records: &[T],
 ) -> io::Result<()> {
+    let mut serialized = Vec::new();
+    for record in records {
+        let start = serialized.len();
+        serde_json::to_writer(&mut serialized, record)?;
+        serde_json::from_slice::<T>(&serialized[start..]).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("compacted segment is not readable: {error}"),
+            )
+        })?;
+        serialized.push(b'\n');
+    }
     match fs::symlink_metadata(target) {
         Ok(metadata) if metadata.is_file() => {
-            if read_lines::<T>(target)? == records {
+            if fs::read(target)? == serialized {
                 return Ok(());
             }
             return Err(io::Error::new(
@@ -469,15 +481,12 @@ pub(crate) fn publish<T: Serialize + for<'de> Deserialize<'de> + PartialEq>(
     ));
     let mut file = crate::observe::private_file(&temporary, true, false)?;
     let result = (|| {
-        for record in records {
-            serde_json::to_writer(&mut file, record)?;
-            file.write_all(b"\n")?;
-        }
+        file.write_all(&serialized)?;
         file.sync_all()?;
         fs::rename(&temporary, target)?;
         #[cfg(unix)]
         File::open(dir)?.sync_all()?;
-        if read_lines::<T>(target)? != records {
+        if fs::read(target)? != serialized {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "compacted segment validation failed",
@@ -1273,6 +1282,45 @@ mod tests {
 
         assert!(source.exists());
         assert_eq!(fs::read(&target).unwrap(), b"{broken\n");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn published_float_rollups_validate_by_written_bytes() {
+        let dir = fixture();
+        let host_target = dir.join("host-5m-float.jsonl");
+        let mut host = HostSummary::new(0, FIVE_MINUTES_MS);
+        host.cpu_percent.weighted_sum = f64::from_bits(0x414c_054c_23d7_0a3e);
+
+        publish(&dir, &host_target, &[host.clone()]).unwrap();
+        let host_bytes = fs::read(&host_target).unwrap();
+        publish(&dir, &host_target, &[host]).unwrap();
+        assert_eq!(fs::read(&host_target).unwrap(), host_bytes);
+
+        let agent_target = dir.join("agent-rollups-float.jsonl");
+        let mut agent = AgentSummary::empty(0, 60_000, "codex".to_owned());
+        agent.cpu_core_ms_estimate = f64::from_bits(0x414c_054c_23d7_0a3e);
+
+        publish(&dir, &agent_target, &[agent.clone()]).unwrap();
+        let agent_bytes = fs::read(&agent_target).unwrap();
+        publish(&dir, &agent_target, &[agent]).unwrap();
+        assert_eq!(fs::read(&agent_target).unwrap(), agent_bytes);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn overflowing_float_rollup_keeps_raw_source() {
+        let dir = fixture();
+        let now = 20 * DAY_MS;
+        let at = now - 3 * DAY_MS;
+        let source = dir.join(format!("samples-{at}-1.jsonl"));
+        let target = dir.join(format!("host-5m-{at}-1.jsonl"));
+        let sample = raw_host(at).replace("\"cpu_percent\":50.0", "\"cpu_percent\":1e308");
+        fs::write(&source, &sample).unwrap();
+
+        assert!(maintain(&dir, now, policy()).is_err());
+        assert_eq!(fs::read_to_string(&source).unwrap(), sample);
+        assert!(!target.exists());
         fs::remove_dir_all(dir).unwrap();
     }
 
