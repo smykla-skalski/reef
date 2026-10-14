@@ -33,6 +33,32 @@ fn reef() -> Command {
 }
 
 #[test]
+fn report_defaults_to_all_retained_observations() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.join("samples-test.jsonl"),
+        concat!(
+            "{\"at_unix_ms\":1767225601000,\"working_ms\":1000,\"cpu_percent\":25.0}\n",
+            "{\"at_unix_ms\":1767398401000,\"working_ms\":1000,\"cpu_percent\":50.0}\n",
+        ),
+    )
+    .unwrap();
+
+    let output = reef()
+        .args(["report", "--to", "2026-01-03T00:00:02Z", "--state-dir"])
+        .arg(&fixture.0)
+        .args(["--format", "json"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["from"], "2026-01-01T00:00:00+00:00");
+    assert_eq!(report["observation_count"], 2);
+}
+
+#[test]
 fn long_term_rollups_keep_agent_cost_and_mark_coarse_host_metrics() {
     let fixture = Fixture::new();
     fs::write(
