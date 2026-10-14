@@ -237,6 +237,20 @@ fn point_tooltip(point: &Point, x: f64, y: f64, unit: &str) -> String {
     )
 }
 
+fn chart_range(points: &[Point], from_ms: u64, to_ms: u64) -> (u64, u64) {
+    let data_from_ms = points
+        .iter()
+        .map(|point| point.at_ms)
+        .min()
+        .unwrap_or(from_ms);
+    let data_to_ms = points
+        .iter()
+        .map(|point| point.at_ms)
+        .max()
+        .unwrap_or(to_ms);
+    (from_ms.max(data_from_ms), to_ms.min(data_to_ms))
+}
+
 fn chart(spec: ChartSpec<'_>) -> String {
     let ChartSpec {
         id,
@@ -256,6 +270,7 @@ fn chart(spec: ChartSpec<'_>) -> String {
         );
         return out;
     }
+    let (from_ms, to_ms) = chart_range(points, from_ms, to_ms);
     let visible = compact_points(points);
     let span = number(to_ms.saturating_sub(from_ms).max(1));
     let ceiling = max_value.max(1.0);

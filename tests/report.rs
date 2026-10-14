@@ -391,6 +391,42 @@ fn html_report_contains_host_charts_and_sanitized_agent_cost() {
 }
 
 #[test]
+fn html_charts_show_only_their_available_data_range() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.join("samples-test.jsonl"),
+        concat!(
+            "{\"at_unix_ms\":1767268801000,\"working_ms\":1000,\"cpu_percent\":25.0}\n",
+            "{\"at_unix_ms\":1767290401000,\"working_ms\":1000,\"cpu_percent\":50.0}\n",
+        ),
+    )
+    .unwrap();
+
+    let output = reef()
+        .args([
+            "report",
+            "--from",
+            "2026-01-01T00:00:00Z",
+            "--to",
+            "2026-01-02T00:00:00Z",
+            "--state-dir",
+        ])
+        .arg(&fixture.0)
+        .args(["--format", "html"])
+        .env("HOME", &fixture.0)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let page = String::from_utf8(output.stdout).unwrap();
+    assert!(page.contains("01 Jan 2026, 00:00:00 UTC"));
+    assert!(page.contains("<text class=\"axis\" x=\"64\" y=\"213\">01 Jan 12:00 UTC</text>"));
+    assert!(page.contains(
+        "<text class=\"axis\" x=\"700\" y=\"213\" text-anchor=\"end\">01 Jan 18:00 UTC</text>"
+    ));
+}
+
+#[test]
 fn html_output_is_private_and_replaces_an_existing_file() {
     let fixture = Fixture::new();
     let path = fixture.0.join("report.html");
