@@ -21,7 +21,7 @@ pub use compare::{CompareOptions, run_compare};
 
 #[derive(Debug, clap::Args)]
 pub struct Options {
-    /// Start of the range, inclusive, in RFC 3339 format. Defaults to 24 hours ago.
+    /// Start of the range, inclusive, in RFC 3339 format. Defaults to oldest retained data.
     #[arg(long, value_parser = parse_date)]
     from: Option<DateTime<Utc>>,
     /// End of the range, exclusive, in RFC 3339 format. Defaults to now.
@@ -2324,19 +2324,62 @@ fn read_measurements(
     Ok(Some(all))
 }
 
-pub fn run(options: &Options) -> io::Result<()> {
+fn default_from(
+    to: DateTime<Utc>,
+    samples: &[Observation],
+    agent_ticks: &[AgentTick],
+    agent_rollups: &[AgentRollup],
+    records: Option<&[Measurement]>,
+    scheduler_events: Option<&[schedule_events::Event]>,
+    control_event_ms: Option<u128>,
+) -> DateTime<Utc> {
+    let to_ms = u128::try_from(to.timestamp_millis()).unwrap_or_default();
+    let oldest_ms = samples
+        .iter()
+        .map(|sample| u128::from(sample.interval_start_unix_ms()))
+        .chain(
+            agent_ticks
+                .iter()
+                .map(|tick| u128::from(tick.at_unix_ms.saturating_sub(tick.working_ms))),
+        )
+        .chain(
+            agent_rollups
+                .iter()
+                .map(|rollup| u128::from(rollup.minute_unix_ms)),
+        )
+        .chain(
+            records
+                .into_iter()
+                .flatten()
+                .map(|record| record.started_at_unix_ms),
+        )
+        .chain(
+            scheduler_events
+                .into_iter()
+                .flatten()
+                .map(|event| u128::from(event.at_unix_ms)),
+        )
+        .chain(control_event_ms)
+        .filter(|timestamp| *timestamp < to_ms)
+        .min();
+    oldest_ms
+        .and_then(|timestamp| i64::try_from(timestamp).ok())
+        .and_then(DateTime::from_timestamp_millis)
+        .unwrap_or(to - Duration::hours(24))
+}
+
+fn read_scheduler_events(options: &Options) -> io::Result<Option<Vec<schedule_events::Event>>> {
+    let dir = options.schedule_state_dir.clone().or_else(|| {
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state/reef/schedule"))
+    });
+    dir.map_or(Ok(None), |dir| schedule_events::read(&dir))
+}
+
+fn validate_options(options: &Options, to: DateTime<Utc>) -> io::Result<()> {
     if (options.output.is_some() || options.open) && !matches!(options.format, Format::Html) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "--output and --open require --format html",
-        ));
-    }
-    let to = options.to.unwrap_or_else(Utc::now);
-    let from = options.from.unwrap_or(to - Duration::hours(24));
-    if from >= to {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "--from must be before --to",
         ));
     }
     for value in [
@@ -2351,21 +2394,61 @@ pub fn run(options: &Options) -> io::Result<()> {
             ));
         }
     }
+    if options.from.is_some_and(|from| from >= to) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--from must be before --to",
+        ));
+    }
+    Ok(())
+}
+
+pub fn run(options: &Options) -> io::Result<()> {
+    let to = options.to.unwrap_or_else(Utc::now);
+    validate_options(options, to)?;
     let dir = state_dir(options.state_dir.as_deref())?;
     let samples = observations(&dir)?;
-    let host_series = html::HostSeries::from_samples(&samples, from, to);
     let agent_samples = agent_ticks(&dir)?;
     let agent_summaries = agent_rollups(&dir)?;
+    let scheduler_events = read_scheduler_events(options)?;
+    #[cfg(unix)]
+    let control_event_ms = control::earliest_event_ms(options.control_state_dir.as_deref());
+    #[cfg(not(unix))]
+    let control_event_ms = None;
     #[cfg(unix)]
     let mut control = control::summary(
         options.control_state_dir.as_deref(),
-        u128::try_from(from.timestamp_millis()).unwrap_or_default(),
+        0,
         u128::try_from(to.timestamp_millis()).unwrap_or_default(),
     );
     #[cfg(unix)]
     let records = read_measurements(options, &mut control)?;
     #[cfg(not(unix))]
     let records = read_measurements(options)?;
+    let from = options.from.unwrap_or_else(|| {
+        default_from(
+            to,
+            &samples,
+            &agent_samples,
+            &agent_summaries,
+            records.as_deref(),
+            scheduler_events.as_deref(),
+            control_event_ms,
+        )
+    });
+    if from >= to {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--from must be before --to",
+        ));
+    }
+    let host_series = html::HostSeries::from_samples(&samples, from, to);
+    #[cfg(unix)]
+    let control = control::summary(
+        options.control_state_dir.as_deref(),
+        u128::try_from(from.timestamp_millis()).unwrap_or_default(),
+        u128::try_from(to.timestamp_millis()).unwrap_or_default(),
+    );
     let report = build_report_with_ticks(
         from,
         to,
@@ -2380,22 +2463,13 @@ pub fn run(options: &Options) -> io::Result<()> {
             options.memory_threshold,
             options.swap_threshold,
         ),
-        {
-            let dir = options.schedule_state_dir.clone().or_else(|| {
-                std::env::var_os("HOME")
-                    .map(|home| PathBuf::from(home).join(".local/state/reef/schedule"))
-            });
-            match dir {
-                Some(dir) => schedule_events::read(&dir)?.map(|events| {
-                    schedule_events::summary(
-                        &events,
-                        u64::try_from(from.timestamp_millis()).unwrap_or_default(),
-                        u64::try_from(to.timestamp_millis()).unwrap_or_default(),
-                    )
-                }),
-                None => None,
-            }
-        },
+        scheduler_events.as_ref().map(|events| {
+            schedule_events::summary(
+                events,
+                u64::try_from(from.timestamp_millis()).unwrap_or_default(),
+                u64::try_from(to.timestamp_millis()).unwrap_or_default(),
+            )
+        }),
     );
     #[cfg(unix)]
     let report = {

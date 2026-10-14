@@ -467,6 +467,14 @@ pub fn summary(dir: Option<&Path>, from_ms: u128, to_ms: u128) -> Summary {
     summarize_attempts(&attempts, &measurements, from_ms, to_ms)
 }
 
+pub(crate) fn earliest_event_ms(dir: Option<&Path>) -> Option<u128> {
+    let path = dir
+        .map_or_else(default_dir, |path| Ok(path.to_path_buf()))
+        .ok()?;
+    let (events, _) = read_telemetry(&path).ok()?;
+    events.into_iter().map(|event| event.at_unix_ms).min()
+}
+
 fn summarize_attempts(
     attempts: &BTreeMap<String, Attempt>,
     measurements: &BTreeMap<String, run::ControlRecord>,
