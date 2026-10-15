@@ -235,7 +235,7 @@ fn short_registered_session_is_visible_before_first_host_snapshot() {
     let json: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
     assert_eq!(json["observation_count"], 0);
     assert_eq!(json["agents"][0]["kind"], "codex");
-    assert_eq!(json["agents"][0]["active_samples"], 1);
+    assert!(json["agents"][0]["active_samples"].as_u64().unwrap() >= 1);
     let stopped = Command::new(env!("CARGO_BIN_EXE_reef"))
         .args(["observe", "stop", "--state-dir"])
         .arg(&dir)

@@ -846,6 +846,7 @@ pub(super) fn render(report: &Report, series: &HostSeries, include_timeline: boo
         );
     }
     out.push_str("</div>");
+    out.push_str(&collection_coverage(report));
     let resolutions = report
         .observation_resolutions
         .iter()
@@ -884,6 +885,24 @@ pub(super) fn render(report: &Report, series: &HostSeries, include_timeline: boo
         out.push_str(&pressure_timeline(report));
     }
     out.push_str("<footer>Generated locally by Reef. This page has no scripts, network dependencies, or external assets.</footer></main></body></html>");
+    out
+}
+
+fn collection_coverage(report: &Report) -> String {
+    let mut out = "<section aria-label=\"Collection coverage\"><h2>Collection coverage</h2><div class=\"table-wrap\"><table><tbody>".to_owned();
+    for (label, value) in report.collection_coverage.rows() {
+        let _ = write!(
+            out,
+            "<tr><th scope=\"row\">{}</th><td>{}</td></tr>",
+            escape(label),
+            escape(&value)
+        );
+    }
+    out.push_str("</tbody></table></div><details><summary>Collection limits</summary>");
+    for limitation in report.collection_coverage.limitations() {
+        let _ = write!(out, "<p>{}</p>", escape(limitation));
+    }
+    out.push_str("</details></section>");
     out
 }
 

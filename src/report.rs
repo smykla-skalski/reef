@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
 mod compare;
+mod coverage;
 mod html;
 pub use compare::{CompareOptions, run_compare};
 
@@ -282,6 +283,7 @@ struct Report {
     observation_resolutions: BTreeMap<String, u64>,
     coarse_history_approximate: bool,
     retention_status: Option<retention::RetentionStatus>,
+    collection_coverage: coverage::CollectionCoverage,
     host_observations_with_agents: usize,
     agent_observation_count: usize,
     agent_rollup_count: usize,
@@ -1728,11 +1730,11 @@ fn build_report_with_ticks(
     let (from_ms, to_ms) = range_millis(from, to);
     let samples = observations_in_range(samples, from_ms, to_ms);
     let observation_resolutions = observation_resolutions(&samples);
-    let mut agent_ticks = ticks_in_range(agent_data.ticks, from_ms, to_ms);
-    let agent_rollups = rollups_in_range(agent_data.rollups, from_ms, to_ms);
+    let (agent_ticks, agent_rollups) = filtered_agent_data(agent_data, from_ms, to_ms);
     let coarse_history_approximate = has_coarse_history(&samples, &agent_rollups);
-    agent_ticks.retain(|tick| !tick_covered_by_rollup(&agent_rollups, tick));
     let records = records_in_range(records, from_ms, to_ms);
+    let collection_coverage =
+        coverage::CollectionCoverage::new(&samples, &agent_ticks, &agent_rollups, from_ms, to_ms);
     let mut pressure = pressure_report(thresholds);
     let agent_sample_coverage = samples.iter().any(|sample| sample.agents.is_some());
     let host_observations_with_agents = count_host_observations_with_agents(&samples);
@@ -1789,6 +1791,7 @@ fn build_report_with_ticks(
         observation_resolutions,
         coarse_history_approximate,
         retention_status: None,
+        collection_coverage,
         host_observations_with_agents,
         agent_observation_count: agent_ticks.len(),
         agent_rollup_count: agent_rollups.len(),
@@ -1805,10 +1808,7 @@ fn build_report_with_ticks(
         passive_commands,
         process_commands: None,
         peak_host_cpu_percent: peak_host_cpu(&samples),
-        peak_host_memory_bytes: samples
-            .iter()
-            .filter_map(|s| s.peak_memory_used_bytes.or(s.memory_used_bytes))
-            .max(),
+        peak_host_memory_bytes: peak_host_memory(&samples),
         peak_root_disk_used_percent: peak_disk_used_percent(&samples),
         swap_growth_bytes: swap_growth(&samples),
         memory_consumers: memory_consumer_reports(&samples),
@@ -1825,6 +1825,24 @@ fn build_report_with_ticks(
         #[cfg(unix)]
         cache: cache_impact::Impact::default(),
     }
+}
+
+fn peak_host_memory(samples: &[Observation]) -> Option<u64> {
+    samples
+        .iter()
+        .filter_map(|sample| sample.peak_memory_used_bytes.or(sample.memory_used_bytes))
+        .max()
+}
+
+fn filtered_agent_data(
+    data: AgentData,
+    from: u128,
+    to: u128,
+) -> (Vec<AgentTick>, Vec<AgentRollup>) {
+    let rollups = rollups_in_range(data.rollups, from, to);
+    let mut ticks = ticks_in_range(data.ticks, from, to);
+    ticks.retain(|tick| !tick_covered_by_rollup(&rollups, tick));
+    (ticks, rollups)
 }
 
 fn range_millis(from: DateTime<Utc>, to: DateTime<Utc>) -> (u128, u128) {
@@ -2480,6 +2498,7 @@ fn markdown_with_timeline(report: &Report, include_timeline: bool) -> String {
         readable_optional_bytes(report.swap_growth_bytes),
         printable(report.peak_command_concurrency),
     );
+    out.push_str(&report.collection_coverage.markdown());
     let resolutions = report
         .observation_resolutions
         .iter()
@@ -2719,15 +2738,7 @@ pub fn run(options: &Options) -> io::Result<()> {
     let agent_summaries = agent_rollups(&dir)?;
     let process_spans = process_history::spans(&dir)?;
     let process_summaries = process_history::summaries(&dir)?;
-    let process_event_ms = process_spans
-        .iter()
-        .map(|span| u128::from(span.first_seen_unix_ms))
-        .chain(
-            process_summaries
-                .iter()
-                .map(|summary| u128::from(summary.bucket_start_unix_ms)),
-        )
-        .min();
+    let process_event_ms = earliest_process_event(&process_spans, &process_summaries);
     let scheduler_events = read_scheduler_events(options)?;
     #[cfg(unix)]
     let control_event_ms = control::earliest_event_ms(options.control_state_dir.as_deref());
@@ -2792,6 +2803,13 @@ pub fn run(options: &Options) -> io::Result<()> {
     let (from_ms, to_ms) = range_millis(from, to);
     report.process_commands =
         process_command_reports(&process_spans, &process_summaries, from_ms, to_ms);
+    report.collection_coverage.process_detail(
+        &process_spans,
+        &process_summaries,
+        from_ms,
+        to_ms,
+        &dir,
+    )?;
     report.empty = report.empty && report.process_commands.as_ref().is_none_or(Vec::is_empty);
     report.retention_status = retention::read_status(&dir)?;
     #[cfg(unix)]
@@ -2808,6 +2826,21 @@ pub fn run(options: &Options) -> io::Result<()> {
         report
     };
     write_report(&report, &host_series, options)
+}
+
+fn earliest_process_event(
+    spans: &[process_history::ProcessSpan],
+    summaries: &[process_history::ProcessSummary],
+) -> Option<u128> {
+    spans
+        .iter()
+        .map(|span| u128::from(span.first_seen_unix_ms))
+        .chain(
+            summaries
+                .iter()
+                .map(|summary| u128::from(summary.bucket_start_unix_ms)),
+        )
+        .min()
 }
 
 fn write_report(
