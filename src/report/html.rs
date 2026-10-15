@@ -9,6 +9,7 @@ const PLOT_RIGHT: f64 = 700.0;
 const PLOT_TOP: f64 = 22.0;
 const PLOT_BOTTOM: f64 = 180.0;
 const MAX_CHART_POINTS: usize = 800;
+const GAP_JITTER_TOLERANCE_MS: u64 = 5_000;
 const MEMORY_FAMILIES: [&str; 8] = [
     "agent runtime",
     "compiler/build",
@@ -29,6 +30,7 @@ fn number(value: u64) -> f64 {
 #[derive(Clone, Copy)]
 struct Point {
     at_ms: u64,
+    interval_start_ms: u64,
     value: f64,
     resolution_ms: u64,
 }
@@ -65,9 +67,11 @@ impl HostSeries {
             .filter(|sample| sample.at_unix_ms > from_ms && sample.interval_start_unix_ms() < to_ms)
         {
             let at_ms = sample.at_unix_ms.min(to_ms);
+            let interval_start_ms = sample.interval_start_unix_ms().min(at_ms);
             if let Some(cpu) = sample.cpu_percent.filter(|value| value.is_finite()) {
                 series.cpu.push(Point {
                     at_ms,
+                    interval_start_ms,
                     value: cpu.clamp(0.0, 100.0),
                     resolution_ms: sample.resolution_ms,
                 });
@@ -79,6 +83,7 @@ impl HostSeries {
             {
                 series.memory.push(Point {
                     at_ms,
+                    interval_start_ms,
                     value: (number(used) / number(total) * 100.0).clamp(0.0, 100.0),
                     resolution_ms: sample.resolution_ms,
                 });
@@ -86,6 +91,7 @@ impl HostSeries {
             if let Some(used) = sample.swap_used_bytes {
                 series.swap.push(Point {
                     at_ms,
+                    interval_start_ms,
                     value: number(used) / 1_073_741_824.0,
                     resolution_ms: sample.resolution_ms,
                 });
@@ -97,6 +103,7 @@ impl HostSeries {
             {
                 series.disk.push(Point {
                     at_ms,
+                    interval_start_ms,
                     value: (1.0 - number(available) / number(total)) * 100.0,
                     resolution_ms: sample.resolution_ms,
                 });
@@ -115,6 +122,7 @@ impl HostSeries {
                         .or_default()
                         .push(Point {
                             at_ms,
+                            interval_start_ms,
                             value: number(by_family.get(family).copied().unwrap_or_default())
                                 / 1_073_741_824.0,
                             resolution_ms: sample.resolution_ms,
@@ -160,9 +168,55 @@ fn compact_points(points: &[Point]) -> Vec<Point> {
     if points.len() <= MAX_CHART_POINTS {
         return points.to_vec();
     }
-    let bucket_size = points.len().div_ceil(MAX_CHART_POINTS / 4);
-    let mut selected = Vec::with_capacity(MAX_CHART_POINTS);
-    for bucket in points.chunks(bucket_size) {
+
+    let mut selected_indexes = std::collections::BTreeSet::new();
+    selected_indexes.insert(0);
+    selected_indexes.insert(points.len() - 1);
+    let minimum = points
+        .iter()
+        .enumerate()
+        .min_by(|(_, left), (_, right)| left.value.total_cmp(&right.value))
+        .map(|(index, _)| index)
+        .unwrap_or_default();
+    let maximum = points
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.value.total_cmp(&right.value))
+        .map(|(index, _)| index)
+        .unwrap_or_default();
+    selected_indexes.extend([minimum, maximum]);
+
+    let components = coverage_components(points);
+    let representatives: Vec<_> = components
+        .iter()
+        .filter(|(start, end)| selected_indexes.range(*start..=*end).next().is_none())
+        .map(|(start, _)| *start)
+        .collect();
+    insert_spread(&mut selected_indexes, &representatives);
+    if selected_indexes.len() == MAX_CHART_POINTS {
+        return selected_indexes
+            .into_iter()
+            .map(|index| points[index])
+            .collect();
+    }
+
+    let edge_candidates: Vec<_> = components
+        .iter()
+        .flat_map(|(start, end)| [*start, *end])
+        .collect();
+    insert_spread(&mut selected_indexes, &edge_candidates);
+    if selected_indexes.len() == MAX_CHART_POINTS {
+        return selected_indexes
+            .into_iter()
+            .map(|index| points[index])
+            .collect();
+    }
+
+    let remaining = MAX_CHART_POINTS - selected_indexes.len();
+    let bucket_count = remaining.div_ceil(4);
+    let bucket_size = points.len().div_ceil(bucket_count);
+    for (bucket_index, bucket) in points.chunks(bucket_size).enumerate() {
+        let offset = bucket_index * bucket_size;
         let min = bucket
             .iter()
             .enumerate()
@@ -177,33 +231,72 @@ fn compact_points(points: &[Point]) -> Vec<Point> {
             .unwrap_or_default();
         let mut indexes = [0, min, max, bucket.len() - 1];
         indexes.sort_unstable();
-        for index in indexes
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>()
-        {
-            selected.push(bucket[index]);
+        for index in indexes {
+            if selected_indexes.len() < MAX_CHART_POINTS {
+                selected_indexes.insert(offset + index);
+            }
         }
     }
-    selected
+    selected_indexes
+        .into_iter()
+        .map(|index| points[index])
+        .collect()
+}
+
+fn insert_spread(selected_indexes: &mut std::collections::BTreeSet<usize>, candidates: &[usize]) {
+    let candidates: Vec<_> = candidates
+        .iter()
+        .copied()
+        .filter(|index| !selected_indexes.contains(index))
+        .collect();
+    let available = MAX_CHART_POINTS.saturating_sub(selected_indexes.len());
+    if candidates.len() <= available {
+        selected_indexes.extend(candidates);
+        return;
+    }
+    if available == 1 {
+        selected_indexes.insert(candidates[candidates.len() / 2]);
+        return;
+    }
+    for position in 0..available {
+        let index = position * (candidates.len() - 1) / (available - 1);
+        selected_indexes.insert(candidates[index]);
+    }
+}
+
+fn coverage_components(points: &[Point]) -> Vec<(usize, usize)> {
+    let mut components = Vec::new();
+    let mut start = 0;
+    for boundary in gap_boundaries(points) {
+        let next = points.partition_point(|point| point.at_ms < boundary);
+        if next > start {
+            components.push((start, next - 1));
+            start = next;
+        }
+    }
+    if start < points.len() {
+        components.push((start, points.len() - 1));
+    }
+    components
 }
 
 fn gap_boundaries(points: &[Point]) -> Vec<u64> {
     let mut intervals: Vec<_> = points
-        .windows(2)
-        .map(|pair| pair[1].at_ms.saturating_sub(pair[0].at_ms))
-        .filter(|interval| *interval > 0)
+        .iter()
+        .map(|point| (point.interval_start_ms, point.at_ms))
         .collect();
-    if intervals.is_empty() {
-        return Vec::new();
-    }
     intervals.sort_unstable();
-    let cadence = intervals[intervals.len() / 2].min(300_000);
-    let limit = cadence.saturating_mul(3).max(60_000);
-    points
-        .windows(2)
-        .filter(|pair| pair[1].at_ms.saturating_sub(pair[0].at_ms) > limit)
-        .map(|pair| pair[1].at_ms)
-        .collect()
+    let Some((_, mut coverage_end)) = intervals.first().copied() else {
+        return Vec::new();
+    };
+    let mut boundaries = Vec::new();
+    for (start, end) in intervals.into_iter().skip(1) {
+        if start > coverage_end.saturating_add(GAP_JITTER_TOLERANCE_MS) {
+            boundaries.push(start);
+        }
+        coverage_end = coverage_end.max(end);
+    }
+    boundaries
 }
 
 #[derive(Clone, Copy)]
@@ -251,6 +344,60 @@ fn chart_range(points: &[Point], from_ms: u64, to_ms: u64) -> (u64, u64) {
     (from_ms.max(data_from_ms), to_ms.min(data_to_ms))
 }
 
+fn series_svg(
+    points: &[Point],
+    from_ms: u64,
+    to_ms: u64,
+    ceiling: f64,
+    unit: &str,
+) -> (String, String, String) {
+    let visible = compact_points(points);
+    let span = number(to_ms.saturating_sub(from_ms).max(1));
+    let gaps = gap_boundaries(points);
+    let mut next_gap = 0;
+    let mut path = String::new();
+    let mut markers = String::new();
+    let mut point_titles = String::new();
+    let mut previous = None;
+    let mut single_point = None;
+    for point in &visible {
+        let x = PLOT_LEFT
+            + (number(point.at_ms.saturating_sub(from_ms)) / span) * (PLOT_RIGHT - PLOT_LEFT);
+        let y = PLOT_BOTTOM - point.value.min(ceiling) / ceiling * (PLOT_BOTTOM - PLOT_TOP);
+        let mut crossed_gap = false;
+        while next_gap < gaps.len() && gaps[next_gap] <= point.at_ms {
+            crossed_gap |= previous.is_some_and(|at| gaps[next_gap] > at);
+            next_gap += 1;
+        }
+        let command = if previous.is_some() && !crossed_gap {
+            'L'
+        } else {
+            'M'
+        };
+        if command == 'M' {
+            if let Some((x, y)) = single_point.take() {
+                let _ = write!(
+                    markers,
+                    "<circle class=\"series-marker\" cx=\"{x:.1}\" cy=\"{y:.1}\" r=\"2.6\"/>"
+                );
+            }
+            single_point = Some((x, y));
+        } else {
+            single_point = None;
+        }
+        let _ = write!(path, "{command}{x:.1},{y:.1} ");
+        point_titles.push_str(&point_tooltip(point, x, y, unit));
+        previous = Some(point.at_ms);
+    }
+    if let Some((x, y)) = single_point {
+        let _ = write!(
+            markers,
+            "<circle class=\"series-marker\" cx=\"{x:.1}\" cy=\"{y:.1}\" r=\"2.6\"/>"
+        );
+    }
+    (path, markers, point_titles)
+}
+
 fn chart(spec: ChartSpec<'_>) -> String {
     let ChartSpec {
         id,
@@ -271,32 +418,8 @@ fn chart(spec: ChartSpec<'_>) -> String {
         return out;
     }
     let (from_ms, to_ms) = chart_range(points, from_ms, to_ms);
-    let visible = compact_points(points);
-    let span = number(to_ms.saturating_sub(from_ms).max(1));
     let ceiling = max_value.max(1.0);
-    let gaps = gap_boundaries(points);
-    let mut next_gap = 0;
-    let mut path = String::new();
-    let mut point_titles = String::new();
-    let mut previous = None;
-    for point in &visible {
-        let x = PLOT_LEFT
-            + (number(point.at_ms.saturating_sub(from_ms)) / span) * (PLOT_RIGHT - PLOT_LEFT);
-        let y = PLOT_BOTTOM - point.value.min(ceiling) / ceiling * (PLOT_BOTTOM - PLOT_TOP);
-        let mut crossed_gap = false;
-        while next_gap < gaps.len() && gaps[next_gap] <= point.at_ms {
-            crossed_gap |= previous.is_some_and(|at| gaps[next_gap] > at);
-            next_gap += 1;
-        }
-        let command = if previous.is_some() && !crossed_gap {
-            'L'
-        } else {
-            'M'
-        };
-        let _ = write!(path, "{command}{x:.1},{y:.1} ");
-        point_titles.push_str(&point_tooltip(point, x, y, unit));
-        previous = Some(point.at_ms);
-    }
+    let (path, markers, point_titles) = series_svg(points, from_ms, to_ms, ceiling, unit);
     let peak = points
         .iter()
         .map(|point| point.value)
@@ -340,7 +463,7 @@ fn chart(spec: ChartSpec<'_>) -> String {
     }
     let _ = write!(
         out,
-        "<path class=\"series\" d=\"{path}\"/>{point_titles}<text class=\"axis\" x=\"{PLOT_LEFT}\" y=\"213\">{}</text><text class=\"axis\" x=\"{PLOT_RIGHT}\" y=\"213\" text-anchor=\"end\">{}</text></svg>",
+        "<path class=\"series\" d=\"{path}\"/>{markers}{point_titles}<text class=\"axis\" x=\"{PLOT_LEFT}\" y=\"213\">{}</text><text class=\"axis\" x=\"{PLOT_RIGHT}\" y=\"213\" text-anchor=\"end\">{}</text></svg>",
         escape(&from_label),
         escape(&to_label)
     );
@@ -608,7 +731,7 @@ fn control_html(control: &crate::control::Summary) -> String {
 pub(super) fn render(report: &Report, series: &HostSeries, include_timeline: bool) -> String {
     let mut out = String::from(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:"><title>Reef workload report</title><style>
-:root{color-scheme:dark;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0b1220;color:#e7edf6}*{box-sizing:border-box}body{margin:0 auto;max-width:1160px;padding:2rem 1.2rem 5rem}h1{font-size:2rem;margin-bottom:.3rem}h2{margin:2.2rem 0 .6rem}h3{margin:.2rem 0 1rem;font-size:1rem}p{line-height:1.55;color:#b9c7da}.muted,.chart-note{color:#92a4bb;font-size:.9rem}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(175px,1fr));gap:.8rem;margin:1.7rem 0}.card,.chart{background:#132033;border:1px solid #29405c;border-radius:14px;padding:1rem}.card span{display:block;color:#9bb0ca;font-size:.85rem}.card strong{display:block;font-size:1.35rem;margin-top:.4rem}.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr));gap:1rem}.chart svg{width:100%;height:auto}.grid{stroke:#344b66;stroke-width:1}.axis{fill:#9bb0ca;font-size:12px}.series{fill:none;stroke:#5eead4;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}.threshold{stroke:#fbbf24;stroke-width:1.4;stroke-dasharray:5 5}.empty{border:1px dashed #405776;padding:1rem;border-radius:9px}.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:.92rem}th,td{text-align:left;padding:.65rem;border-bottom:1px solid #29405c;vertical-align:middle}th{color:#dbe7f8}.bar{display:inline-block;width:var(--size);min-width:2px;max-width:110px;height:.6rem;margin-right:.5rem;border-radius:10px;background:#5eead4}.note{border-left:3px solid #fbbf24;padding-left:.9rem}footer{margin-top:3rem;font-size:.85rem;color:#92a4bb}@media print{:root{color-scheme:light;background:white;color:#172033}.card,.chart{background:white;border-color:#bbb}p,.muted,.chart-note{color:#444}.axis{fill:#555}.grid{stroke:#ccc}th{color:#222}}
+:root{color-scheme:dark;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0b1220;color:#e7edf6}*{box-sizing:border-box}body{margin:0 auto;max-width:1160px;padding:2rem 1.2rem 5rem}h1{font-size:2rem;margin-bottom:.3rem}h2{margin:2.2rem 0 .6rem}h3{margin:.2rem 0 1rem;font-size:1rem}p{line-height:1.55;color:#b9c7da}.muted,.chart-note{color:#92a4bb;font-size:.9rem}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(175px,1fr));gap:.8rem;margin:1.7rem 0}.card,.chart{background:#132033;border:1px solid #29405c;border-radius:14px;padding:1rem}.card span{display:block;color:#9bb0ca;font-size:.85rem}.card strong{display:block;font-size:1.35rem;margin-top:.4rem}.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr));gap:1rem}.chart svg{width:100%;height:auto}.grid{stroke:#344b66;stroke-width:1}.axis{fill:#9bb0ca;font-size:12px}.series{fill:none;stroke:#5eead4;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}.series-marker{fill:#5eead4}.threshold{stroke:#fbbf24;stroke-width:1.4;stroke-dasharray:5 5}.empty{border:1px dashed #405776;padding:1rem;border-radius:9px}.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:.92rem}th,td{text-align:left;padding:.65rem;border-bottom:1px solid #29405c;vertical-align:middle}th{color:#dbe7f8}.bar{display:inline-block;width:var(--size);min-width:2px;max-width:110px;height:.6rem;margin-right:.5rem;border-radius:10px;background:#5eead4}.note{border-left:3px solid #fbbf24;padding-left:.9rem}footer{margin-top:3rem;font-size:.85rem;color:#92a4bb}@media print{:root{color-scheme:light;background:white;color:#172033}.card,.chart{background:white;border-color:#bbb}p,.muted,.chart-note{color:#444}.axis{fill:#555}.grid{stroke:#ccc}th{color:#222}}
 </style></head><body><main><h1>Reef workload report</h1>"#,
     );
     let _ = write!(
@@ -818,6 +941,7 @@ mod tests {
         let mut points: Vec<_> = (0..10_000)
             .map(|at_ms| Point {
                 at_ms,
+                interval_start_ms: at_ms.saturating_sub(1),
                 value: 10.0,
                 resolution_ms: 0,
             })
@@ -835,12 +959,136 @@ mod tests {
     }
 
     #[test]
-    fn a_collection_gap_remains_disconnected_after_downsampling() {
-        let points: Vec<_> = (0..1_000)
+    fn downsampling_keeps_an_isolated_singleton_sample() {
+        let mut points: Vec<_> = (0..500)
             .map(|index| Point {
-                at_ms: index * 1_000 + u64::from(index >= 500) * 120_000,
+                at_ms: index * 1_000,
+                interval_start_ms: (index * 1_000).saturating_sub(1_000),
                 value: 50.0,
                 resolution_ms: 0,
+            })
+            .collect();
+        points.push(Point {
+            at_ms: 620_000,
+            interval_start_ms: 619_000,
+            value: 50.0,
+            resolution_ms: 0,
+        });
+        points.extend((0..500).map(|index| Point {
+            at_ms: 740_000 + index * 1_000,
+            interval_start_ms: 739_000 + index * 1_000,
+            value: 50.0,
+            resolution_ms: 0,
+        }));
+
+        let output = chart(ChartSpec {
+            id: "cpu",
+            title: "CPU",
+            points: &points,
+            from_ms: 0,
+            to_ms: 1_239_000,
+            max_value: 100.0,
+            unit: "%",
+            threshold: None,
+        });
+
+        assert_eq!(output.matches("class=\"series-marker\"").count(), 1);
+    }
+
+    #[test]
+    fn downsampling_uses_spare_gap_budget_for_an_extreme() {
+        let mut points: Vec<_> = (0..1_200)
+            .map(|index| {
+                let group = (index / 3).min(398);
+                let at_ms = index * 1_000 + group * 1_000;
+                Point {
+                    at_ms,
+                    interval_start_ms: at_ms.saturating_sub(1_000),
+                    value: 10.0,
+                    resolution_ms: 0,
+                }
+            })
+            .collect();
+        points[1].value = 99.0;
+
+        let reduced = compact_points(&points);
+
+        assert!(reduced.len() <= MAX_CHART_POINTS);
+        assert!(
+            reduced
+                .iter()
+                .any(|point| (point.value - 99.0).abs() < f64::EPSILON)
+        );
+    }
+
+    #[test]
+    fn downsampling_keeps_a_representative_for_each_component_when_bounded() {
+        let singleton_at_ms = 201 * 20_000 + 1_000;
+        let points: Vec<_> = (0..402)
+            .flat_map(|component| {
+                let count = if component == 201 { 1 } else { 2 };
+                (0..count).map(move |offset| {
+                    let interval_start_ms = component * 20_000 + offset * 1_000;
+                    Point {
+                        at_ms: interval_start_ms + 1_000,
+                        interval_start_ms,
+                        value: 50.0,
+                        resolution_ms: 0,
+                    }
+                })
+            })
+            .collect();
+
+        let reduced = compact_points(&points);
+
+        assert!(reduced.len() <= MAX_CHART_POINTS);
+        assert!(reduced.iter().any(|point| point.at_ms == singleton_at_ms));
+    }
+
+    #[test]
+    fn downsampling_preserves_global_extremes_when_gap_edges_fill_the_budget() {
+        let mut points: Vec<_> = (0..400)
+            .flat_map(|component| {
+                (0..3).map(move |offset| {
+                    let interval_start_ms = component * 20_000 + offset * 1_000;
+                    Point {
+                        at_ms: interval_start_ms + 1_000,
+                        interval_start_ms,
+                        value: 10.0,
+                        resolution_ms: 0,
+                    }
+                })
+            })
+            .collect();
+        points[1].value = 99.0;
+        points[4].value = 1.0;
+
+        let reduced = compact_points(&points);
+
+        assert!(reduced.len() <= MAX_CHART_POINTS);
+        assert!(
+            reduced
+                .iter()
+                .any(|point| (point.value - 99.0).abs() < f64::EPSILON)
+        );
+        assert!(
+            reduced
+                .iter()
+                .any(|point| (point.value - 1.0).abs() < f64::EPSILON)
+        );
+    }
+
+    #[test]
+    fn a_collection_gap_remains_disconnected_after_downsampling() {
+        let points: Vec<_> = (0..1_000)
+            .map(|index| {
+                let at_ms = index * 1_000 + u64::from(index >= 500) * 120_000;
+                Point {
+                    at_ms,
+                    interval_start_ms: at_ms.saturating_sub(1_000),
+                    value: 50.0,
+                    resolution_ms: 0,
+                }
             })
             .collect();
         let output = chart(ChartSpec {
@@ -864,9 +1112,269 @@ mod tests {
     }
 
     #[test]
+    fn mixed_retention_resolutions_render_as_one_continuous_series() {
+        let mut points: Vec<_> = (0..200)
+            .map(|index| Point {
+                at_ms: index * 300_000,
+                interval_start_ms: (index * 300_000).saturating_sub(300_000),
+                value: 50.0,
+                resolution_ms: 300_000,
+            })
+            .collect();
+        points.extend((0..2_000).map(|index| Point {
+            at_ms: 59_700_000 + index * 60_000,
+            interval_start_ms: 59_640_000 + index * 60_000,
+            value: 50.0,
+            resolution_ms: 0,
+        }));
+
+        let output = chart(ChartSpec {
+            id: "cpu",
+            title: "CPU",
+            points: &points,
+            from_ms: 0,
+            to_ms: 180_000_000,
+            max_value: 100.0,
+            unit: "%",
+            threshold: None,
+        });
+
+        let path = output
+            .split("class=\"series\" d=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        assert_eq!(path.matches('M').count(), 1);
+    }
+
+    #[test]
+    fn normal_sampling_jitter_keeps_the_line_connected() {
+        let points = [
+            Point {
+                at_ms: 60_000,
+                interval_start_ms: 0,
+                value: 50.0,
+                resolution_ms: 0,
+            },
+            Point {
+                at_ms: 121_800,
+                interval_start_ms: 61_800,
+                value: 50.0,
+                resolution_ms: 0,
+            },
+            Point {
+                at_ms: 184_900,
+                interval_start_ms: 124_900,
+                value: 50.0,
+                resolution_ms: 0,
+            },
+        ];
+
+        let output = chart(ChartSpec {
+            id: "cpu",
+            title: "CPU",
+            points: &points,
+            from_ms: 0,
+            to_ms: 184_900,
+            max_value: 100.0,
+            unit: "%",
+            threshold: None,
+        });
+
+        let path = output
+            .split("class=\"series\" d=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        assert_eq!(path.matches('M').count(), 1);
+    }
+
+    #[test]
+    fn lone_raw_sample_connects_when_its_interval_abuts_coarse_history() {
+        let points = [
+            Point {
+                at_ms: 300_000,
+                interval_start_ms: 0,
+                value: 50.0,
+                resolution_ms: 300_000,
+            },
+            Point {
+                at_ms: 600_000,
+                interval_start_ms: 300_000,
+                value: 50.0,
+                resolution_ms: 300_000,
+            },
+            Point {
+                at_ms: 900_000,
+                interval_start_ms: 600_000,
+                value: 50.0,
+                resolution_ms: 0,
+            },
+        ];
+
+        let output = chart(ChartSpec {
+            id: "cpu",
+            title: "CPU",
+            points: &points,
+            from_ms: 0,
+            to_ms: 900_000,
+            max_value: 100.0,
+            unit: "%",
+            threshold: None,
+        });
+
+        let path = output
+            .split("class=\"series\" d=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        assert_eq!(path.matches('M').count(), 1);
+    }
+
+    #[test]
+    fn later_overlapping_sample_closes_an_apparent_pairwise_gap() {
+        let points = [
+            Point {
+                at_ms: 100,
+                interval_start_ms: 0,
+                value: 50.0,
+                resolution_ms: 0,
+            },
+            Point {
+                at_ms: 200,
+                interval_start_ms: 150,
+                value: 50.0,
+                resolution_ms: 0,
+            },
+            Point {
+                at_ms: 200,
+                interval_start_ms: 0,
+                value: 50.0,
+                resolution_ms: 300_000,
+            },
+        ];
+
+        let output = chart(ChartSpec {
+            id: "cpu",
+            title: "CPU",
+            points: &points,
+            from_ms: 0,
+            to_ms: 200,
+            max_value: 100.0,
+            unit: "%",
+            threshold: None,
+        });
+
+        let path = output
+            .split("class=\"series\" d=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        assert_eq!(path.matches('M').count(), 1);
+    }
+
+    #[test]
+    fn coarse_to_raw_transition_preserves_an_uncovered_gap() {
+        let mut points: Vec<_> = (0..200)
+            .map(|index| Point {
+                at_ms: index * 300_000,
+                interval_start_ms: (index * 300_000).saturating_sub(300_000),
+                value: 50.0,
+                resolution_ms: 300_000,
+            })
+            .collect();
+        points.extend((0..20).map(|index| Point {
+            at_ms: 60_300_000 + index * 60_000,
+            interval_start_ms: 60_240_000 + index * 60_000,
+            value: 50.0,
+            resolution_ms: 0,
+        }));
+
+        let output = chart(ChartSpec {
+            id: "cpu",
+            title: "CPU",
+            points: &points,
+            from_ms: 0,
+            to_ms: 61_440_000,
+            max_value: 100.0,
+            unit: "%",
+            threshold: None,
+        });
+
+        let path = output
+            .split("class=\"series\" d=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        assert_eq!(path.matches('M').count(), 2);
+    }
+
+    #[test]
+    fn coarse_gap_disconnects_lines_and_shows_the_isolated_sample() {
+        let points = [
+            Point {
+                at_ms: 0,
+                interval_start_ms: 0,
+                value: 50.0,
+                resolution_ms: 300_000,
+            },
+            Point {
+                at_ms: 300_000,
+                interval_start_ms: 0,
+                value: 50.0,
+                resolution_ms: 300_000,
+            },
+            Point {
+                at_ms: 600_000,
+                interval_start_ms: 300_000,
+                value: 50.0,
+                resolution_ms: 300_000,
+            },
+            Point {
+                at_ms: 1_800_000,
+                interval_start_ms: 1_500_000,
+                value: 50.0,
+                resolution_ms: 300_000,
+            },
+        ];
+
+        let output = chart(ChartSpec {
+            id: "cpu",
+            title: "CPU",
+            points: &points,
+            from_ms: 0,
+            to_ms: 1_800_000,
+            max_value: 100.0,
+            unit: "%",
+            threshold: None,
+        });
+
+        let path = output
+            .split("class=\"series\" d=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        assert_eq!(path.matches('M').count(), 2);
+        assert_eq!(output.matches("class=\"series-marker\"").count(), 1);
+    }
+
+    #[test]
     fn tooltip_hit_targets_do_not_paint_over_the_series() {
         let point = Point {
             at_ms: 1_000,
+            interval_start_ms: 0,
             value: 42.0,
             resolution_ms: 0,
         };
