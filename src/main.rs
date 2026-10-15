@@ -14,6 +14,7 @@ mod history;
 mod observe;
 #[cfg(unix)]
 mod pressure;
+mod process_history;
 #[cfg(unix)]
 mod remote;
 mod report;
@@ -358,6 +359,12 @@ struct ObserveOptions {
     /// Hours to retain full-resolution host and agent samples.
     #[arg(long, default_value_t = 48, value_parser = clap::value_parser!(u64).range(1..))]
     raw_retention_hours: u64,
+    /// Days to retain individual sampled agent process executions.
+    #[arg(long, default_value_t = 14, value_parser = clap::value_parser!(u64).range(1..))]
+    process_detail_retention_days: u64,
+    /// Days to retain five-minute process summaries.
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+    process_five_minute_retention_days: u64,
     /// Days to retain five-minute trends.
     #[arg(long, default_value_t = 14, value_parser = clap::value_parser!(u64).range(1..))]
     five_minute_retention_days: u64,

@@ -16,6 +16,8 @@ static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy)]
 pub(crate) struct Policy {
     pub raw_hours: u64,
+    pub process_detail_days: u64,
+    pub process_five_minute_days: u64,
     pub five_minute_days: u64,
     pub hourly_days: u64,
     pub daily_days: u64,
@@ -26,12 +28,14 @@ impl Policy {
     pub(crate) fn validate(self) -> io::Result<()> {
         let raw_days = self.raw_hours.div_ceil(24);
         if raw_days > self.five_minute_days
+            || self.process_detail_days > self.process_five_minute_days
+            || self.process_five_minute_days > self.hourly_days
             || self.five_minute_days > self.hourly_days
             || self.hourly_days > self.daily_days
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "retention horizons must increase from raw through daily history",
+                "retention horizons must increase from detailed through daily history",
             ));
         }
         Ok(())
@@ -721,7 +725,7 @@ pub(crate) struct RetentionStatus {
     pub cap_unmet: bool,
 }
 
-const OWNED_PREFIXES: [&str; 9] = [
+const OWNED_PREFIXES: [&str; 13] = [
     "samples-",
     "agent-samples-",
     "agent-rollups-",
@@ -731,10 +735,14 @@ const OWNED_PREFIXES: [&str; 9] = [
     "agent-history-1h-",
     "host-1d-",
     "agent-history-1d-",
+    "process-spans-",
+    "process-history-5m-",
+    "process-history-1h-",
+    "process-history-1d-",
 ];
 
 fn total_bytes(dir: &Path) -> io::Result<u64> {
-    let mut total = 0_u64;
+    let mut total = crate::process_history::checkpoint_bytes(dir)?;
     for prefix in OWNED_PREFIXES {
         for segment in segments(dir, prefix)? {
             total = total.saturating_add(segment.bytes);
@@ -804,6 +812,43 @@ fn early_compact(
     status: &mut RetentionStatus,
     failures: &mut Vec<(PathBuf, String)>,
 ) -> io::Result<()> {
+    for (source, target, source_resolution, target_resolution) in [
+        (
+            "process-spans-",
+            "process-history-5m-",
+            None,
+            FIVE_MINUTES_MS,
+        ),
+        (
+            "process-history-5m-",
+            "process-history-1h-",
+            Some(FIVE_MINUTES_MS),
+            ONE_HOUR_MS,
+        ),
+        (
+            "process-history-1h-",
+            "process-history-1d-",
+            Some(ONE_HOUR_MS),
+            ONE_DAY_MS,
+        ),
+    ] {
+        if total_bytes(dir)? <= max_bytes {
+            return Ok(());
+        }
+        let count = crate::process_history::compact(
+            dir,
+            source,
+            target,
+            source_resolution,
+            target_resolution,
+            u64::MAX,
+            failures,
+        )?;
+        if count > 0 {
+            status.early_compacted_files = status.early_compacted_files.saturating_add(count);
+            status.last_early_compaction_unix_ms = now;
+        }
+    }
     for stage in EARLY_STAGES {
         for segment in segments(dir, stage.source)? {
             if total_bytes(dir)? <= max_bytes {
@@ -852,10 +897,15 @@ fn evict_over_budget(
     protected: &BTreeSet<PathBuf>,
 ) -> io::Result<()> {
     let tiers: &[&[&str]] = &[
-        &["host-1d-", "agent-history-1d-"],
-        &["host-1h-", "agent-history-1h-"],
-        &["host-5m-", "agent-history-5m-", "agent-rollups-"],
-        &["samples-"],
+        &["host-1d-", "agent-history-1d-", "process-history-1d-"],
+        &["host-1h-", "agent-history-1h-", "process-history-1h-"],
+        &[
+            "host-5m-",
+            "agent-history-5m-",
+            "agent-rollups-",
+            "process-history-5m-",
+        ],
+        &["samples-", "process-spans-"],
     ];
     let mut total = total_bytes(dir)?;
     for prefixes in tiers {
@@ -958,6 +1008,7 @@ pub(crate) fn maintain(dir: &Path, now: u64, policy: Policy) -> io::Result<()> {
     let hourly_cutoff = now.saturating_sub(policy.hourly_days.saturating_mul(DAY_MS));
     let daily_cutoff = now.saturating_sub(policy.daily_days.saturating_mul(DAY_MS));
     let mut failures = Vec::new();
+    crate::process_history::maintain(dir, now, policy, &mut failures)?;
     compact_host(
         dir,
         "samples-",
@@ -1108,6 +1159,8 @@ mod tests {
     fn policy() -> Policy {
         Policy {
             raw_hours: 48,
+            process_detail_days: 14,
+            process_five_minute_days: 30,
             five_minute_days: 14,
             hourly_days: 90,
             daily_days: 365,

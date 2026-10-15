@@ -3,6 +3,7 @@ use crate::cache_impact;
 #[cfg(unix)]
 use crate::control;
 use crate::history;
+use crate::process_history;
 use crate::retention;
 use crate::schedule_events;
 use chrono::{DateTime, Duration, Utc};
@@ -13,7 +14,7 @@ use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
 mod compare;
 mod html;
@@ -290,6 +291,7 @@ struct Report {
     categories: Option<Vec<CategoryReport>>,
     agent_commands: Option<Vec<AgentCategoryReport>>,
     passive_commands: Option<Vec<PassiveCommandLoad>>,
+    process_commands: Option<Vec<ProcessCommandLoad>>,
     peak_host_cpu_percent: Option<f64>,
     peak_host_memory_bytes: Option<u64>,
     peak_root_disk_used_percent: Option<f64>,
@@ -393,6 +395,24 @@ struct PassiveCommandLoad {
     read_bytes: u64,
     written_bytes: u64,
     peak_processes: usize,
+}
+
+#[derive(Default, Serialize)]
+struct ProcessCommandLoad {
+    agent: String,
+    workspace_kind: String,
+    family: String,
+    executable: String,
+    subcommand: String,
+    process_count: f64,
+    execution_count_estimated: bool,
+    observed_working_ms: u128,
+    cpu_core_ms_estimate: f64,
+    peak_cpu_percent: f64,
+    peak_memory_bytes: u64,
+    read_bytes: u64,
+    written_bytes: u64,
+    detail_coverage: String,
 }
 
 #[derive(Default, Serialize)]
@@ -1103,6 +1123,20 @@ fn scaled_u64(value: u64, overlap_ms: u128, resolution_ms: u64) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+fn scaled_count(value: f64, overlap_ms: u128, resolution_ms: u64) -> f64 {
+    if value == 0.0 || overlap_ms == 0 {
+        return 0.0;
+    }
+    value * duration_fraction(overlap_ms, u128::from(resolution_ms))
+}
+
+fn duration_fraction(numerator_ms: u128, denominator_ms: u128) -> f64 {
+    let numerator = StdDuration::from_millis(u64::try_from(numerator_ms).unwrap_or(u64::MAX));
+    let denominator =
+        StdDuration::from_millis(u64::try_from(denominator_ms.max(1)).unwrap_or(u64::MAX));
+    numerator.as_secs_f64() / denominator.as_secs_f64()
+}
+
 fn accumulate_agent_rollups(
     load: &mut BTreeMap<String, AgentLoad>,
     rollups: &[AgentRollup],
@@ -1245,6 +1279,232 @@ fn passive_command_reports(
             .total_cmp(&left.cpu_core_ms_estimate)
             .then_with(|| left.agent.cmp(&right.agent))
             .then_with(|| left.family.cmp(&right.family))
+    });
+    Some(reports)
+}
+
+fn safe_process_executable(value: &str) -> &'static str {
+    match value {
+        "go" => "go",
+        "cargo" => "cargo",
+        "mise" => "mise",
+        "make" => "make",
+        "npm" => "npm",
+        "pnpm" => "pnpm",
+        "yarn" => "yarn",
+        "bun" => "bun",
+        "golangci-lint" => "golangci-lint",
+        "rustc" => "rustc",
+        "compile" => "compile",
+        "link" => "link",
+        "asm" => "asm",
+        "cgo" => "cgo",
+        "cc" => "cc",
+        "gcc" => "gcc",
+        "g++" => "g++",
+        "clang" => "clang",
+        "clang++" => "clang++",
+        "swiftc" => "swiftc",
+        "pytest" => "pytest",
+        "jest" => "jest",
+        "vitest" => "vitest",
+        "ruff" => "ruff",
+        "eslint" => "eslint",
+        "staticcheck" => "staticcheck",
+        "clippy-driver" => "clippy-driver",
+        "git" => "git",
+        "docker" => "docker",
+        "podman" => "podman",
+        "kubectl" => "kubectl",
+        _ => "other",
+    }
+}
+
+fn safe_process_subcommand(value: &str) -> &'static str {
+    match value {
+        "build" => "build",
+        "test" => "test",
+        "vet" => "vet",
+        "generate" => "generate",
+        "list" => "list",
+        "check" => "check",
+        "clippy" => "clippy",
+        "run" => "run",
+        "bench" => "bench",
+        "doc" => "doc",
+        "lint" => "lint",
+        "status" => "status",
+        "diff" => "diff",
+        "log" => "log",
+        "show" => "show",
+        "fetch" => "fetch",
+        "pull" => "pull",
+        "push" => "push",
+        "commit" => "commit",
+        "checkout" => "checkout",
+        "switch" => "switch",
+        "worktree" => "worktree",
+        "merge" => "merge",
+        "rebase" => "rebase",
+        "exec" => "exec",
+        "apply" => "apply",
+        "get" => "get",
+        "logs" => "logs",
+        "none" => "none",
+        _ => "other",
+    }
+}
+
+fn safe_workspace_kind(value: &str) -> &'static str {
+    match value {
+        "checkout" => "checkout",
+        "worktree" => "worktree",
+        "outside repository" => "outside repository",
+        _ => "unknown",
+    }
+}
+
+type ProcessGroups = BTreeMap<(String, String, String, String, String), ProcessCommandLoad>;
+
+fn process_group<'a>(
+    groups: &'a mut ProcessGroups,
+    agent: &str,
+    workspace_kind: &str,
+    family: &str,
+    executable: &str,
+    subcommand: &str,
+) -> &'a mut ProcessCommandLoad {
+    let agent = agent_kind(agent).to_owned();
+    let workspace_kind = safe_workspace_kind(workspace_kind).to_owned();
+    let family = passive_family(family).to_owned();
+    let executable = safe_process_executable(executable).to_owned();
+    let subcommand = safe_process_subcommand(subcommand).to_owned();
+    groups
+        .entry((
+            agent.clone(),
+            workspace_kind.clone(),
+            family.clone(),
+            executable.clone(),
+            subcommand.clone(),
+        ))
+        .or_insert_with(|| ProcessCommandLoad {
+            agent,
+            workspace_kind,
+            family,
+            executable,
+            subcommand,
+            ..ProcessCommandLoad::default()
+        })
+}
+
+fn accumulate_process_summary(
+    groups: &mut ProcessGroups,
+    summary: &process_history::ProcessSummary,
+    from_ms: u128,
+    to_ms: u128,
+) {
+    let start = u128::from(summary.bucket_start_unix_ms);
+    let resolution = u128::from(summary.resolution_ms);
+    let overlap = start
+        .saturating_add(resolution)
+        .min(to_ms)
+        .saturating_sub(start.max(from_ms));
+    if overlap == 0 {
+        return;
+    }
+    let group = process_group(
+        groups,
+        &summary.agent,
+        &summary.workspace_kind,
+        &summary.family,
+        &summary.executable,
+        &summary.subcommand,
+    );
+    group.process_count += scaled_count(summary.process_count, overlap, summary.resolution_ms);
+    group.execution_count_estimated |= summary.process_count > 0.0;
+    group.observed_working_ms = group.observed_working_ms.saturating_add(
+        u128::from(summary.observed_working_ms).saturating_mul(overlap) / resolution.max(1),
+    );
+    let fraction = duration_fraction(overlap, resolution);
+    group.cpu_core_ms_estimate += summary.cpu_core_ms_estimate * fraction;
+    group.peak_cpu_percent = group
+        .peak_cpu_percent
+        .max(f64::from(summary.peak_cpu_percent));
+    group.peak_memory_bytes = group.peak_memory_bytes.max(summary.peak_memory_bytes);
+    group.read_bytes = group.read_bytes.saturating_add(scaled_u64(
+        summary.read_bytes,
+        overlap,
+        summary.resolution_ms,
+    ));
+    group.written_bytes = group.written_bytes.saturating_add(scaled_u64(
+        summary.written_bytes,
+        overlap,
+        summary.resolution_ms,
+    ));
+    group.detail_coverage = if group.detail_coverage == "individual sampled spans" {
+        "mixed detail and compacted summaries".to_owned()
+    } else {
+        "compacted summaries".to_owned()
+    };
+}
+
+fn process_command_reports(
+    spans: &[process_history::ProcessSpan],
+    summaries: &[process_history::ProcessSummary],
+    from_ms: u128,
+    to_ms: u128,
+) -> Option<Vec<ProcessCommandLoad>> {
+    if spans.is_empty() && summaries.is_empty() {
+        return None;
+    }
+    let mut groups = BTreeMap::new();
+    for span in spans {
+        let start = u128::from(span.first_seen_unix_ms);
+        let end = u128::from(span.last_seen_unix_ms);
+        let overlap = end.min(to_ms).saturating_sub(start.max(from_ms));
+        if overlap == 0 {
+            continue;
+        }
+        let duration = end.saturating_sub(start).max(1);
+        let fraction = duration_fraction(overlap, duration);
+        let group = process_group(
+            &mut groups,
+            &span.agent,
+            &span.workspace_kind,
+            &span.family,
+            &span.executable,
+            &span.subcommand,
+        );
+        group.process_count += 1.0;
+        group.observed_working_ms = group.observed_working_ms.saturating_add(
+            u128::from(span.observed_working_ms).saturating_mul(overlap) / duration,
+        );
+        group.cpu_core_ms_estimate += span.cpu_core_ms_estimate * fraction;
+        group.peak_cpu_percent = group.peak_cpu_percent.max(f64::from(span.peak_cpu_percent));
+        group.peak_memory_bytes = group.peak_memory_bytes.max(span.peak_memory_bytes);
+        group.read_bytes = group.read_bytes.saturating_add(scaled_u64(
+            span.read_bytes,
+            overlap,
+            u64::try_from(duration).unwrap_or(u64::MAX),
+        ));
+        group.written_bytes = group.written_bytes.saturating_add(scaled_u64(
+            span.written_bytes,
+            overlap,
+            u64::try_from(duration).unwrap_or(u64::MAX),
+        ));
+        "individual sampled spans".clone_into(&mut group.detail_coverage);
+    }
+    for summary in summaries {
+        accumulate_process_summary(&mut groups, summary, from_ms, to_ms);
+    }
+    let mut reports: Vec<_> = groups.into_values().collect();
+    reports.sort_by(|left, right| {
+        right
+            .cpu_core_ms_estimate
+            .total_cmp(&left.cpu_core_ms_estimate)
+            .then_with(|| left.agent.cmp(&right.agent))
+            .then_with(|| left.executable.cmp(&right.executable))
+            .then_with(|| left.subcommand.cmp(&right.subcommand))
     });
     Some(reports)
 }
@@ -1543,6 +1803,7 @@ fn build_report_with_ticks(
             .then(|| compare_agents(&agent_load, passive_commands.as_deref())),
         agent_activity_comparison: passive_commands.as_deref().map(compare_agent_activities),
         passive_commands,
+        process_commands: None,
         peak_host_cpu_percent: peak_host_cpu(&samples),
         peak_host_memory_bytes: samples
             .iter()
@@ -2029,6 +2290,49 @@ fn passive_commands_markdown(commands: Option<&[PassiveCommandLoad]>) -> String 
     out
 }
 
+fn process_commands_markdown(commands: Option<&[ProcessCommandLoad]>) -> String {
+    let mut out = String::from("## Agent process drilldown\n\n");
+    match commands {
+        None => out.push_str("No process-span history is available.\n\n"),
+        Some([]) => out.push_str("No completed agent descendant process overlaps the range.\n\n"),
+        Some(commands) => {
+            out.push_str("Command arguments, paths, environment, prompts, and file contents are excluded. Older rows are compacted under the configured storage cap; a tilde marks proportional execution-equivalent estimates.\n\n");
+            out.push_str("| Agent | Workspace | Family | Process | Subcommand | Executions | Active time | CPU core-ms | Peak RSS | Read | Written | Detail |\n| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n");
+            for command in commands.iter().take(50) {
+                let _ = writeln!(
+                    out,
+                    "| {} | {} | {} | {} | {} | {} | {} | {:.0} | {} | {} | {} | {} |",
+                    command.agent,
+                    command.workspace_kind,
+                    command.family,
+                    command.executable,
+                    command.subcommand,
+                    if command.execution_count_estimated {
+                        format!("~{:.2}", command.process_count)
+                    } else {
+                        format!("{:.0}", command.process_count)
+                    },
+                    readable_duration(Some(command.observed_working_ms)),
+                    command.cpu_core_ms_estimate,
+                    readable_bytes(i128::from(command.peak_memory_bytes)),
+                    readable_bytes(i128::from(command.read_bytes)),
+                    readable_bytes(i128::from(command.written_bytes)),
+                    command.detail_coverage,
+                );
+            }
+            if commands.len() > 50 {
+                let _ = writeln!(
+                    out,
+                    "\nShowing the 50 highest-CPU groups of {}.",
+                    commands.len()
+                );
+            }
+            out.push('\n');
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 fn markdown(report: &Report) -> String {
     markdown_with_timeline(report, false)
@@ -2232,6 +2536,9 @@ fn markdown_with_timeline(report: &Report, include_timeline: bool) -> String {
     out.push_str(&passive_commands_markdown(
         report.passive_commands.as_deref(),
     ));
+    out.push_str(&process_commands_markdown(
+        report.process_commands.as_deref(),
+    ));
     out.push_str(&agents_markdown(report.agents.as_deref()));
     out.push_str(&agent_comparison_markdown(
         report.agent_comparison.as_deref(),
@@ -2331,7 +2638,7 @@ fn default_from(
     agent_rollups: &[AgentRollup],
     records: Option<&[Measurement]>,
     scheduler_events: Option<&[schedule_events::Event]>,
-    control_event_ms: Option<u128>,
+    extra_event_ms: [Option<u128>; 2],
 ) -> DateTime<Utc> {
     let to_ms = u128::try_from(to.timestamp_millis()).unwrap_or_default();
     let oldest_ms = samples
@@ -2359,7 +2666,7 @@ fn default_from(
                 .flatten()
                 .map(|event| u128::from(event.at_unix_ms)),
         )
-        .chain(control_event_ms)
+        .chain(extra_event_ms.into_iter().flatten())
         .filter(|timestamp| *timestamp < to_ms)
         .min();
     oldest_ms
@@ -2410,6 +2717,17 @@ pub fn run(options: &Options) -> io::Result<()> {
     let samples = observations(&dir)?;
     let agent_samples = agent_ticks(&dir)?;
     let agent_summaries = agent_rollups(&dir)?;
+    let process_spans = process_history::spans(&dir)?;
+    let process_summaries = process_history::summaries(&dir)?;
+    let process_event_ms = process_spans
+        .iter()
+        .map(|span| u128::from(span.first_seen_unix_ms))
+        .chain(
+            process_summaries
+                .iter()
+                .map(|summary| u128::from(summary.bucket_start_unix_ms)),
+        )
+        .min();
     let scheduler_events = read_scheduler_events(options)?;
     #[cfg(unix)]
     let control_event_ms = control::earliest_event_ms(options.control_state_dir.as_deref());
@@ -2433,7 +2751,7 @@ pub fn run(options: &Options) -> io::Result<()> {
             &agent_summaries,
             records.as_deref(),
             scheduler_events.as_deref(),
-            control_event_ms,
+            [control_event_ms, process_event_ms],
         )
     });
     if from >= to {
@@ -2449,7 +2767,7 @@ pub fn run(options: &Options) -> io::Result<()> {
         u128::try_from(from.timestamp_millis()).unwrap_or_default(),
         u128::try_from(to.timestamp_millis()).unwrap_or_default(),
     );
-    let report = build_report_with_ticks(
+    let mut report = build_report_with_ticks(
         from,
         to,
         samples,
@@ -2471,6 +2789,11 @@ pub fn run(options: &Options) -> io::Result<()> {
             )
         }),
     );
+    let (from_ms, to_ms) = range_millis(from, to);
+    report.process_commands =
+        process_command_reports(&process_spans, &process_summaries, from_ms, to_ms);
+    report.empty = report.empty && report.process_commands.as_ref().is_none_or(Vec::is_empty);
+    report.retention_status = retention::read_status(&dir)?;
     #[cfg(unix)]
     let report = {
         let mut report = report;
@@ -2484,8 +2807,6 @@ pub fn run(options: &Options) -> io::Result<()> {
         report.empty = report.empty && report.cache.hits == 0 && report.cache.misses == 0;
         report
     };
-    let mut report = report;
-    report.retention_status = retention::read_status(&dir)?;
     write_report(&report, &host_series, options)
 }
 
@@ -3200,5 +3521,102 @@ mod tests {
                 .unwrap()
                 .contains("secret-token")
         );
+    }
+
+    #[test]
+    fn process_report_keeps_cost_and_sanitizes_persisted_labels() {
+        let spans = vec![process_history::ProcessSpan {
+            agent: "codex".to_owned(),
+            pid: 42,
+            start_time: 1,
+            parent_pid: Some(10),
+            parent_start_time: Some(1),
+            executable: "secret-executable".to_owned(),
+            subcommand: "secret-subcommand".to_owned(),
+            family: "secret-family".to_owned(),
+            category: "test".to_owned(),
+            workspace_kind: "/private/worktree".to_owned(),
+            first_seen_unix_ms: 1_000,
+            last_seen_unix_ms: 3_000,
+            observed_working_ms: 2_000,
+            sample_count: 2,
+            cpu_core_ms_estimate: 1_500.0,
+            peak_cpu_percent: 100.0,
+            peak_memory_bytes: 200,
+            read_bytes: 30,
+            written_bytes: 40,
+            coverage: "sampled".to_owned(),
+        }];
+        let groups = process_command_reports(&spans, &[], 0, 4_000).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].agent, "codex");
+        assert_eq!(groups[0].executable, "other");
+        assert_eq!(groups[0].subcommand, "other");
+        assert_eq!(groups[0].family, "other");
+        assert_eq!(groups[0].workspace_kind, "unknown");
+        assert_eq!(groups[0].cpu_core_ms_estimate, 1_500.0);
+        let json = serde_json::to_string(&groups).unwrap();
+        assert!(!json.contains("secret"));
+        assert!(!json.contains("/private"));
+        assert!(!json.contains("\"pid\""));
+    }
+
+    #[test]
+    fn process_report_marks_partial_compacted_execution_counts_as_estimates() {
+        let summaries = vec![process_history::ProcessSummary {
+            bucket_start_unix_ms: 0,
+            resolution_ms: 86_400_000,
+            agent: "codex".to_owned(),
+            executable: "go".to_owned(),
+            subcommand: "test".to_owned(),
+            family: "go test".to_owned(),
+            category: "test".to_owned(),
+            workspace_kind: "worktree".to_owned(),
+            process_count: 1.0,
+            observed_working_ms: 24_000,
+            cpu_core_ms_estimate: 24_000.0,
+            peak_cpu_percent: 100.0,
+            peak_memory_bytes: 200,
+            read_bytes: 24,
+            written_bytes: 48,
+        }];
+        let groups = process_command_reports(&[], &summaries, 0, 3_600_000).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert!((groups[0].process_count - 1.0 / 24.0).abs() < f64::EPSILON);
+        assert!(groups[0].execution_count_estimated);
+        assert_eq!(groups[0].observed_working_ms, 1_000);
+        assert_eq!(groups[0].cpu_core_ms_estimate, 1_000.0);
+    }
+
+    #[test]
+    fn process_report_scales_cpu_for_a_long_running_process() {
+        const DAY_MS: u64 = 86_400_000;
+        let spans = vec![process_history::ProcessSpan {
+            agent: "codex".to_owned(),
+            pid: 42,
+            start_time: 1,
+            parent_pid: Some(10),
+            parent_start_time: Some(1),
+            executable: "go".to_owned(),
+            subcommand: "test".to_owned(),
+            family: "go test".to_owned(),
+            category: "test".to_owned(),
+            workspace_kind: "worktree".to_owned(),
+            first_seen_unix_ms: 0,
+            last_seen_unix_ms: 100 * DAY_MS,
+            observed_working_ms: 100 * DAY_MS,
+            sample_count: 1,
+            cpu_core_ms_estimate: 100_000.0,
+            peak_cpu_percent: 100.0,
+            peak_memory_bytes: 200,
+            read_bytes: 100_000,
+            written_bytes: 0,
+            coverage: "sampled".to_owned(),
+        }];
+        let groups = process_command_reports(&spans, &[], 0, u128::from(60 * DAY_MS)).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].cpu_core_ms_estimate, 60_000.0);
+        assert_eq!(groups[0].observed_working_ms, u128::from(60 * DAY_MS));
+        assert_eq!(groups[0].read_bytes, 60_000);
     }
 }

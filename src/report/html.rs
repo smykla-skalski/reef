@@ -523,6 +523,64 @@ fn command_cost(report: &Report) -> String {
     out
 }
 
+fn process_drilldown(report: &Report) -> String {
+    let mut out = String::from(
+        "<section><h2>Agent process drilldown</h2><p>One row groups completed descendant processes by safe executable, subcommand, command family, and workspace type. Reef excludes arguments, paths, environment, prompts, and file contents. Older rows are compacted under the configured storage cap; a tilde marks proportional execution-equivalent estimates.</p>",
+    );
+    let Some(commands) = report.process_commands.as_deref() else {
+        out.push_str("<p class=\"empty\">Unavailable: observations predate process-span tracking.</p></section>");
+        return out;
+    };
+    if commands.is_empty() {
+        out.push_str("<p class=\"empty\">No completed agent descendant process overlaps this range.</p></section>");
+        return out;
+    }
+    let mut by_agent: BTreeMap<&str, Vec<_>> = BTreeMap::new();
+    for command in commands {
+        by_agent.entry(&command.agent).or_default().push(command);
+    }
+    for (agent, rows) in by_agent {
+        let executions: f64 = rows.iter().map(|row| row.process_count).sum();
+        let execution_label = if rows.iter().any(|row| row.execution_count_estimated) {
+            format!("~{executions:.2} estimated executions")
+        } else {
+            format!("{executions:.0} executions")
+        };
+        let cpu: f64 = rows.iter().map(|row| row.cpu_core_ms_estimate).sum();
+        let _ = write!(
+            out,
+            "<details><summary>{} · {} · {:.0} core-ms</summary><div class=\"table-wrap\"><table><thead><tr><th>Workspace</th><th>Family</th><th>Process</th><th>Subcommand</th><th>Executions</th><th>Active time</th><th>CPU cost</th><th>Peak RSS</th><th>Read</th><th>Written</th><th>Detail</th></tr></thead><tbody>",
+            escape(agent),
+            execution_label,
+            cpu,
+        );
+        for row in rows.iter().take(50) {
+            let _ = write!(
+                out,
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.0} core-ms</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                escape(&row.workspace_kind),
+                escape(&row.family),
+                escape(&row.executable),
+                escape(&row.subcommand),
+                if row.execution_count_estimated {
+                    format!("~{:.2}", row.process_count)
+                } else {
+                    format!("{:.0}", row.process_count)
+                },
+                readable_duration(Some(row.observed_working_ms)),
+                row.cpu_core_ms_estimate,
+                readable_bytes(i128::from(row.peak_memory_bytes)),
+                readable_bytes(i128::from(row.read_bytes)),
+                readable_bytes(i128::from(row.written_bytes)),
+                escape(&row.detail_coverage),
+            );
+        }
+        out.push_str("</tbody></table></div></details>");
+    }
+    out.push_str("</section>");
+    out
+}
+
 fn agent_comparison(report: &Report) -> String {
     let mut out = String::from(
         "<section><h2>Activity-adjusted agent comparison</h2><p>CPU and I/O are normalized by observed active time. Activity mix uses sampled descendant-command CPU, not all agent CPU. Peak RSS is a peak; concurrent observations do not establish causality.</p>",
@@ -731,7 +789,7 @@ fn control_html(control: &crate::control::Summary) -> String {
 pub(super) fn render(report: &Report, series: &HostSeries, include_timeline: bool) -> String {
     let mut out = String::from(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:"><title>Reef workload report</title><style>
-:root{color-scheme:dark;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0b1220;color:#e7edf6}*{box-sizing:border-box}body{margin:0 auto;max-width:1160px;padding:2rem 1.2rem 5rem}h1{font-size:2rem;margin-bottom:.3rem}h2{margin:2.2rem 0 .6rem}h3{margin:.2rem 0 1rem;font-size:1rem}p{line-height:1.55;color:#b9c7da}.muted,.chart-note{color:#92a4bb;font-size:.9rem}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(175px,1fr));gap:.8rem;margin:1.7rem 0}.card,.chart{background:#132033;border:1px solid #29405c;border-radius:14px;padding:1rem}.card span{display:block;color:#9bb0ca;font-size:.85rem}.card strong{display:block;font-size:1.35rem;margin-top:.4rem}.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr));gap:1rem}.chart svg{width:100%;height:auto}.grid{stroke:#344b66;stroke-width:1}.axis{fill:#9bb0ca;font-size:12px}.series{fill:none;stroke:#5eead4;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}.series-marker{fill:#5eead4}.threshold{stroke:#fbbf24;stroke-width:1.4;stroke-dasharray:5 5}.empty{border:1px dashed #405776;padding:1rem;border-radius:9px}.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:.92rem}th,td{text-align:left;padding:.65rem;border-bottom:1px solid #29405c;vertical-align:middle}th{color:#dbe7f8}.bar{display:inline-block;width:var(--size);min-width:2px;max-width:110px;height:.6rem;margin-right:.5rem;border-radius:10px;background:#5eead4}.note{border-left:3px solid #fbbf24;padding-left:.9rem}footer{margin-top:3rem;font-size:.85rem;color:#92a4bb}@media print{:root{color-scheme:light;background:white;color:#172033}.card,.chart{background:white;border-color:#bbb}p,.muted,.chart-note{color:#444}.axis{fill:#555}.grid{stroke:#ccc}th{color:#222}}
+:root{color-scheme:dark;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0b1220;color:#e7edf6}*{box-sizing:border-box}body{margin:0 auto;max-width:1160px;padding:2rem 1.2rem 5rem}h1{font-size:2rem;margin-bottom:.3rem}h2{margin:2.2rem 0 .6rem}h3{margin:.2rem 0 1rem;font-size:1rem}p{line-height:1.55;color:#b9c7da}.muted,.chart-note{color:#92a4bb;font-size:.9rem}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(175px,1fr));gap:.8rem;margin:1.7rem 0}.card,.chart{background:#132033;border:1px solid #29405c;border-radius:14px;padding:1rem}.card span{display:block;color:#9bb0ca;font-size:.85rem}.card strong{display:block;font-size:1.35rem;margin-top:.4rem}.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr));gap:1rem}.chart svg{width:100%;height:auto}.grid{stroke:#344b66;stroke-width:1}.axis{fill:#9bb0ca;font-size:12px}.series{fill:none;stroke:#5eead4;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}.series-marker{fill:#5eead4}.threshold{stroke:#fbbf24;stroke-width:1.4;stroke-dasharray:5 5}.empty{border:1px dashed #405776;padding:1rem;border-radius:9px}.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:.92rem}th,td{text-align:left;padding:.65rem;border-bottom:1px solid #29405c;vertical-align:middle}th{color:#dbe7f8}.bar{display:inline-block;width:var(--size);min-width:2px;max-width:110px;height:.6rem;margin-right:.5rem;border-radius:10px;background:#5eead4}.note{border-left:3px solid #fbbf24;padding-left:.9rem}details{background:#132033;border:1px solid #29405c;border-radius:10px;margin:.7rem 0;padding:.8rem}summary{cursor:pointer;font-weight:650}details .table-wrap{margin-top:.8rem}footer{margin-top:3rem;font-size:.85rem;color:#92a4bb}@media print{:root{color-scheme:light;background:white;color:#172033}.card,.chart,details{background:white;border-color:#bbb}p,.muted,.chart-note{color:#444}.axis{fill:#555}.grid{stroke:#ccc}th{color:#222}}
 </style></head><body><main><h1>Reef workload report</h1>"#,
     );
     let _ = write!(
@@ -821,6 +879,7 @@ pub(super) fn render(report: &Report, series: &HostSeries, include_timeline: boo
     out.push_str(&memory_consumers(report, series));
     out.push_str(&agent_comparison(report));
     out.push_str(&command_cost(report));
+    out.push_str(&process_drilldown(report));
     if include_timeline {
         out.push_str(&pressure_timeline(report));
     }
