@@ -33,6 +33,59 @@ fn reef() -> Command {
 }
 
 #[test]
+fn anonymous_workspaces_compare_equivalent_commands_in_all_formats() {
+    let fixture = Fixture::new();
+    let mut first = serde_json::json!({
+        "bucket_start_unix_ms":1_767_225_600_000_u64, "resolution_ms":300_000,
+        "agent":"codex", "executable":"go", "subcommand":"test", "family":"go test",
+        "category":"test", "workspace_kind":"worktree", "ecosystem":"Go",
+        "repository_id":"a".repeat(64), "workspace_id":"b".repeat(64),
+        "command_fingerprint":"c".repeat(64), "process_count":2.0,
+        "observed_working_ms":2000, "cpu_core_ms_estimate":1000.0,
+        "peak_cpu_percent":50.0, "peak_memory_bytes":400, "read_bytes":10, "written_bytes":20
+    });
+    let line = serde_json::to_string(&first).unwrap();
+    first["workspace_id"] = Value::String("d".repeat(64));
+    first["process_count"] = Value::from(3.0);
+    fs::write(
+        fixture.0.join("process-history-5m-1767225600000-1.jsonl"),
+        format!("{line}\n{first}\n"),
+    )
+    .unwrap();
+    for format in ["json", "markdown", "html"] {
+        let output = reef()
+            .args([
+                "report",
+                "--from",
+                "2026-01-01T00:00:00Z",
+                "--to",
+                "2026-01-01T00:05:00Z",
+                "--state-dir",
+            ])
+            .arg(&fixture.0)
+            .args(["--format", format])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("Go"));
+        assert!(text.contains("cache misses"));
+        if format == "json" {
+            let json: Value = serde_json::from_str(&text).unwrap();
+            let rows = json["process_commands"].as_array().unwrap();
+            assert_eq!(rows.len(), 2);
+            for row in rows {
+                assert_eq!(row["repository_command_executions"], 5.0);
+                assert_eq!(row["command_workspaces"], 2);
+                assert_eq!(row["ecosystem"], "Go");
+            }
+        } else {
+            assert!(text.contains("5.00 equivalent executions across 2 workspaces"));
+        }
+    }
+}
+
+#[test]
 fn report_defaults_to_all_retained_observations() {
     let fixture = Fixture::new();
     fs::write(

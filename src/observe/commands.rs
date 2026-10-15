@@ -18,12 +18,14 @@ pub(crate) struct ProcessSample {
     pub family: String,
     pub category: String,
     pub workspace_kind: String,
+    pub workload: crate::workload::Workload,
     pub cpu_percent: f32,
     pub memory_bytes: u64,
     pub total_read_bytes: u64,
     pub total_written_bytes: u64,
 }
 
+#[derive(Default)]
 pub(super) struct Capture {
     pub commands: Vec<CommandObservation>,
     pub processes: Vec<ProcessSample>,
@@ -110,6 +112,7 @@ fn executable(name: &str) -> &'static str {
         "pnpm" => "pnpm",
         "yarn" => "yarn",
         "bun" => "bun",
+        "node" => "node",
         "golangci-lint" => "golangci-lint",
         "rustc" => "rustc",
         "compile" => "compile",
@@ -224,19 +227,13 @@ fn workspace_kind(cwd: Option<&Path>) -> &'static str {
     }
 }
 
-pub(super) fn sample(system: &mut System, roots: &HashMap<u32, Registration>) -> Capture {
-    if roots.is_empty() {
-        return Capture {
-            commands: Vec::new(),
-            processes: Vec::new(),
-        };
-    }
+fn owned_processes(system: &System, roots: &HashMap<u32, Registration>) -> Vec<(Pid, AgentKind)> {
     let parents: HashMap<_, _> = system
         .processes()
         .iter()
         .map(|(pid, process)| (pid.as_u32(), process.parent().map(Pid::as_u32)))
         .collect();
-    let owned: Vec<_> = system
+    system
         .processes()
         .keys()
         .filter_map(|pid| {
@@ -245,25 +242,34 @@ pub(super) fn sample(system: &mut System, roots: &HashMap<u32, Registration>) ->
                 .flatten()
                 .map(|kind| (*pid, kind))
         })
-        .collect();
+        .collect()
+}
+
+pub(super) fn sample(
+    system: &mut System,
+    roots: &HashMap<u32, Registration>,
+    dir: &Path,
+) -> Capture {
+    if roots.is_empty() {
+        return Capture::default();
+    }
+    let owned = owned_processes(system, roots);
     if owned.is_empty() {
-        return Capture {
-            commands: Vec::new(),
-            processes: Vec::new(),
-        };
+        return Capture::default();
     }
     let pids: Vec<_> = owned.iter().map(|(pid, _)| *pid).collect();
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&pids),
         false,
         ProcessRefreshKind::nothing()
-            .with_cmd(UpdateKind::OnlyIfNotSet)
-            .with_cwd(UpdateKind::OnlyIfNotSet)
+            .with_cmd(UpdateKind::Always)
+            .with_cwd(UpdateKind::Always)
             .without_tasks(),
     );
     let mut groups: BTreeMap<(String, String), CommandObservation> = BTreeMap::new();
     let mut workspace_cache = HashMap::new();
     let mut samples = Vec::new();
+    let key = crate::workload::installation_key(dir).ok();
     for (pid, kind) in owned {
         let Some(process) = system.process(pid) else {
             continue;
@@ -284,6 +290,15 @@ pub(super) fn sample(system: &mut System, roots: &HashMap<u32, Registration>) ->
                 .entry(cwd.to_path_buf())
                 .or_insert_with(|| workspace_kind(Some(cwd)))
         });
+        let mut workload = crate::workload::identify(
+            key.as_ref(),
+            process.cwd(),
+            executable,
+            args.get(1..).unwrap_or_default(),
+        );
+        if family == "Go test binary" {
+            "Go".clone_into(&mut workload.ecosystem);
+        }
         samples.push(ProcessSample {
             pid: pid.as_u32(),
             start_time: process.start_time(),
@@ -295,6 +310,7 @@ pub(super) fn sample(system: &mut System, roots: &HashMap<u32, Registration>) ->
             family: family.to_owned(),
             category: category.to_owned(),
             workspace_kind: workspace_kind.to_owned(),
+            workload,
             cpu_percent: process.cpu_usage(),
             memory_bytes: process.memory(),
             total_read_bytes: disk.total_read_bytes,

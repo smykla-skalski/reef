@@ -401,6 +401,12 @@ struct PassiveCommandLoad {
 struct ProcessCommandLoad {
     agent: String,
     workspace_kind: String,
+    #[serde(flatten)]
+    workload: crate::workload::Workload,
+    repository_command_executions: Option<f64>,
+    repository_command_executions_estimated: bool,
+    command_workspaces: Option<usize>,
+    command_comparison: &'static str,
     family: String,
     executable: String,
     subcommand: String,
@@ -413,6 +419,21 @@ struct ProcessCommandLoad {
     read_bytes: u64,
     written_bytes: u64,
     detail_coverage: String,
+}
+
+impl ProcessCommandLoad {
+    fn repetition_label(&self) -> String {
+        self.repository_command_executions.map_or_else(
+            || "unknown".to_owned(),
+            |count| {
+                if self.repository_command_executions_estimated {
+                    format!("~{count:.2}")
+                } else {
+                    format!("{count:.2}")
+                }
+            },
+        )
+    }
 }
 
 #[derive(Default, Serialize)]
@@ -1293,6 +1314,7 @@ fn safe_process_executable(value: &str) -> &'static str {
         "pnpm" => "pnpm",
         "yarn" => "yarn",
         "bun" => "bun",
+        "node" => "node",
         "golangci-lint" => "golangci-lint",
         "rustc" => "rustc",
         "compile" => "compile",
@@ -1364,7 +1386,17 @@ fn safe_workspace_kind(value: &str) -> &'static str {
     }
 }
 
-type ProcessGroups = BTreeMap<(String, String, String, String, String), ProcessCommandLoad>;
+type ProcessGroups = BTreeMap<
+    (
+        String,
+        String,
+        String,
+        String,
+        String,
+        crate::workload::Workload,
+    ),
+    ProcessCommandLoad,
+>;
 
 fn process_group<'a>(
     groups: &'a mut ProcessGroups,
@@ -1373,6 +1405,7 @@ fn process_group<'a>(
     family: &str,
     executable: &str,
     subcommand: &str,
+    workload: crate::workload::Workload,
 ) -> &'a mut ProcessCommandLoad {
     let agent = agent_kind(agent).to_owned();
     let workspace_kind = safe_workspace_kind(workspace_kind).to_owned();
@@ -1386,10 +1419,13 @@ fn process_group<'a>(
             family.clone(),
             executable.clone(),
             subcommand.clone(),
+            workload.clone(),
         ))
         .or_insert_with(|| ProcessCommandLoad {
             agent,
             workspace_kind,
+            workload,
+            command_comparison: "Normalized argv and relative cwd only; equal inputs, cache misses, and wasted work are not established",
             family,
             executable,
             subcommand,
@@ -1399,6 +1435,7 @@ fn process_group<'a>(
 
 fn accumulate_process_summary(
     groups: &mut ProcessGroups,
+    seen: &mut std::collections::BTreeSet<crate::workload::Workload>,
     summary: &process_history::ProcessSummary,
     from_ms: u128,
     to_ms: u128,
@@ -1419,6 +1456,7 @@ fn accumulate_process_summary(
         &summary.family,
         &summary.executable,
         &summary.subcommand,
+        summary.workload.bounded(seen),
     );
     group.process_count += scaled_count(summary.process_count, overlap, summary.resolution_ms);
     group.execution_count_estimated |= summary.process_count > 0.0;
@@ -1458,6 +1496,7 @@ fn process_command_reports(
         return None;
     }
     let mut groups = BTreeMap::new();
+    let mut seen = std::collections::BTreeSet::new();
     for span in spans {
         let start = u128::from(span.first_seen_unix_ms);
         let end = u128::from(span.last_seen_unix_ms);
@@ -1474,6 +1513,7 @@ fn process_command_reports(
             &span.family,
             &span.executable,
             &span.subcommand,
+            span.workload.bounded(&mut seen),
         );
         group.process_count += 1.0;
         group.observed_working_ms = group.observed_working_ms.saturating_add(
@@ -1495,9 +1535,10 @@ fn process_command_reports(
         "individual sampled spans".clone_into(&mut group.detail_coverage);
     }
     for summary in summaries {
-        accumulate_process_summary(&mut groups, summary, from_ms, to_ms);
+        accumulate_process_summary(&mut groups, &mut seen, summary, from_ms, to_ms);
     }
     let mut reports: Vec<_> = groups.into_values().collect();
+    annotate_repetitions(&mut reports);
     reports.sort_by(|left, right| {
         right
             .cpu_core_ms_estimate
@@ -1507,6 +1548,47 @@ fn process_command_reports(
             .then_with(|| left.subcommand.cmp(&right.subcommand))
     });
     Some(reports)
+}
+
+fn annotate_repetitions(reports: &mut [ProcessCommandLoad]) {
+    let mut repetitions: BTreeMap<_, (f64, std::collections::BTreeSet<_>, bool)> = BTreeMap::new();
+    for row in reports.iter() {
+        if let Some((repository, fingerprint)) = row
+            .workload
+            .repository_id
+            .as_ref()
+            .zip(row.workload.command_fingerprint.as_ref())
+        {
+            let repetition = repetitions.entry((repository, fingerprint)).or_default();
+            repetition.0 += row.process_count;
+            repetition.2 |= row.execution_count_estimated;
+            if let Some(workspace) = &row.workload.workspace_id {
+                repetition.1.insert(workspace);
+            }
+        }
+    }
+    let repetitions: BTreeMap<_, _> = repetitions
+        .into_iter()
+        .map(|((repo, command), (count, workspaces, estimated))| {
+            (
+                (repo.clone(), command.clone()),
+                (count, workspaces.len(), estimated),
+            )
+        })
+        .collect();
+    for row in reports.iter_mut() {
+        if let Some((count, workspaces, estimated)) = row
+            .workload
+            .repository_id
+            .as_ref()
+            .zip(row.workload.command_fingerprint.as_ref())
+            .and_then(|(repo, command)| repetitions.get(&(repo.clone(), command.clone())))
+        {
+            row.repository_command_executions = Some(*count);
+            row.command_workspaces = Some(*workspaces);
+            row.repository_command_executions_estimated = *estimated;
+        }
+    }
 }
 
 fn swap_growth(samples: &[Observation]) -> Option<i128> {
@@ -2296,14 +2378,28 @@ fn process_commands_markdown(commands: Option<&[ProcessCommandLoad]>) -> String 
         None => out.push_str("No process-span history is available.\n\n"),
         Some([]) => out.push_str("No completed agent descendant process overlaps the range.\n\n"),
         Some(commands) => {
-            out.push_str("Command arguments, paths, environment, prompts, and file contents are excluded. Older rows are compacted under the configured storage cap; a tilde marks proportional execution-equivalent estimates.\n\n");
+            out.push_str("Command arguments, paths, environment, prompts, and file contents are excluded. Local identifiers use an installation-secret keyed digest. Equal command fingerprints describe normalized argv and relative cwd, not equal inputs, cache misses, or wasted work. At most 256 identity groups are retained per compaction segment and report; overflow and legacy identifiers are unknown. Older rows are compacted under the configured storage cap; a tilde marks proportional execution-equivalent estimates.\n\n");
             out.push_str("| Agent | Workspace | Family | Process | Subcommand | Executions | Active time | CPU core-ms | Peak RSS | Read | Written | Detail |\n| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n");
             for command in commands.iter().take(50) {
+                let identity = format!(
+                    "{} / {} / repo {} / workspace {} / command {} / {} equivalent executions across {} workspaces",
+                    command.workspace_kind,
+                    command.workload.ecosystem,
+                    crate::workload::Workload::short(command.workload.repository_id.as_deref()),
+                    crate::workload::Workload::short(command.workload.workspace_id.as_deref()),
+                    crate::workload::Workload::short(
+                        command.workload.command_fingerprint.as_deref()
+                    ),
+                    command.repetition_label(),
+                    command
+                        .command_workspaces
+                        .map_or_else(|| "unknown".to_owned(), |count| count.to_string())
+                );
                 let _ = writeln!(
                     out,
                     "| {} | {} | {} | {} | {} | {} | {} | {:.0} | {} | {} | {} | {} |",
                     command.agent,
-                    command.workspace_kind,
+                    identity,
                     command.family,
                     command.executable,
                     command.subcommand,
@@ -3536,6 +3632,7 @@ mod tests {
             family: "secret-family".to_owned(),
             category: "test".to_owned(),
             workspace_kind: "/private/worktree".to_owned(),
+            workload: crate::workload::Workload::default(),
             first_seen_unix_ms: 1_000,
             last_seen_unix_ms: 3_000,
             observed_working_ms: 2_000,
@@ -3572,6 +3669,7 @@ mod tests {
             family: "go test".to_owned(),
             category: "test".to_owned(),
             workspace_kind: "worktree".to_owned(),
+            workload: crate::workload::Workload::default(),
             process_count: 1.0,
             observed_working_ms: 24_000,
             cpu_core_ms_estimate: 24_000.0,
@@ -3602,6 +3700,7 @@ mod tests {
             family: "go test".to_owned(),
             category: "test".to_owned(),
             workspace_kind: "worktree".to_owned(),
+            workload: crate::workload::Workload::default(),
             first_seen_unix_ms: 0,
             last_seen_unix_ms: 100 * DAY_MS,
             observed_working_ms: 100 * DAY_MS,

@@ -30,6 +30,7 @@ mod status;
 #[cfg(target_os = "linux")]
 mod strong_linux;
 mod tool_classification;
+mod workload;
 
 #[cfg(target_os = "linux")]
 use clap::Args;

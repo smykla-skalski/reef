@@ -213,6 +213,12 @@ An opt-in trusted SSH worker path is implemented behind a disabled-by-default po
 
 ## Development
 
+### Anonymous workload comparison
+
+The agent process drilldown labels Rust, Go, Node, mixed-tool, and unknown ecosystems. Repository and workspace IDs are keyed digests local to the observer installation: linked Git worktrees share a repository ID and have distinct workspace IDs. Only Git administrative paths are inspected; remotes, file contents, environment variables, and raw arguments are never recorded. Missing or unreadable metadata stays unknown, including older history.
+
+Command fingerprints compare bounded argv and cwd relative to the workspace. Absolute arguments rooted in that workspace are normalized, allowing equivalent commands across linked worktrees to match. Matching fingerprints establish command repetition only: they do not establish equal inputs, a cache miss, or wasted work. Unknown executables and oversized argv have no fingerprint. CPU core-time, observed duration, peak RSS, I/O, and execution-equivalent counts survive compaction. Compaction segments and reports retain at most 256 identity groups; overflow loses identifiers and remains in aggregate metrics. Reports show short identifier prefixes; JSON retains full digests. Resetting the observer's private `workload-secret` starts a new identity namespace; keep it private.
+
 Install the toolchain and run all checks:
 
 ```console
