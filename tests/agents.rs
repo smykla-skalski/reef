@@ -35,7 +35,7 @@ impl Fixture {
         write_script(&bin.join("opencode"), "#!/bin/sh\nexec \"$@\"\n");
         write_script(
             &bin.join("go"),
-            "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$REEF_ADMITTED\" \"$REEF_AGENT_KIND\" \"$*\" >> \"$REEF_TEST_OUTPUT\"\nif [ \"$REEF_TEST_PAUSE\" = 1 ]; then touch \"$REEF_TEST_MARKER\"; sleep 2; fi\nif [ \"$REEF_TEST_NESTED_ENABLED\" = 1 ] && [ -z \"$REEF_TEST_NESTED\" ]; then REEF_TEST_NESTED=1 go test nested; fi\nexit 7\n",
+            "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$REEF_ADMITTED\" \"$REEF_AGENT_KIND\" \"$*\" >> \"$REEF_TEST_OUTPUT\"\nif [ \"$REEF_TEST_PAUSE\" = 1 ]; then touch \"$REEF_TEST_MARKER\"; if [ -n \"$REEF_TEST_RELEASE\" ]; then while [ ! -e \"$REEF_TEST_RELEASE\" ]; do sleep 0.02; done; else sleep 2; fi; fi\nif [ \"$REEF_TEST_NESTED_ENABLED\" = 1 ] && [ -z \"$REEF_TEST_NESTED\" ]; then REEF_TEST_NESTED=1 go test nested; fi\nexit 7\n",
         );
         for tool in ["cargo", "make"] {
             write_script(
@@ -164,10 +164,12 @@ impl Fixture {
 fn agent_wait_expires_without_starting_a_queued_command() {
     let fixture = Fixture::new(true);
     let marker = fixture.path.join("first-started");
+    let release = fixture.path.join("first-release");
     let mut first = fixture
         .launch("codex", &["go", "test", "first"])
         .env("REEF_TEST_PAUSE", "1")
         .env("REEF_TEST_MARKER", &marker)
+        .env("REEF_TEST_RELEASE", &release)
         .spawn()
         .unwrap();
     wait_until(|| marker.exists());
@@ -176,6 +178,7 @@ fn agent_wait_expires_without_starting_a_queued_command() {
         .launch_mode_with_wait("codex", &["go", "test", "second"], false, 50)
         .output()
         .unwrap();
+    fs::write(release, "").unwrap();
     assert!(!second.status.success(), "{second:?}");
     assert!(
         String::from_utf8_lossy(&second.stderr).contains("pre-admission wait expired"),
