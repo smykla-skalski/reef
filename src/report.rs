@@ -45,6 +45,10 @@ pub struct Options {
     #[cfg(unix)]
     #[arg(long)]
     cache_dir: Option<PathBuf>,
+    /// Native cache evidence directory; separate from Reef's output cache.
+    #[cfg(unix)]
+    #[arg(long)]
+    native_cache_state_dir: Option<PathBuf>,
     /// Report format.
     #[arg(long, value_enum, default_value_t = Format::Markdown)]
     format: Format,
@@ -310,6 +314,8 @@ struct Report {
     control: control::Summary,
     #[cfg(unix)]
     cache: cache_impact::Impact,
+    #[cfg(unix)]
+    native_cache: crate::native_cache::Evidence,
 }
 
 #[derive(Serialize)]
@@ -1727,7 +1733,6 @@ fn build_report_with_ticks(
 ) -> Report {
     let (from_ms, to_ms) = range_millis(from, to);
     let samples = observations_in_range(samples, from_ms, to_ms);
-    let observation_resolutions = observation_resolutions(&samples);
     let mut agent_ticks = ticks_in_range(agent_data.ticks, from_ms, to_ms);
     let agent_rollups = rollups_in_range(agent_data.rollups, from_ms, to_ms);
     let coarse_history_approximate = has_coarse_history(&samples, &agent_rollups);
@@ -1786,7 +1791,7 @@ fn build_report_with_ticks(
             scheduler.as_ref(),
         ),
         observation_count: samples.len(),
-        observation_resolutions,
+        observation_resolutions: observation_resolutions(&samples),
         coarse_history_approximate,
         retention_status: None,
         host_observations_with_agents,
@@ -1805,10 +1810,7 @@ fn build_report_with_ticks(
         passive_commands,
         process_commands: None,
         peak_host_cpu_percent: peak_host_cpu(&samples),
-        peak_host_memory_bytes: samples
-            .iter()
-            .filter_map(|s| s.peak_memory_used_bytes.or(s.memory_used_bytes))
-            .max(),
+        peak_host_memory_bytes: peak_host_memory(&samples),
         peak_root_disk_used_percent: peak_disk_used_percent(&samples),
         swap_growth_bytes: swap_growth(&samples),
         memory_consumers: memory_consumer_reports(&samples),
@@ -1824,7 +1826,16 @@ fn build_report_with_ticks(
         control: control::Summary::default(),
         #[cfg(unix)]
         cache: cache_impact::Impact::default(),
+        #[cfg(unix)]
+        native_cache: crate::native_cache::Evidence::default(),
     }
+}
+
+fn peak_host_memory(samples: &[Observation]) -> Option<u64> {
+    samples
+        .iter()
+        .filter_map(|sample| sample.peak_memory_used_bytes.or(sample.memory_used_bytes))
+        .max()
 }
 
 fn range_millis(from: DateTime<Utc>, to: DateTime<Utc>) -> (u128, u128) {
@@ -2557,6 +2568,8 @@ fn markdown_with_timeline(report: &Report, include_timeline: bool) -> String {
     #[cfg(unix)]
     {
         out.push_str(&cache_impact::markdown(&report.cache));
+        out.push_str("\n## ");
+        out.push_str(&crate::native_cache::text(&report.native_cache));
     }
     out
 }
@@ -2734,6 +2747,22 @@ pub fn run(options: &Options) -> io::Result<()> {
     #[cfg(not(unix))]
     let control_event_ms = None;
     #[cfg(unix)]
+    let native_cache = crate::native_cache::report(
+        options.native_cache_state_dir.as_deref(),
+        0,
+        u64::try_from(to.timestamp_millis()).unwrap_or_default(),
+    )?;
+    #[cfg(unix)]
+    let control_event_ms = control_event_ms
+        .into_iter()
+        .chain(
+            native_cache
+                .snapshots
+                .iter()
+                .map(|snapshot| u128::from(snapshot.collected_unix_ms)),
+        )
+        .min();
+    #[cfg(unix)]
     let mut control = control::summary(
         options.control_state_dir.as_deref(),
         0,
@@ -2761,12 +2790,6 @@ pub fn run(options: &Options) -> io::Result<()> {
         ));
     }
     let host_series = html::HostSeries::from_samples(&samples, from, to);
-    #[cfg(unix)]
-    let control = control::summary(
-        options.control_state_dir.as_deref(),
-        u128::try_from(from.timestamp_millis()).unwrap_or_default(),
-        u128::try_from(to.timestamp_millis()).unwrap_or_default(),
-    );
     let mut report = build_report_with_ticks(
         from,
         to,
@@ -2795,19 +2818,28 @@ pub fn run(options: &Options) -> io::Result<()> {
     report.empty = report.empty && report.process_commands.as_ref().is_none_or(Vec::is_empty);
     report.retention_status = retention::read_status(&dir)?;
     #[cfg(unix)]
-    let report = {
-        let mut report = report;
-        report.control = control;
-        report.empty = report.empty && report.control.attempted.unwrap_or_default() == 0;
-        report.cache = cache_impact::report(
-            options.cache_dir.as_deref(),
-            u128::try_from(from.timestamp_millis()).unwrap_or_default(),
-            u128::try_from(to.timestamp_millis()).unwrap_or_default(),
-        )?;
-        report.empty = report.empty && report.cache.hits == 0 && report.cache.misses == 0;
-        report
-    };
+    attach_unix_evidence(&mut report, options, from_ms, to_ms, native_cache)?;
     write_report(&report, &host_series, options)
+}
+
+#[cfg(unix)]
+fn attach_unix_evidence(
+    report: &mut Report,
+    options: &Options,
+    from_ms: u128,
+    to_ms: u128,
+    mut native_cache: crate::native_cache::Evidence,
+) -> io::Result<()> {
+    report.control = control::summary(options.control_state_dir.as_deref(), from_ms, to_ms);
+    report.empty = report.empty && report.control.attempted.unwrap_or_default() == 0;
+    report.cache = cache_impact::report(options.cache_dir.as_deref(), from_ms, to_ms)?;
+    report.empty = report.empty && report.cache.hits == 0 && report.cache.misses == 0;
+    native_cache
+        .snapshots
+        .retain(|snapshot| u128::from(snapshot.collected_unix_ms) >= from_ms);
+    report.native_cache = native_cache;
+    report.empty = report.empty && report.native_cache.snapshots.is_empty();
+    Ok(())
 }
 
 fn write_report(

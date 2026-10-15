@@ -786,6 +786,14 @@ fn control_html(control: &crate::control::Summary) -> String {
     out
 }
 
+#[cfg(unix)]
+fn native_cache_html(report: &Report) -> String {
+    format!(
+        "<section><h2>Native cache evidence</h2><pre style=\"white-space:pre-wrap\">{}</pre></section>",
+        escape(&crate::native_cache::text(&report.native_cache))
+    )
+}
+
 pub(super) fn render(report: &Report, series: &HostSeries, include_timeline: bool) -> String {
     let mut out = String::from(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:"><title>Reef workload report</title><style>
@@ -880,6 +888,8 @@ pub(super) fn render(report: &Report, series: &HostSeries, include_timeline: boo
     out.push_str(&agent_comparison(report));
     out.push_str(&command_cost(report));
     out.push_str(&process_drilldown(report));
+    #[cfg(unix)]
+    out.push_str(&native_cache_html(report));
     if include_timeline {
         out.push_str(&pressure_timeline(report));
     }
