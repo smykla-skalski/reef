@@ -168,6 +168,37 @@ fn read_metadata(path: &Path) -> Option<String> {
     fs::read_to_string(path).ok()
 }
 
+fn normalized_argument(bytes: &[u8], root: &[u8], alias: &[u8]) -> Vec<u8> {
+    let (prefix, value) = bytes
+        .iter()
+        .position(|byte| *byte == b'=')
+        .filter(|_| bytes.starts_with(b"-"))
+        .map_or((&[][..], bytes), |index| {
+            (&bytes[..=index], &bytes[index + 1..])
+        });
+    let tail = [root, alias].into_iter().find_map(|base| {
+        value
+            .strip_prefix(base)
+            .filter(|tail| tail.is_empty() || matches!(tail[0], b'/' | b'\\'))
+    });
+    // Tag workspace-relative paths separately from literal argv, including literal markers.
+    let mut encoded = Vec::with_capacity(bytes.len() + 9);
+    if let Some(tail) = tail {
+        encoded.push(1);
+        encoded.extend(
+            u64::try_from(prefix.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        encoded.extend(prefix);
+        encoded.extend(tail);
+    } else {
+        encoded.push(0);
+        encoded.extend(bytes);
+    }
+    encoded
+}
+
 pub(crate) fn identify(
     key: Option<&[u8; 32]>,
     cwd: Option<&Path>,
@@ -222,21 +253,10 @@ pub(crate) fn identify(
             .to_vec(),
     ];
     for arg in args {
-        let bytes = arg.as_encoded_bytes();
-        let root_bytes = root.as_os_str().as_encoded_bytes();
-        let value = bytes
-            .strip_prefix(root_bytes)
-            .or_else(|| bytes.strip_prefix(alias_bytes))
-            .filter(|tail| tail.first().is_some_and(|b| matches!(b, b'/' | b'\\')));
-        normalized.push(value.map_or_else(
-            || {
-                if bytes == root_bytes || bytes == alias_bytes {
-                    b"$WORKSPACE".to_vec()
-                } else {
-                    bytes.to_vec()
-                }
-            },
-            |tail| [b"$WORKSPACE".as_slice(), tail].concat(),
+        normalized.push(normalized_argument(
+            arg.as_encoded_bytes(),
+            root.as_os_str().as_encoded_bytes(),
+            alias_bytes,
         ));
     }
     result.command_fingerprint = Some(digest(
@@ -335,6 +355,62 @@ mod tests {
         let one = digest(&[7; 32], b"test", &[b"a", b"bc"]);
         let two = digest(&[7; 32], b"test", &[b"ab", b"c"]);
         assert_ne!(one, two);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn equals_form_workspace_paths_match_across_linked_worktrees() {
+        let root = fixture();
+        let first = identify(
+            Some(&[7; 32]),
+            Some(&root.join("checkout")),
+            "cargo",
+            &[
+                OsString::from("test"),
+                OsString::from(format!(
+                    "--manifest-path={}",
+                    root.join("checkout/Cargo.toml").display()
+                )),
+            ],
+        );
+        let linked = identify(
+            Some(&[7; 32]),
+            Some(&root.join("linked")),
+            "cargo",
+            &[
+                OsString::from("test"),
+                OsString::from(format!(
+                    "--manifest-path={}",
+                    root.join("linked/Cargo.toml").display()
+                )),
+            ],
+        );
+        assert!(first.command_fingerprint.is_some());
+        assert_eq!(first.command_fingerprint, linked.command_fingerprint);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn literal_marker_arguments_do_not_collide_with_workspace_paths() {
+        let root = fixture();
+        for prefix in ["", "--script="] {
+            let absolute = identify(
+                Some(&[7; 32]),
+                Some(&root.join("checkout")),
+                "node",
+                &[OsString::from(format!(
+                    "{prefix}{}",
+                    root.join("checkout/script.js").display()
+                ))],
+            );
+            let literal = identify(
+                Some(&[7; 32]),
+                Some(&root.join("checkout")),
+                "node",
+                &[OsString::from(format!("{prefix}$WORKSPACE/script.js"))],
+            );
+            assert_ne!(absolute.command_fingerprint, literal.command_fingerprint);
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
