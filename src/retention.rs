@@ -466,7 +466,7 @@ pub(crate) fn publish<T: Serialize + DeserializeOwned>(
     }
     match fs::symlink_metadata(target) {
         Ok(metadata) if metadata.is_file() => {
-            if fs::read(target)? == serialized {
+            if fs::read(target)? == serialized || compatible_segment::<T>(target, &serialized)? {
                 return Ok(());
             }
             return Err(io::Error::new(
@@ -502,6 +502,54 @@ pub(crate) fn publish<T: Serialize + DeserializeOwned>(
         let _ = fs::remove_file(temporary);
     }
     result
+}
+
+fn compatible_segment<T: Serialize + DeserializeOwned>(
+    target: &Path,
+    serialized: &[u8],
+) -> io::Result<bool> {
+    let existing: Vec<T> = match read_lines(target) {
+        Ok(records) => records,
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let expected: Vec<T> = BufReader::new(serialized)
+        .lines()
+        .map(|line| serde_json::from_str(&line?).map_err(io::Error::other))
+        .collect::<io::Result<_>>()?;
+    Ok(compatible_value(
+        &serde_json::to_value(existing)?,
+        &serde_json::to_value(expected)?,
+    ))
+}
+
+fn compatible_value(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) if left.is_f64() && right.is_f64() => {
+            let left = left.as_f64().unwrap_or(f64::NAN);
+            let right = right.as_f64().unwrap_or(f64::NAN);
+            // Legacy JSON float parsing can move a value by one representable step.
+            left.is_sign_negative() == right.is_sign_negative()
+                && left.to_bits().abs_diff(right.to_bits()) <= 1
+        }
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| compatible_value(left, right))
+        }
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, left)| {
+                    right
+                        .get(key)
+                        .is_some_and(|right| compatible_value(left, right))
+                })
+        }
+        _ => left == right,
+    }
 }
 
 fn fold_host_raw(records: &[RawHost], resolution: u64) -> Vec<HostSummary> {
@@ -1358,6 +1406,113 @@ mod tests {
         let agent_bytes = fs::read(&agent_target).unwrap();
         publish(&dir, &agent_target, &[agent]).unwrap();
         assert_eq!(fs::read(&agent_target).unwrap(), agent_bytes);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persisted_float_metrics_round_trip_without_moving_a_bit() {
+        let value = f64::from_bits(0x414c_054c_23d7_0a3e);
+        let encoded = serde_json::to_string(&value).unwrap();
+        let decoded: f64 = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(decoded.to_bits(), value.to_bits());
+    }
+
+    #[test]
+    fn legacy_publish_accepts_defaults_and_preserves_existing_bytes() {
+        let dir = fixture();
+        let target = dir.join("agent-rollups-0-1.jsonl");
+        let record = AgentSummary::empty(0, 60_000, "codex".to_owned());
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        legacy.as_object_mut().unwrap().remove("resolution_ms");
+        legacy.as_object_mut().unwrap().remove("covered_minutes");
+        let original = format!("{legacy}\n");
+        fs::write(&target, &original).unwrap();
+
+        publish(&dir, &target, &[record]).unwrap();
+        publish(
+            &dir,
+            &target,
+            &[AgentSummary::empty(0, 60_000, "codex".to_owned())],
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), original);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_float_rounding_is_compatible_but_resource_changes_are_not() {
+        let dir = fixture();
+        let target = dir.join("host-5m-0-1.jsonl");
+        let mut record = HostSummary::new(0, FIVE_MINUTES_MS);
+        record.cpu_percent.weighted_sum = 1.0;
+        publish(&dir, &target, &[record.clone()]).unwrap();
+        let mut legacy: HostSummary = read_lines(&target).unwrap().remove(0);
+        legacy.cpu_percent.weighted_sum =
+            f64::from_bits(legacy.cpu_percent.weighted_sum.to_bits() + 1);
+        fs::write(
+            &target,
+            format!("{}\n", serde_json::to_string(&legacy).unwrap()),
+        )
+        .unwrap();
+        let bytes = fs::read(&target).unwrap();
+        assert_ne!(
+            bytes,
+            format!("{}\n", serde_json::to_string(&record).unwrap()).as_bytes()
+        );
+        publish(&dir, &target, &[record.clone()]).unwrap();
+
+        record.source_samples = 1;
+        assert!(publish(&dir, &target, &[record.clone()]).is_err());
+        record.source_samples = 0;
+        record.cpu_percent.weighted_sum *= 1.001;
+        assert!(publish(&dir, &target, &[record]).is_err());
+        assert_eq!(fs::read(&target).unwrap(), bytes);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_large_integer_metrics_stay_exact() {
+        let dir = fixture();
+        let target = dir.join("host-5m-0-1.jsonl");
+        let mut record = HostSummary::new(0, FIVE_MINUTES_MS);
+        record.memory_used_bytes.weighted_sum = u128::from(u64::MAX) + 10;
+        let legacy = serde_json::to_value(&record).unwrap();
+        fs::write(&target, format!("{legacy}\n")).unwrap();
+        let bytes = fs::read(&target).unwrap();
+
+        publish(&dir, &target, &[record.clone()]).unwrap();
+        record.memory_used_bytes.weighted_sum += 1;
+        assert!(publish(&dir, &target, &[record]).is_err());
+        assert_eq!(fs::read(&target).unwrap(), bytes);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_after_legacy_publish_keeps_totals_across_retries() {
+        let dir = fixture();
+        let now = 20 * DAY_MS;
+        let at = now - 3 * DAY_MS;
+        let source = dir.join(format!("samples-{at}-1.jsonl"));
+        let target = dir.join(format!("host-5m-{at}-1.jsonl"));
+        let original = raw_host(at);
+        fs::write(&source, &original).unwrap();
+        let records = fold_host_raw(&read_lines::<RawHost>(&source).unwrap(), FIVE_MINUTES_MS);
+        let mut legacy = serde_json::to_value(&records[0]).unwrap();
+        legacy["cpu_percent"]["weighted_sum"] = serde_json::json!(3_000_000.000_000_000_5_f64);
+        fs::write(&target, format!("{legacy}\n")).unwrap();
+        let before = fs::read(&target).unwrap();
+        assert_eq!(host_rollups(&dir).unwrap(), []);
+
+        maintain(&dir, now, policy()).unwrap();
+        assert!(!source.exists());
+        assert_eq!(host_rollups(&dir).unwrap()[0].source_samples, 1);
+        fs::write(&source, original).unwrap();
+        maintain(&dir, now, policy()).unwrap();
+        maintain(&dir, now, policy()).unwrap();
+        assert_eq!(host_rollups(&dir).unwrap()[0].source_samples, 1);
+        assert_eq!(fs::read(&target).unwrap(), before);
         fs::remove_dir_all(dir).unwrap();
     }
 
