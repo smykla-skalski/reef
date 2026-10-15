@@ -1,5 +1,6 @@
 use crate::ObserveOptions;
 use crate::agent_observe;
+use crate::process_history;
 use crate::retention;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sysinfo::{Disks, ProcessRefreshKind, ProcessesToUpdate, System};
 
-mod commands;
+pub(crate) mod commands;
 mod memory;
 mod platform;
 #[cfg(unix)]
@@ -35,6 +36,8 @@ struct Observation {
     memory_consumers: Vec<MemoryConsumer>,
     #[serde(skip_serializing)]
     commands: Vec<CommandObservation>,
+    #[serde(skip_serializing)]
+    process_details: Vec<commands::ProcessSample>,
 }
 
 #[derive(Serialize)]
@@ -73,6 +76,8 @@ struct AgentTick {
     agents: Vec<AgentObservation>,
     #[serde(default)]
     commands: Vec<CommandObservation>,
+    #[serde(skip)]
+    process_details: Vec<commands::ProcessSample>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -199,7 +204,7 @@ fn sample(
     let processes = process_observations(system);
     let roots = agent_observe::registrations(dir, system)?;
     let agents = agent_observations(&processes, &roots);
-    let commands = commands::sample(system, &roots);
+    let capture = commands::sample(system, &roots);
     let memory_total = system.total_memory();
     let swap_total = system.total_swap();
     Ok(Observation {
@@ -218,7 +223,8 @@ fn sample(
         processes,
         agents,
         memory_consumers: memory::sample(system),
-        commands,
+        commands: capture.commands,
+        process_details: capture.processes,
     })
 }
 
@@ -275,11 +281,13 @@ fn agent_tick(system: &mut System, dir: &Path, working_ms: u64) -> io::Result<Op
     if roots.is_empty() {
         return Ok(None);
     }
+    let capture = commands::sample(system, &roots);
     Ok(Some(AgentTick {
         at_unix_ms: now_ms()?,
         working_ms,
         agents: agent_observations(&process_observations(system), &roots),
-        commands: commands::sample(system, &roots),
+        commands: capture.commands,
+        process_details: capture.processes,
     }))
 }
 
@@ -367,6 +375,8 @@ fn retention_policy(options: &ObserveOptions) -> retention::Policy {
         raw_hours: options
             .retention_days
             .map_or(options.raw_retention_hours, |days| days.saturating_mul(24)),
+        process_detail_days: options.process_detail_retention_days,
+        process_five_minute_days: options.process_five_minute_retention_days,
         five_minute_days: options.five_minute_retention_days,
         hourly_days: options.hourly_retention_days,
         daily_days: options.daily_retention_days,
@@ -606,15 +616,22 @@ pub fn run(options: &ObserveOptions) -> io::Result<()> {
     if let Err(error) = fold_agent_segments(&dir, now, options) {
         eprintln!("reef observer could not fold agent history: {error}");
     }
+    process_history::repair_span_segments(&dir)?;
+    let process_tracker = process_history::Tracker::recover(&dir)?;
     if let Err(error) = retention::maintain(&dir, now, retention_policy(options)) {
         eprintln!("reef observer could not compact history: {error}");
     }
-    let result = record_loop(&dir, &stop_path, options);
+    let result = record_loop(&dir, &stop_path, options, process_tracker);
     pid_file.set_len(0)?;
     result
 }
 
-fn record_loop(dir: &Path, stop_path: &Path, options: &ObserveOptions) -> io::Result<()> {
+fn record_loop(
+    dir: &Path,
+    stop_path: &Path,
+    options: &ObserveOptions,
+    mut process_tracker: process_history::Tracker,
+) -> io::Result<()> {
     #[cfg(unix)]
     let executable = reload::ExecutableWatch::capture();
     let interval = Duration::from_secs(options.interval_seconds);
@@ -637,8 +654,13 @@ fn record_loop(dir: &Path, stop_path: &Path, options: &ObserveOptions) -> io::Re
     loop {
         thread::sleep(tick_interval);
         if stop_path.exists() {
-            fs::remove_file(stop_path)?;
-            return Ok(());
+            return stop_recording(
+                &mut process_tracker,
+                dir,
+                stop_path,
+                options,
+                &mut previous_compaction_error,
+            );
         }
         let tick_elapsed = previous_tick.elapsed();
         previous_tick = std::time::Instant::now();
@@ -651,6 +673,14 @@ fn record_loop(dir: &Path, stop_path: &Path, options: &ObserveOptions) -> io::Re
                 &mut disks,
                 dir,
                 working_ms(host_elapsed, interval),
+            )?;
+            record_process_samples(
+                &mut process_tracker,
+                dir,
+                &observation.process_details,
+                observation.at_unix_ms,
+                tick_working_ms,
+                options,
             )?;
             if let Some(error) = changed_error(
                 &mut previous_fold_error,
@@ -666,6 +696,7 @@ fn record_loop(dir: &Path, stop_path: &Path, options: &ObserveOptions) -> io::Re
                         working_ms: tick_working_ms,
                         agents: observation.agents.clone(),
                         commands: observation.commands.clone(),
+                        process_details: Vec::new(),
                     },
                     options,
                 )?;
@@ -684,9 +715,86 @@ fn record_loop(dir: &Path, stop_path: &Path, options: &ObserveOptions) -> io::Re
                 eprintln!("reef observer could not reload updated executable: {error}");
             }
         } else if let Some(tick) = agent_tick(&mut system, dir, tick_working_ms)? {
-            append_agent_tick(dir, &tick, options)?;
+            record_agent_tick(
+                &mut process_tracker,
+                dir,
+                &tick,
+                tick_working_ms,
+                options,
+                &mut previous_compaction_error,
+            )?;
+        } else {
+            record_missing_processes(&mut process_tracker, dir, tick_working_ms, options)?;
         }
     }
+}
+
+fn record_agent_tick(
+    tracker: &mut process_history::Tracker,
+    dir: &Path,
+    tick: &AgentTick,
+    working_ms: u64,
+    options: &ObserveOptions,
+    previous_compaction_error: &mut Option<String>,
+) -> io::Result<()> {
+    record_process_samples(
+        tracker,
+        dir,
+        &tick.process_details,
+        tick.at_unix_ms,
+        working_ms,
+        options,
+    )?;
+    append_agent_tick(dir, tick, options)?;
+    if let Some(error) = changed_error(
+        previous_compaction_error,
+        retention::maintain(dir, tick.at_unix_ms, retention_policy(options)),
+    ) {
+        eprintln!("reef observer could not compact history: {error}");
+    }
+    Ok(())
+}
+
+fn stop_recording(
+    tracker: &mut process_history::Tracker,
+    dir: &Path,
+    stop_path: &Path,
+    options: &ObserveOptions,
+    previous_compaction_error: &mut Option<String>,
+) -> io::Result<()> {
+    let stopped_at = now_ms()?;
+    record_process_samples(tracker, dir, &[], stopped_at, 0, options)?;
+    if let Some(error) = changed_error(
+        previous_compaction_error,
+        retention::maintain(dir, stopped_at, retention_policy(options)),
+    ) {
+        eprintln!("reef observer could not compact history: {error}");
+    }
+    fs::remove_file(stop_path)
+}
+
+fn record_process_samples(
+    tracker: &mut process_history::Tracker,
+    dir: &Path,
+    samples: &[commands::ProcessSample],
+    at_unix_ms: u64,
+    working_ms: u64,
+    options: &ObserveOptions,
+) -> io::Result<()> {
+    let completed = tracker.observe(samples, at_unix_ms, working_ms);
+    if !completed.is_empty() {
+        process_history::append_spans(dir, &completed, options.max_storage_mib)?;
+    }
+    tracker.checkpoint(dir)
+}
+
+fn record_missing_processes(
+    tracker: &mut process_history::Tracker,
+    dir: &Path,
+    working_ms: u64,
+    options: &ObserveOptions,
+) -> io::Result<()> {
+    record_process_samples(tracker, dir, &[], now_ms()?, working_ms, options)
 }
 
 pub fn start(options: &ObserveOptions) -> io::Result<()> {
@@ -743,6 +851,8 @@ mod tests {
             interval_seconds: 1,
             retention_days: Some(1),
             raw_retention_hours: 48,
+            process_detail_retention_days: 14,
+            process_five_minute_retention_days: 30,
             five_minute_retention_days: 14,
             hourly_retention_days: 90,
             daily_retention_days: 365,
@@ -766,6 +876,7 @@ mod tests {
             agents: vec![],
             memory_consumers: vec![],
             commands: vec![],
+            process_details: vec![],
         }
     }
 
@@ -970,6 +1081,7 @@ mod tests {
                 read_bytes: Some(5),
                 written_bytes: Some(7),
             }],
+            process_details: vec![],
         };
         append_agent_tick(&dir, &make_tick(3_600_100), &options(&dir)).unwrap();
         append_agent_tick(&dir, &make_tick(3_601_100), &options(&dir)).unwrap();
@@ -1016,6 +1128,7 @@ mod tests {
                 written_bytes: None,
             }],
             commands: vec![],
+            process_details: vec![],
         };
         append_agent_tick(&dir, &tick(3_600_100), &options(&dir)).unwrap();
         append_agent_tick(&dir, &tick(7_200_100), &options(&dir)).unwrap();
@@ -1084,6 +1197,7 @@ mod tests {
                 written_bytes: None,
             }],
             commands: vec![],
+            process_details: vec![],
         };
         append_agent_tick(&dir, &tick, &options(&dir)).unwrap();
         let raw = segments_with_prefix(&dir, "agent-samples-").unwrap()[0]

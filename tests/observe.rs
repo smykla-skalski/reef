@@ -136,6 +136,67 @@ fn recorder_folds_previous_hour_agent_ticks_before_enforcing_cap() {
 }
 
 #[test]
+fn fast_agent_tick_enforces_cap_before_first_host_snapshot() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let now = u64::try_from(nonce / 1_000_000).unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "reef-agent-fast-cap-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&dir).unwrap();
+    let raw = dir.join(format!("samples-{now}-1.jsonl"));
+    let mut sample = format!(
+        "{{\"at_unix_ms\":{now},\"working_ms\":60000,\"cpu_percent\":50.0,\"memory_used_bytes\":1048576,\"memory_total_bytes\":2097152}}"
+    );
+    sample.extend(std::iter::repeat_n(' ', 1_047_000 - sample.len() - 1));
+    sample.push('\n');
+    fs::write(&raw, sample).unwrap();
+    let marked = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args(["agents", "observe", "codex", "--pid"])
+        .arg(std::process::id().to_string())
+        .arg("--state-dir")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(marked.status.success(), "{marked:?}");
+    let mut running = Recorder(
+        Command::new(env!("CARGO_BIN_EXE_reef"))
+            .args([
+                "observe",
+                "run",
+                "--interval-seconds",
+                "60",
+                "--max-storage-mib",
+                "1",
+                "--state-dir",
+            ])
+            .arg(&dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+
+    assert!(
+        wait_until(|| !raw.exists()),
+        "{}",
+        child_failure(&mut running)
+    );
+    let stopped = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args(["observe", "stop", "--state-dir"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(stopped.status.success(), "{stopped:?}");
+    assert!(wait_until(|| running.0.try_wait().unwrap().is_some()));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn short_registered_session_is_visible_before_first_host_snapshot() {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -186,6 +247,60 @@ fn short_registered_session_is_visible_before_first_host_snapshot() {
 }
 
 #[test]
+fn process_cost_is_finalized_when_the_registered_agent_exits() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "reef-agent-root-exit-{}-{nonce}",
+        std::process::id()
+    ));
+    let mut running = recorder_at_interval(&dir, "60");
+    let script = format!(
+        "'{}' agents observe codex --pid $$ --state-dir '{}' && sleep 2",
+        env!("CARGO_BIN_EXE_reef"),
+        dir.display()
+    );
+    let mut agent = Command::new("sh")
+        .args(["-c", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert!(agent.wait().unwrap().success());
+
+    assert!(
+        wait_until(|| {
+            let report = Command::new(env!("CARGO_BIN_EXE_reef"))
+                .args(["report", "--state-dir"])
+                .arg(&dir)
+                .args(["--format", "json"])
+                .output()
+                .unwrap();
+            if !report.status.success() {
+                return false;
+            }
+            let json: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+            json["process_commands"]
+                .as_array()
+                .is_some_and(|groups| !groups.is_empty())
+        }),
+        "{}",
+        child_failure(&mut running)
+    );
+    let stopped = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args(["observe", "stop", "--state-dir"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(stopped.status.success(), "{stopped:?}");
+    assert!(wait_until(|| running.0.try_wait().unwrap().is_some()));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn registered_agent_descendant_command_appears_in_report() {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -230,6 +345,30 @@ fn registered_agent_descendant_command_appears_in_report() {
     drop(git.stdin.take());
     assert!(git.wait().unwrap().success());
     assert!(observed, "{}", child_failure(&mut running));
+    assert!(
+        wait_until(|| {
+            let report = Command::new(env!("CARGO_BIN_EXE_reef"))
+                .args(["report", "--state-dir"])
+                .arg(&dir)
+                .args(["--format", "json"])
+                .output()
+                .unwrap();
+            if !report.status.success() {
+                return false;
+            }
+            let json: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+            json["process_commands"].as_array().is_some_and(|groups| {
+                groups.iter().any(|group| {
+                    group["agent"] == "codex"
+                        && group["family"] == "git"
+                        && group["executable"] == "git"
+                        && group["process_count"].as_f64() == Some(1.0)
+                })
+            })
+        }),
+        "{}",
+        child_failure(&mut running)
+    );
     let stopped = Command::new(env!("CARGO_BIN_EXE_reef"))
         .args(["observe", "stop", "--state-dir"])
         .arg(&dir)
@@ -326,6 +465,95 @@ fn recorder_recovers_after_abrupt_exit_without_running_twice() {
     );
     assert!(wait_until(|| restarted.0.try_wait().unwrap().is_some()));
     assert!(restarted.0.wait().unwrap().success());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn recorder_reconciles_completed_span_before_startup_compaction() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let now = u64::try_from(nonce / 1_000_000).unwrap();
+    let at = now - 15 * 86_400_000;
+    let dir = std::env::temp_dir().join(format!(
+        "reef-process-recovery-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&dir).unwrap();
+    let raw = dir.join(format!("process-spans-{at}-1.jsonl"));
+    let common = serde_json::json!({
+        "agent": "codex",
+        "parent_pid": 1,
+        "parent_start_time": 1,
+        "executable": "go",
+        "subcommand": "test",
+        "family": "go test",
+        "category": "test",
+        "workspace_kind": "worktree",
+        "first_seen_unix_ms": at - 1_000,
+        "last_seen_unix_ms": at,
+        "observed_working_ms": 1_000,
+        "sample_count": 1,
+        "cpu_core_ms_estimate": 500.0,
+        "peak_cpu_percent": 50.0,
+        "peak_memory_bytes": 100
+    });
+    let mut completed = common.clone();
+    completed["pid"] = serde_json::json!(2_000_000_000_u32);
+    completed["start_time"] = serde_json::json!(10);
+    completed["read_bytes"] = serde_json::json!(0);
+    completed["written_bytes"] = serde_json::json!(0);
+    completed["coverage"] = serde_json::json!("sampled");
+    fs::write(&raw, format!("{completed}\n")).unwrap();
+    let mut active = common;
+    active["key"] = serde_json::json!({"pid": 2_000_000_000_u32, "start_time": 10});
+    active["first_total_read_bytes"] = serde_json::json!(10);
+    active["last_total_read_bytes"] = serde_json::json!(10);
+    active["first_total_written_bytes"] = serde_json::json!(0);
+    active["last_total_written_bytes"] = serde_json::json!(0);
+    fs::write(
+        dir.join("process-active.json"),
+        serde_json::to_vec(&vec![active]).unwrap(),
+    )
+    .unwrap();
+
+    let mut running = recorder(&dir);
+    assert!(
+        wait_until(|| {
+            !raw.exists()
+                && fs::read_dir(&dir).is_ok_and(|entries| {
+                    entries
+                        .flatten()
+                        .any(|entry| entry.file_name().to_string_lossy().starts_with("samples-"))
+                })
+        }),
+        "{}",
+        child_failure(&mut running)
+    );
+    let stop = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args(["observe", "stop", "--state-dir"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(stop.status.success(), "{stop:?}");
+    assert!(wait_until(|| running.0.try_wait().unwrap().is_some()));
+    let report = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args(["report", "--state-dir"])
+        .arg(&dir)
+        .args(["--format", "json"])
+        .output()
+        .unwrap();
+    assert!(report.status.success(), "{report:?}");
+    let json: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(
+        json["process_commands"][0]["process_count"].as_f64(),
+        Some(1.0)
+    );
+    assert_eq!(
+        json["process_commands"][0]["cpu_core_ms_estimate"].as_f64(),
+        Some(500.0)
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 
