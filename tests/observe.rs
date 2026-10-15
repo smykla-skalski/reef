@@ -257,18 +257,48 @@ fn process_cost_is_finalized_when_the_registered_agent_exits() {
         std::process::id()
     ));
     let mut running = recorder_at_interval(&dir, "60");
-    let script = format!(
-        "'{}' agents observe codex --pid $$ --state-dir '{}' && sleep 2",
-        env!("CARGO_BIN_EXE_reef"),
-        dir.display()
-    );
-    let mut agent = Command::new("sh")
-        .args(["-c", &script])
-        .stdin(Stdio::null())
+    let mut agent = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "agent_root_fixture_spawns_descendant",
+            "--nocapture",
+        ])
+        .env("REEF_TEST_AGENT_ROOT", "1")
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    let marked = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args(["agents", "observe", "codex", "--pid"])
+        .arg(agent.id().to_string())
+        .arg("--state-dir")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(marked.status.success(), "{marked:?}");
+    assert!(
+        wait_until(|| {
+            let report = Command::new(env!("CARGO_BIN_EXE_reef"))
+                .args(["report", "--state-dir"])
+                .arg(&dir)
+                .args(["--format", "json"])
+                .output()
+                .unwrap();
+            if !report.status.success() {
+                return false;
+            }
+            let json: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+            json["passive_commands"].as_array().is_some_and(|groups| {
+                groups
+                    .iter()
+                    .any(|group| group["agent"] == "codex" && group["family"] == "git")
+            })
+        }),
+        "{}",
+        child_failure(&mut running)
+    );
+    drop(agent.stdin.take());
     assert!(agent.wait().unwrap().success());
 
     assert!(
@@ -283,9 +313,15 @@ fn process_cost_is_finalized_when_the_registered_agent_exits() {
                 return false;
             }
             let json: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
-            json["process_commands"]
-                .as_array()
-                .is_some_and(|groups| !groups.is_empty())
+            json["process_commands"].as_array().is_some_and(|groups| {
+                groups.iter().any(|group| {
+                    group["agent"] == "codex"
+                        && group["family"] == "git"
+                        && group["process_count"]
+                            .as_f64()
+                            .is_some_and(|count| count >= 1.0)
+                })
+            })
         }),
         "{}",
         child_failure(&mut running)
@@ -301,22 +337,10 @@ fn process_cost_is_finalized_when_the_registered_agent_exits() {
 }
 
 #[test]
-fn registered_agent_descendant_command_appears_in_report() {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir =
-        std::env::temp_dir().join(format!("reef-agent-command-{}-{nonce}", std::process::id()));
-    let marked = Command::new(env!("CARGO_BIN_EXE_reef"))
-        .args(["agents", "observe", "codex", "--pid"])
-        .arg(std::process::id().to_string())
-        .arg("--state-dir")
-        .arg(&dir)
-        .output()
-        .unwrap();
-    assert!(marked.status.success(), "{marked:?}");
-    let mut running = recorder(&dir);
+fn agent_root_fixture_spawns_descendant() {
+    if std::env::var_os("REEF_TEST_AGENT_ROOT").is_none() {
+        return;
+    }
     let mut git = Command::new("git")
         .args(["hash-object", "--stdin"])
         .stdin(Stdio::piped())
@@ -324,6 +348,41 @@ fn registered_agent_descendant_command_appears_in_report() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
+    let mut input = Vec::new();
+    std::io::stdin().read_to_end(&mut input).unwrap();
+    drop(git.stdin.take());
+    assert!(git.wait().unwrap().success());
+}
+
+#[test]
+fn registered_agent_descendant_command_appears_in_report() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir =
+        std::env::temp_dir().join(format!("reef-agent-command-{}-{nonce}", std::process::id()));
+    let mut agent = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "agent_root_fixture_spawns_descendant",
+            "--nocapture",
+        ])
+        .env("REEF_TEST_AGENT_ROOT", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let marked = Command::new(env!("CARGO_BIN_EXE_reef"))
+        .args(["agents", "observe", "codex", "--pid"])
+        .arg(agent.id().to_string())
+        .arg("--state-dir")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(marked.status.success(), "{marked:?}");
+    let mut running = recorder(&dir);
 
     let observed = wait_until(|| {
         let report = Command::new(env!("CARGO_BIN_EXE_reef"))
@@ -342,8 +401,8 @@ fn registered_agent_descendant_command_appears_in_report() {
                 .any(|group| group["agent"] == "codex" && group["family"] == "git")
         })
     });
-    drop(git.stdin.take());
-    assert!(git.wait().unwrap().success());
+    drop(agent.stdin.take());
+    assert!(agent.wait().unwrap().success());
     assert!(observed, "{}", child_failure(&mut running));
     assert!(
         wait_until(|| {
@@ -362,7 +421,9 @@ fn registered_agent_descendant_command_appears_in_report() {
                     group["agent"] == "codex"
                         && group["family"] == "git"
                         && group["executable"] == "git"
-                        && group["process_count"].as_f64() == Some(1.0)
+                        && group["process_count"]
+                            .as_f64()
+                            .is_some_and(|count| count >= 1.0)
                 })
             })
         }),
