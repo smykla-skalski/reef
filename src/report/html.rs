@@ -797,6 +797,22 @@ fn control_html(control: &crate::control::Summary) -> String {
     out
 }
 
+#[cfg(unix)]
+fn native_cache_html(report: &Report) -> String {
+    format!(
+        "<section><h2>Native cache evidence</h2><pre style=\"white-space:pre-wrap\">{}</pre></section>",
+        escape(&crate::native_cache::text(&report.native_cache))
+    )
+}
+
+fn workload_details(report: &Report) -> String {
+    let mut out = command_cost(report);
+    out.push_str(&process_drilldown(report));
+    #[cfg(unix)]
+    out.push_str(&native_cache_html(report));
+    out
+}
+
 pub(super) fn render(report: &Report, series: &HostSeries, include_timeline: bool) -> String {
     let mut out = String::from(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:"><title>Reef workload report</title><style>
@@ -857,6 +873,7 @@ pub(super) fn render(report: &Report, series: &HostSeries, include_timeline: boo
         );
     }
     out.push_str("</div>");
+    out.push_str(&collection_coverage(report));
     let resolutions = report
         .observation_resolutions
         .iter()
@@ -889,12 +906,29 @@ pub(super) fn render(report: &Report, series: &HostSeries, include_timeline: boo
     out.push_str(&host_charts(report, series));
     out.push_str(&memory_consumers(report, series));
     out.push_str(&agent_comparison(report));
-    out.push_str(&command_cost(report));
-    out.push_str(&process_drilldown(report));
+    out.push_str(&workload_details(report));
     if include_timeline {
         out.push_str(&pressure_timeline(report));
     }
     out.push_str("<footer>Generated locally by Reef. This page has no scripts, network dependencies, or external assets.</footer></main></body></html>");
+    out
+}
+
+fn collection_coverage(report: &Report) -> String {
+    let mut out = "<section aria-label=\"Collection coverage\"><h2>Collection coverage</h2><div class=\"table-wrap\"><table><tbody>".to_owned();
+    for (label, value) in report.collection_coverage.rows() {
+        let _ = write!(
+            out,
+            "<tr><th scope=\"row\">{}</th><td>{}</td></tr>",
+            escape(label),
+            escape(&value)
+        );
+    }
+    out.push_str("</tbody></table></div><details><summary>Collection limits</summary>");
+    for limitation in report.collection_coverage.limitations() {
+        let _ = write!(out, "<p>{}</p>", escape(limitation));
+    }
+    out.push_str("</details></section>");
     out
 }
 

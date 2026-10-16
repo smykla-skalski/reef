@@ -86,6 +86,85 @@ fn anonymous_workspaces_compare_equivalent_commands_in_all_formats() {
 }
 
 #[test]
+fn collection_coverage_distinguishes_missing_empty_active_and_mixed_detail() {
+    let fixture = Fixture::new();
+    let read = |format: &str| {
+        let output = reef()
+            .args([
+                "report",
+                "--from",
+                "2026-01-01T00:00:00Z",
+                "--to",
+                "2026-01-01T00:05:00Z",
+                "--state-dir",
+            ])
+            .arg(&fixture.0)
+            .args(["--format", format])
+            .env("HOME", &fixture.0)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let missing: Value = serde_json::from_str(&read("json")).unwrap();
+    assert!(missing["collection_coverage"]["retained_process_spans"].is_null());
+    assert!(missing["collection_coverage"]["total_command_capture_percent"].is_null());
+    fs::write(fixture.0.join("process-active.json"), "{}").unwrap();
+    let active: Value = serde_json::from_str(&read("json")).unwrap();
+    assert_eq!(
+        active["collection_coverage"]["active_checkpoint_present"],
+        true
+    );
+    assert!(read("markdown").contains("unfinished processes are excluded"));
+    fs::write(fixture.0.join("process-spans-1767225600000-1.jsonl"), "").unwrap();
+    let empty: Value = serde_json::from_str(&read("json")).unwrap();
+    assert_eq!(empty["collection_coverage"]["retained_process_samples"], 0);
+    fs::write(fixture.0.join("process-spans-1767225600000-1.jsonl"), concat!(
+        "{\"agent\":\"codex\",\"pid\":1,\"start_time\":1,\"parent_pid\":null,\"parent_start_time\":null,\"executable\":\"cargo\",\"subcommand\":\"test\",\"family\":\"cargo test\",\"category\":\"test\",\"workspace_kind\":\"git\",",
+        "\"first_seen_unix_ms\":1767225600000,\"last_seen_unix_ms\":1767225601000,\"observed_working_ms\":1000,\"sample_count\":5,\"cpu_core_ms_estimate\":10.0,\"peak_cpu_percent\":2.0,\"peak_memory_bytes\":100,\"read_bytes\":0,\"written_bytes\":0,\"coverage\":\"sampled\"}\n"
+    )).unwrap();
+    fs::write(fixture.0.join("process-history-5m-1767225600000-2.jsonl"), concat!(
+        "{\"bucket_start_unix_ms\":1767225600000,\"resolution_ms\":300000,\"agent\":\"codex\",\"executable\":\"cargo\",\"subcommand\":\"test\",\"family\":\"cargo test\",\"category\":\"test\",\"workspace_kind\":\"git\",",
+        "\"process_count\":2.0,\"observed_working_ms\":1000,\"cpu_core_ms_estimate\":10.0,\"peak_cpu_percent\":2.0,\"peak_memory_bytes\":100,\"read_bytes\":0,\"written_bytes\":0}\n"
+    )).unwrap();
+    fs::write(
+        fixture.0.join("agent-samples-1767225600000-1.jsonl"),
+        "{\"at_unix_ms\":1767225601000,\"working_ms\":200,\"agents\":[{\"kind\":\"codex\",\"root_pid\":1,\"process_count\":1,\"cpu_percent\":null,\"memory_bytes\":100,\"read_bytes\":0,\"written_bytes\":null}],\"commands\":[]}\n",
+    )
+    .unwrap();
+    let mixed: Value = serde_json::from_str(&read("json")).unwrap();
+    let coverage = &mixed["collection_coverage"];
+    assert_eq!(coverage["retained_process_spans"], 1);
+    assert_eq!(coverage["retained_process_samples"], 5);
+    assert_eq!(coverage["process_summary_rows"], 1);
+    assert_eq!(
+        coverage["process_detail"],
+        "mixed individual spans and compacted summaries"
+    );
+    assert!(coverage["agent_sampling_interval_ms"].is_null());
+    assert_eq!(coverage["agent_tick_working_interval_ms"]["minimum"], 200);
+    assert_eq!(coverage["retained_agent_tick_working_ms"], 200);
+    assert_eq!(coverage["range_without_retained_agent_ticks_ms"], 299_800);
+    assert_eq!(coverage["raw_agent_resource_samples"]["cpu_unavailable"], 1);
+    assert_eq!(
+        coverage["raw_agent_resource_samples"]["read_bytes_measured"],
+        1
+    );
+    assert_eq!(
+        coverage["raw_agent_resource_samples"]["written_bytes_unavailable"],
+        1
+    );
+    assert!(coverage["total_command_capture_percent"].is_null());
+    for format in ["markdown", "html"] {
+        let text = read(format);
+        assert!(text.contains("Collection coverage"));
+        assert!(text.contains("Total-command capture"));
+        assert!(text.contains("mixed individual spans and compacted summaries"));
+        assert!(text.contains("unknown, not zero"));
+    }
+}
+
+#[test]
 fn report_defaults_to_all_retained_observations() {
     let fixture = Fixture::new();
     fs::write(
@@ -158,6 +237,12 @@ fn long_term_rollups_keep_agent_cost_and_mark_coarse_host_metrics() {
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["observation_resolutions"]["5m"], 2);
     assert_eq!(report["coarse_history_approximate"], true);
+    assert_eq!(report["collection_coverage"]["agent_rollup_count"], 1);
+    assert!(report["collection_coverage"]["agent_sampling_interval_ms"].is_null());
+    assert_eq!(
+        report["collection_coverage"]["agent_rollup_resolutions_ms"]["300000"],
+        1
+    );
     assert_eq!(report["peak_host_cpu_percent"], 95.0);
     assert!(report["pressure"]["any_above_ms"].is_null());
     assert_eq!(report["agents"][0]["cpu_core_ms_estimate"], 1000.0);
@@ -783,6 +868,8 @@ fn explicit_records_work_without_a_home_directory() {
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["command_count"], 1);
     assert_eq!(report["categories"][0]["category"], "build");
+    #[cfg(unix)]
+    assert_eq!(report["native_cache"]["snapshots"], serde_json::json!([]));
 }
 
 #[test]

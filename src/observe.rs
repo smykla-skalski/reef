@@ -118,6 +118,7 @@ struct AgentRollup {
     written_bytes: u64,
     peak_processes: usize,
     peak_roots: usize,
+    #[serde(default)]
     commands: BTreeMap<String, CommandRollup>,
 }
 
@@ -1204,6 +1205,14 @@ mod tests {
             .1
             .clone();
         fold_agent_segments(&dir, 7_200_000, &options(&dir)).unwrap();
+        let target = segments_with_prefix(&dir, "agent-rollups-").unwrap()[0]
+            .1
+            .clone();
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("commands");
+        let published = format!("{legacy}\n");
+        fs::write(&target, &published).unwrap();
         append_agent_tick(&dir, &tick, &options(&dir)).unwrap();
         assert_eq!(
             segments_with_prefix(&dir, "agent-samples-").unwrap()[0].1,
@@ -1211,6 +1220,8 @@ mod tests {
         );
 
         fold_agent_segments(&dir, 7_200_000, &options(&dir)).unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), published);
 
         assert_eq!(
             segments_with_prefix(&dir, "agent-samples-").unwrap(),

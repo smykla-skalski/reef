@@ -126,6 +126,8 @@ If a host such as Sail bypasses native session hooks, it can call `reef agents o
 
 ## Output cache (Unix)
 
+Native compiler and test caches have a separate optional [capture/import workflow](docs/native-cache.md): `reef native-cache capture --source ccache` or `--source sccache`, and `reef native-cache import --source go-test --input go-test-output.txt`. Reports disclose cumulative counters, resets, unavailable sources, and unsupported Go build/Node cache metrics. Raw statistics and test output are discarded.
+
 Explicitly opt in for a command that only reads inputs and writes stdout or stderr:
 
 ```console
@@ -160,6 +162,8 @@ The old `--retention-days` flag remains accepted for existing startup configurat
 Use `reef observe run` to keep the recorder in the foreground. All three commands accept `--state-dir` for an alternate location; pass it to `stop` as well when using a custom directory. Stopping takes effect within one second. A crashed recorder releases its lock, so the next run reuses its state files without manual cleanup. Do not delete `recorder.pid` or `recorder.lock` while a recorder is running.
 
 On Unix, a recorder launched through a stable command path such as Homebrew's `reef` link reloads itself after that link points to a new executable. It finishes the current host sample first, then replaces its process at the next host interval. The replacement keeps the same PID and process start time, so use the executable mapped by the process to verify its version. This does not download upgrades. A recorder launched from a version-specific binary path stays on that version.
+
+Reports expose a **Collection coverage** section in JSON, Markdown, and HTML. It shows observed tick spacing within each recorder segment separately from capped working durations, legacy agent observations, rollup resolutions, completed process spans and their source sample counts, and compacted process rows. Counts include whole retained rows overlapping the selected range; they do not reconstruct lost timing from compacted history. Missing process stores report unavailable counts; an existing store with no matching rows reports zero. An active checkpoint is disclosed separately because unfinished processes are excluded until their spans are finalized. Short processes between samples remain unseen, so total-command capture is always unknown, never a percentage. Missing tool/resource metrics and native measurements remain unknown; legacy resource totals do not prove complete measurement. Storage-cap compaction and eviction notices describe retention loss separately.
 
 Generate a workload report from observations and default command history; add custom record files with `--records`:
 
