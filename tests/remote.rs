@@ -171,11 +171,19 @@ fn local_worker_cancel_confirms_termination_and_prevents_cleanup_while_running()
     fs::create_dir(&root).unwrap();
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
     assert!(worker(&root, "abc123", "prepare").status.success());
-    let manifest = format!(
-        "{{\"repository\":\"repo\",\"toolchain\":\"rustc\",\"os\":\"{}\",\"arch\":\"{}\",\"command\":[\"/bin/sh\",\"-c\",\"sleep 5\"],\"files\":[]}}",
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    );
+    // Stay alive until cancellation or fixture cleanup, independent of runner delays.
+    let manifest = serde_json::json!({
+        "repository": "repo",
+        "toolchain": "rustc",
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "command": [
+            "/bin/sh", "-c", "while [ -d \"$1\" ]; do sleep 0.02; done",
+            "reef-cancellation-test", fixture.0,
+        ],
+        "files": [],
+    })
+    .to_string();
     fs::write(root.join("jobs/abc123/job.json"), manifest).unwrap();
     assert!(worker(&root, "abc123", "verify").status.success());
     let mut executing = Command::new(env!("CARGO_BIN_EXE_reef"))
