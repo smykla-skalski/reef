@@ -59,6 +59,7 @@ pub(crate) fn admission_reason(
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Request {
+    AdmissionProtocolV1,
     Acquire {
         cpu: u32,
         memory_mib: u64,
@@ -75,6 +76,9 @@ enum Request {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Reply {
+    AdmissionProtocol {
+        version: u32,
+    },
     Queued {
         id: u64,
         position: usize,
@@ -511,6 +515,7 @@ fn handle(mut stream: UnixStream, shared: &Arc<Mutex<State>>) -> io::Result<()> 
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     let request: Request = serde_json::from_slice(&read_line(&mut stream)?)?;
     match request {
+        Request::AdmissionProtocolV1 => send(&mut stream, &Reply::AdmissionProtocol { version: 1 }),
         Request::Queue => {
             let jobs = shared.lock().unwrap().snapshot();
             send(&mut stream, &Reply::Snapshot { jobs })
@@ -1007,6 +1012,27 @@ fn connect(state_dir: Option<&Path>) -> io::Result<UnixStream> {
             ),
         )
     })
+}
+
+pub fn admission_protocol(state_dir: Option<&Path>) -> io::Result<()> {
+    let mut stream = connect(state_dir)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    match request(&mut stream, &Request::AdmissionProtocolV1)? {
+        Reply::AdmissionProtocol { version: 1 } => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "version": 1,
+                "socket": socket_path(state_dir)?.canonicalize()?,
+                })
+            );
+            Ok(())
+        }
+        _ => Err(io::Error::other(
+            "scheduler does not support external admission v1",
+        )),
+    }
 }
 
 fn connect_before_deadline(state_dir: Option<&Path>, deadline: Instant) -> io::Result<UnixStream> {

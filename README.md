@@ -42,6 +42,9 @@ reef run --no-record -- cargo metadata
 
 ## Shared scheduling (Unix)
 
+Applications owning non-command work can use the supported
+[external admission protocol](docs/external-admission.md) to share this budget.
+
 Start one scheduler per workstation, ideally under your user service manager:
 
 ```console
