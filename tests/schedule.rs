@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -99,6 +99,96 @@ impl Drop for Fixture {
 
 fn reef() -> Command {
     Command::new(env!("CARGO_BIN_EXE_reef"))
+}
+
+#[test]
+fn external_admission_discovers_version_and_shares_capacity() {
+    let fixture = Fixture::new();
+    let output = reef()
+        .args(["admission-protocol", "--state-dir"])
+        .arg(&fixture.path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let protocol: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(protocol["version"], 1);
+    let socket = protocol["socket"].as_str().unwrap();
+    let acquire = || {
+        let mut stream = UnixStream::connect(socket).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        writeln!(
+            stream,
+            "{{\"op\":\"acquire\",\"cpu\":1,\"memory_mib\":1024,\"identity\":\"sail-agent\"}}"
+        )
+        .unwrap();
+        BufReader::new(stream)
+    };
+    let read = |reader: &mut BufReader<UnixStream>| {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        serde_json::from_str::<Value>(&line).unwrap()
+    };
+    let mut first = acquire();
+    assert_eq!(read(&mut first)["kind"], "queued");
+    assert_eq!(read(&mut first)["kind"], "granted");
+    let mut cancelled = acquire();
+    let waiting = read(&mut cancelled);
+    assert_eq!(waiting["kind"], "queued");
+    assert_eq!(waiting["reason"], "running limit reached");
+    drop(cancelled);
+    Fixture::wait_until(|| fixture.jobs().len() == 1);
+    let mut second = acquire();
+    assert_eq!(read(&mut second)["kind"], "queued");
+    writeln!(first.get_mut(), "done success").unwrap();
+    while read(&mut second)["kind"] != "granted" {}
+    drop(second);
+    Fixture::wait_until(|| fixture.jobs().is_empty());
+}
+
+#[test]
+fn external_admission_discovery_fails_without_scheduler() {
+    let mut fixture = Fixture::new();
+    fixture.server.kill().unwrap();
+    fixture.server.wait().unwrap();
+    let output = reef()
+        .args(["admission-protocol", "--state-dir"])
+        .arg(&fixture.path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("scheduler unavailable"));
+    assert_eq!(output.stdout, [] as [u8; 0]);
+}
+
+#[test]
+fn external_discovery_preserves_a_connectable_socket_alias() {
+    struct Alias(PathBuf);
+    impl Drop for Alias {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    let fixture = Fixture::new();
+    let alias = Alias(std::env::temp_dir().join(format!(
+        "r-alias-{}-{}",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    )));
+    std::os::unix::fs::symlink(&fixture.path, &alias.0).unwrap();
+    let output = reef()
+        .args(["admission-protocol", "--state-dir"])
+        .arg(&alias.0)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let protocol: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        protocol["socket"],
+        alias.0.join("reef.sock").to_str().unwrap()
+    );
+    UnixStream::connect(protocol["socket"].as_str().unwrap()).unwrap();
 }
 
 fn has_job(jobs: &[Value], state: &str) -> bool {

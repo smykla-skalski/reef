@@ -53,6 +53,12 @@ struct Cli {
 enum Command {
     /// Show current machine resource usage.
     Status,
+    /// Discover the supported external-work admission protocol and socket.
+    #[cfg(unix)]
+    AdmissionProtocol {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
     /// Capture or import bounded native compiler/test cache evidence.
     #[cfg(unix)]
     NativeCache(native_cache::Options),
@@ -527,6 +533,14 @@ fn agent_command(command: AgentCommand) -> std::process::ExitCode {
     }
 }
 
+fn observe_command(command: ObserveCommand) -> std::io::Result<()> {
+    match command {
+        ObserveCommand::Start(options) => observe::start(&options),
+        ObserveCommand::Run(options) => observe::run(&options),
+        ObserveCommand::Stop { state_dir } => observe::stop(state_dir.as_deref()),
+    }
+}
+
 fn main() -> std::process::ExitCode {
     #[cfg(unix)]
     if let Some(tool) = agents::shim_name() {
@@ -535,6 +549,10 @@ fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
+        #[cfg(unix)]
+        Command::AdmissionProtocol { state_dir } => {
+            result(schedule::admission_protocol(state_dir.as_deref()))
+        }
         Command::Status => {
             status::print();
             std::process::ExitCode::SUCCESS
@@ -616,11 +634,7 @@ fn main() -> std::process::ExitCode {
         Command::Remote(options) => command_result(remote::submit(&options)),
         #[cfg(unix)]
         Command::RemoteWorker(options) => command_result(remote::worker(&options)),
-        Command::Observe { command } => result(match command {
-            ObserveCommand::Start(options) => observe::start(&options),
-            ObserveCommand::Run(options) => observe::run(&options),
-            ObserveCommand::Stop { state_dir } => observe::stop(state_dir.as_deref()),
-        }),
+        Command::Observe { command } => result(observe_command(command)),
         #[cfg(unix)]
         Command::NativeCache(options) => result(native_cache::run(&options)),
         Command::Report(options) => report_result(report::run(&options)),
