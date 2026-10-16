@@ -205,7 +205,7 @@ fn sample(
     let processes = process_observations(system);
     let roots = agent_observe::registrations(dir, system)?;
     let agents = agent_observations(&processes, &roots);
-    let capture = commands::sample(system, &roots);
+    let capture = commands::sample(system, &roots, dir);
     let memory_total = system.total_memory();
     let swap_total = system.total_swap();
     Ok(Observation {
@@ -282,7 +282,7 @@ fn agent_tick(system: &mut System, dir: &Path, working_ms: u64) -> io::Result<Op
     if roots.is_empty() {
         return Ok(None);
     }
-    let capture = commands::sample(system, &roots);
+    let capture = commands::sample(system, &roots, dir);
     Ok(Some(AgentTick {
         at_unix_ms: now_ms()?,
         working_ms,

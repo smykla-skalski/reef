@@ -525,7 +525,7 @@ fn command_cost(report: &Report) -> String {
 
 fn process_drilldown(report: &Report) -> String {
     let mut out = String::from(
-        "<section><h2>Agent process drilldown</h2><p>One row groups completed descendant processes by safe executable, subcommand, command family, and workspace type. Reef excludes arguments, paths, environment, prompts, and file contents. Older rows are compacted under the configured storage cap; a tilde marks proportional execution-equivalent estimates.</p>",
+        "<section><h2>Agent process drilldown</h2><p>One row groups completed descendant processes by ecosystem, safe executable, subcommand, command family, and anonymous workspace. Identifiers use an installation-secret keyed digest; displayed IDs are 12-character prefixes (full values in JSON). Equal command fingerprints mean normalized argv and relative cwd match, not equal inputs, cache misses, or wasted work. Reef excludes arguments, paths, environment, prompts, and file contents. At most 256 identity groups survive per compaction segment and report; overflow and legacy identities are unknown. Older rows are compacted under the configured storage cap; a tilde marks proportional execution-equivalent estimates.</p>",
     );
     let Some(commands) = report.process_commands.as_deref() else {
         out.push_str("<p class=\"empty\">Unavailable: observations predate process-span tracking.</p></section>");
@@ -555,10 +555,21 @@ fn process_drilldown(report: &Report) -> String {
             cpu,
         );
         for row in rows.iter().take(50) {
+            let identity = format!(
+                "{} · {}<br>repo {}<br>workspace {}<br>command {}<br>{} equivalent executions across {} workspaces",
+                escape(&row.workspace_kind),
+                escape(&row.workload.ecosystem),
+                crate::workload::Workload::short(row.workload.repository_id.as_deref()),
+                crate::workload::Workload::short(row.workload.workspace_id.as_deref()),
+                crate::workload::Workload::short(row.workload.command_fingerprint.as_deref()),
+                row.repetition_label(),
+                row.command_workspaces
+                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string())
+            );
             let _ = write!(
                 out,
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.0} core-ms</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                escape(&row.workspace_kind),
+                identity,
                 escape(&row.family),
                 escape(&row.executable),
                 escape(&row.subcommand),

@@ -38,6 +38,8 @@ struct ActiveSpan {
     family: String,
     category: String,
     workspace_kind: String,
+    #[serde(default, flatten)]
+    workload: crate::workload::Workload,
     first_seen_unix_ms: u64,
     last_seen_unix_ms: u64,
     observed_working_ms: u64,
@@ -66,6 +68,7 @@ impl ActiveSpan {
             family: sample.family.clone(),
             category: sample.category.clone(),
             workspace_kind: sample.workspace_kind.clone(),
+            workload: sample.workload.clone(),
             first_seen_unix_ms: at_unix_ms.saturating_sub(working_ms),
             last_seen_unix_ms: at_unix_ms,
             observed_working_ms: 0,
@@ -89,6 +92,7 @@ impl ActiveSpan {
             && self.family == sample.family
             && self.category == sample.category
             && self.workspace_kind == sample.workspace_kind
+            && self.workload == sample.workload
     }
 
     fn add(&mut self, sample: &ProcessSample, at_unix_ms: u64, working_ms: u64) {
@@ -120,6 +124,7 @@ impl ActiveSpan {
             family: self.family,
             category: self.category,
             workspace_kind: self.workspace_kind,
+            workload: self.workload,
             first_seen_unix_ms: self.first_seen_unix_ms,
             last_seen_unix_ms: self.last_seen_unix_ms,
             observed_working_ms: self.observed_working_ms,
@@ -150,6 +155,8 @@ pub(crate) struct ProcessSpan {
     pub family: String,
     pub category: String,
     pub workspace_kind: String,
+    #[serde(default, flatten)]
+    pub workload: crate::workload::Workload,
     pub first_seen_unix_ms: u64,
     pub last_seen_unix_ms: u64,
     pub observed_working_ms: u64,
@@ -172,6 +179,8 @@ pub(crate) struct ProcessSummary {
     pub family: String,
     pub category: String,
     pub workspace_kind: String,
+    #[serde(default, flatten)]
+    pub workload: crate::workload::Workload,
     pub process_count: f64,
     pub observed_working_ms: u64,
     pub cpu_core_ms_estimate: f64,
@@ -348,6 +357,7 @@ fn completed_matches_active(completed: &ProcessSpan, active: &ActiveSpan) -> boo
         && completed.family == active.family
         && completed.category == active.category
         && completed.workspace_kind == active.workspace_kind
+        && completed.workload == active.workload
         && completed.first_seen_unix_ms == active.first_seen_unix_ms
         && completed.last_seen_unix_ms == active.last_seen_unix_ms
         && completed.observed_working_ms == active.observed_working_ms
@@ -534,6 +544,17 @@ pub(crate) fn append_spans(
     Ok(())
 }
 
+type SummaryKey = (
+    u64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    crate::workload::Workload,
+);
+
 fn summary_key(
     start: u64,
     agent: &str,
@@ -567,8 +588,10 @@ fn scaled_metric(value: u64, overlap_ms: u64, duration_ms: u64) -> u64 {
 }
 
 fn fold_spans(records: &[ProcessSpan], resolution: u64) -> Vec<ProcessSummary> {
-    let mut groups = BTreeMap::new();
+    let mut groups: BTreeMap<SummaryKey, ProcessSummary> = BTreeMap::new();
+    let mut seen = BTreeSet::new();
     for span in records {
+        let workload = span.workload.bounded(&mut seen);
         let end = span
             .last_seen_unix_ms
             .max(span.first_seen_unix_ms.saturating_add(1));
@@ -613,6 +636,16 @@ fn fold_spans(records: &[ProcessSpan], resolution: u64) -> Vec<ProcessSummary> {
                 &span.category,
                 &span.workspace_kind,
             );
+            let key = (
+                key.0,
+                key.1,
+                key.2,
+                key.3,
+                key.4,
+                key.5,
+                key.6,
+                workload.clone(),
+            );
             let summary = groups.entry(key).or_insert_with(|| ProcessSummary {
                 bucket_start_unix_ms: start,
                 resolution_ms: resolution,
@@ -622,6 +655,7 @@ fn fold_spans(records: &[ProcessSpan], resolution: u64) -> Vec<ProcessSummary> {
                 family: span.family.clone(),
                 category: span.category.clone(),
                 workspace_kind: span.workspace_kind.clone(),
+                workload: workload.clone(),
                 process_count: 0.0,
                 observed_working_ms: 0,
                 cpu_core_ms_estimate: 0.0,
@@ -646,7 +680,9 @@ fn fold_spans(records: &[ProcessSpan], resolution: u64) -> Vec<ProcessSummary> {
 
 fn fold_summaries(records: &[ProcessSummary], resolution: u64) -> Vec<ProcessSummary> {
     let mut groups = BTreeMap::new();
+    let mut seen = BTreeSet::new();
     for record in records {
+        let workload = record.workload.bounded(&mut seen);
         let start = record.bucket_start_unix_ms / resolution * resolution;
         let key = summary_key(
             start,
@@ -656,6 +692,16 @@ fn fold_summaries(records: &[ProcessSummary], resolution: u64) -> Vec<ProcessSum
             &record.family,
             &record.category,
             &record.workspace_kind,
+        );
+        let key = (
+            key.0,
+            key.1,
+            key.2,
+            key.3,
+            key.4,
+            key.5,
+            key.6,
+            workload.clone(),
         );
         groups
             .entry(key)
@@ -668,6 +714,7 @@ fn fold_summaries(records: &[ProcessSummary], resolution: u64) -> Vec<ProcessSum
                 family: record.family.clone(),
                 category: record.category.clone(),
                 workspace_kind: record.workspace_kind.clone(),
+                workload,
                 process_count: 0.0,
                 observed_working_ms: 0,
                 cpu_core_ms_estimate: 0.0,
@@ -894,6 +941,7 @@ mod tests {
             family: "go test".to_owned(),
             category: "test".to_owned(),
             workspace_kind: "worktree".to_owned(),
+            workload: crate::workload::Workload::default(),
             cpu_percent: cpu,
             memory_bytes: memory,
             total_read_bytes: read,
@@ -928,13 +976,58 @@ mod tests {
     #[test]
     fn folding_keeps_safe_command_and_workspace_dimensions() {
         let mut tracker = Tracker::default();
-        tracker.observe(&[sample(42, 50.0, 100, 10)], 301_000, 1_000);
+        let mut input = sample(42, 50.0, 100, 10);
+        input.workload = crate::workload::Workload {
+            ecosystem: "Go".to_owned(),
+            repository_id: Some("a".repeat(64)),
+            workspace_id: Some("b".repeat(64)),
+            command_fingerprint: Some("c".repeat(64)),
+        };
+        tracker.observe(&[input.clone()], 301_000, 1_000);
         let spans = tracker.observe(&[], 302_000, 1_000);
         let summaries = fold_spans(&spans, retention::FIVE_MINUTES_MS);
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].process_count, 1.0);
         assert_eq!(summaries[0].workspace_kind, "worktree");
         assert_eq!(summaries[0].executable, "go");
+        assert_eq!(summaries[0].workload, input.workload);
+        let daily = fold_summaries(&summaries, DAY_MS);
+        assert_eq!(daily[0].workload, input.workload);
+        assert_eq!(daily[0].process_count, 1.0);
+        assert_eq!(daily[0].cpu_core_ms_estimate, 500.0);
+        assert_eq!(daily[0].peak_memory_bytes, 100);
+    }
+
+    #[test]
+    fn identity_overflow_is_aggregated_without_losing_cost() {
+        let mut tracker = Tracker::default();
+        let inputs: Vec<_> = (0..300_u32)
+            .map(|index| {
+                let mut input = sample(index + 42, 50.0, 100, 10);
+                input.workload.command_fingerprint = Some(format!("{index:064x}"));
+                input
+            })
+            .collect();
+        tracker.observe(&inputs, 301_000, 1_000);
+        let spans = tracker.observe(&[], 302_000, 1_000);
+        let summaries = fold_spans(&spans, retention::FIVE_MINUTES_MS);
+        assert_eq!(summaries.len(), crate::workload::MAX_GROUPS + 1);
+        assert_eq!(
+            summaries.iter().map(|row| row.process_count).sum::<f64>(),
+            300.0
+        );
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|row| row.cpu_core_ms_estimate)
+                .sum::<f64>(),
+            150_000.0
+        );
+        let unknown = summaries
+            .iter()
+            .find(|row| row.workload.command_fingerprint.is_none())
+            .unwrap();
+        assert_eq!(unknown.process_count, 44.0);
     }
 
     #[test]
@@ -1088,6 +1181,7 @@ mod tests {
             family: "go test".to_owned(),
             category: "test".to_owned(),
             workspace_kind: "worktree".to_owned(),
+            workload: crate::workload::Workload::default(),
             first_seen_unix_ms: 0,
             last_seen_unix_ms: 7_200_000,
             observed_working_ms: 7_200_000,
