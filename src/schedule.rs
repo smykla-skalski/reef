@@ -1024,7 +1024,7 @@ pub fn admission_protocol(state_dir: Option<&Path>) -> io::Result<()> {
                 "{}",
                 serde_json::json!({
                     "version": 1,
-                "socket": socket_path(state_dir)?.canonicalize()?,
+                "socket": std::path::absolute(socket_path(state_dir)?)?,
                 })
             );
             Ok(())

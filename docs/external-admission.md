@@ -9,6 +9,9 @@ an absolute `socket` path. A missing, unavailable or incompatible scheduler exit
 unsuccessfully. Fail closed when discovery fails; never infer support from the
 Reef executable version or fall back to unscheduled work.
 
+Use the returned socket path unchanged. Discovery preserves absolute aliases so
+clients can use short socket addresses on systems with Unix socket path limits.
+
 Connect to that private Unix socket and exchange newline-delimited UTF-8 JSON.
 Each connection owns one lease. Submit:
 

@@ -162,6 +162,35 @@ fn external_admission_discovery_fails_without_scheduler() {
     assert_eq!(output.stdout, [] as [u8; 0]);
 }
 
+#[test]
+fn external_discovery_preserves_a_connectable_socket_alias() {
+    struct Alias(PathBuf);
+    impl Drop for Alias {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    let fixture = Fixture::new();
+    let alias = Alias(std::env::temp_dir().join(format!(
+        "r-alias-{}-{}",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    )));
+    std::os::unix::fs::symlink(&fixture.path, &alias.0).unwrap();
+    let output = reef()
+        .args(["admission-protocol", "--state-dir"])
+        .arg(&alias.0)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let protocol: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        protocol["socket"],
+        alias.0.join("reef.sock").to_str().unwrap()
+    );
+    UnixStream::connect(protocol["socket"].as_str().unwrap()).unwrap();
+}
+
 fn has_job(jobs: &[Value], state: &str) -> bool {
     jobs.iter().any(|job| job["state"] == state)
 }
