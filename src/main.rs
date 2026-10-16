@@ -11,6 +11,8 @@ mod contain;
 #[cfg(unix)]
 mod control;
 mod history;
+#[cfg(unix)]
+mod native_cache;
 mod observe;
 #[cfg(unix)]
 mod pressure;
@@ -50,6 +52,9 @@ struct Cli {
 enum Command {
     /// Show current machine resource usage.
     Status,
+    /// Capture or import bounded native compiler/test cache evidence.
+    #[cfg(unix)]
+    NativeCache(native_cache::Options),
     /// Reuse successful output-only commands with explicit opt-in.
     #[cfg(unix)]
     Cache {
@@ -615,6 +620,8 @@ fn main() -> std::process::ExitCode {
             ObserveCommand::Run(options) => observe::run(&options),
             ObserveCommand::Stop { state_dir } => observe::stop(state_dir.as_deref()),
         }),
+        #[cfg(unix)]
+        Command::NativeCache(options) => result(native_cache::run(&options)),
         Command::Report(options) => report_result(report::run(&options)),
         Command::Compare(options) => report_result(report::run_compare(&options)),
         #[cfg(unix)]

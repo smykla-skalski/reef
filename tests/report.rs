@@ -815,6 +815,8 @@ fn explicit_records_work_without_a_home_directory() {
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["command_count"], 1);
     assert_eq!(report["categories"][0]["category"], "build");
+    #[cfg(unix)]
+    assert_eq!(report["native_cache"]["snapshots"], serde_json::json!([]));
 }
 
 #[test]

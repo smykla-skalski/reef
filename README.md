@@ -126,6 +126,8 @@ If a host such as Sail bypasses native session hooks, it can call `reef agents o
 
 ## Output cache (Unix)
 
+Native compiler and test caches have a separate optional [capture/import workflow](docs/native-cache.md): `reef native-cache capture --source ccache` or `--source sccache`, and `reef native-cache import --source go-test --input go-test-output.txt`. Reports disclose cumulative counters, resets, unavailable sources, and unsupported Go build/Node cache metrics. Raw statistics and test output are discarded.
+
 Explicitly opt in for a command that only reads inputs and writes stdout or stderr:
 
 ```console

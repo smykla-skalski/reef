@@ -151,7 +151,8 @@ fn fast_agent_tick_enforces_cap_before_first_host_snapshot() {
     let mut sample = format!(
         "{{\"at_unix_ms\":{now},\"working_ms\":60000,\"cpu_percent\":50.0,\"memory_used_bytes\":1048576,\"memory_total_bytes\":2097152}}"
     );
-    sample.extend(std::iter::repeat_n(' ', 1_047_000 - sample.len() - 1));
+    // One byte below the cap makes the first agent tick cross the budget.
+    sample.extend(std::iter::repeat_n(' ', 1_048_575 - sample.len() - 1));
     sample.push('\n');
     fs::write(&raw, sample).unwrap();
     let marked = Command::new(env!("CARGO_BIN_EXE_reef"))
