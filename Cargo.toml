@@ -22,7 +22,7 @@ webbrowser = "=1.2.6"
 [target.'cfg(unix)'.dependencies]
 blake3 = "1"
 nix = { version = "0.31.3", features = ["fs", "process", "signal", "term", "user"] }
-signal-hook = "=0.4.5"
+signal-hook = "=0.4.6"
 socket2 = "0.6.5"
 wait4 = "0.2.0"
 
