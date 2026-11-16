@@ -9,7 +9,7 @@ repository = "https://github.com/smykla-skalski/reef"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-sysinfo = { version = "0.39", default-features = false, features = ["system", "disk"] }
+sysinfo = { version = "0.40", default-features = false, features = ["system", "disk"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision", "float_roundtrip"] }
 sha2 = "0.11"
